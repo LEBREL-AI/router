@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	"lebrel-router/internal/auth"
+	"lebrel-router/internal/dstack"
 	"lebrel-router/internal/ledger"
 	"lebrel-router/internal/limit"
 	"lebrel-router/internal/meter"
@@ -100,6 +101,9 @@ type Settings struct {
 	HTTPClient      *http.Client
 	Now             func() time.Time
 	Logger          *log.Logger
+	// Attester is the confidential VM's guest agent when the router runs in one: it serves the
+	// quote at /.well-known/attestation bound to the receipt-signing key. Nil outside a VM.
+	Attester dstack.Attester
 }
 
 type Server struct {
@@ -110,6 +114,8 @@ type Server struct {
 	edgeToken string
 	mu        sync.Mutex
 	manifests map[string]cachedManifest
+	// attestations caches the last quote asked without a nonce.
+	attestations attestationCache
 
 	// shutdown: the completions being answered, the switch that cuts them once the budget is spent,
 	// and the reservations it cut
@@ -244,6 +250,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleSettlementHealth(w, r)
 	case path == "/.well-known/proof-of-edition":
 		s.handleManifest(w, r, scoped)
+	case path == AttestationPath && scoped == nil:
+		s.handleAttestation(w, r)
 	case strings.HasPrefix(path, "/v1/receipts/"):
 		s.handleReceipt(w, r, strings.TrimPrefix(path, "/v1/receipts/"))
 	case path == "/v1/models":
@@ -1194,7 +1202,7 @@ func textOf(raw json.RawMessage) string {
 
 // publicDocumentPath is true for the signed documents anyone may read from any origin.
 func publicDocumentPath(path string) bool {
-	return path == "/.well-known/proof-of-edition" || path == "/v1/models" || strings.HasPrefix(path, "/v1/receipts/")
+	return path == "/.well-known/proof-of-edition" || path == AttestationPath || path == "/v1/models" || strings.HasPrefix(path, "/v1/receipts/")
 }
 
 // boundedID keeps an upstream identifier printable and short enough for a receipt.

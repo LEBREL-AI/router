@@ -22,6 +22,16 @@ their request. `RELEASES.md` lists each served version with its measurement.
 What follows from reading the code: the router keeps no prompt and no completion, writes no request
 body anywhere, and its upstream keys and receipt-signing key live only inside the measured machine.
 
+Inside the VM the router asks dstack's guest agent for two things. The receipt-signing seed is
+derived by the KMS for this app's measurement (`GetKey`), so every instance of the same compose
+signs with the same key and no human ever holds it; an explicit `RECEIPT_SIGNING_SEED` is only
+for deployments outside a VM. And `GET /.well-known/attestation[?nonce=<hex, up to 32 bytes>]`
+serves the TDX quote whose report data is `SHA-512("lebrel-router-attestation-v1" || public_key ||
+nonce)`, with the event log and the app's identity (app id, compose hash, OS image hash): a
+verifier checks Intel's chain on the quote, recomputes the report data from the document, compares
+the compose hash with `RELEASES.md`, and then knows that the key signing the receipts lives in this
+code on this hardware. `scripts/verify-attestation.py` does those checks.
+
 What it does not prove: what the lab at the other end (DeepSeek, Z.ai, Moonshot AI, Alibaba Cloud)
 does with the request under its own policy, and which weights that lab ran. The first is their
 declaration; the second is measured hourly by `proof-of-edition/watch` against the published
