@@ -5,7 +5,7 @@
 # variables, which the KMS releases only to this measured app.
 services:
   router:
-    image: ghcr.io/lebrel-ai/router@sha256:6c46fb6a13c8ae323eac6b337a6ec17667c3311cc2e10415994a17b308ebe13e
+    image: ghcr.io/lebrel-ai/router@sha256:2c7a7fcc8714013d72bc44eccfad3e2150d7303f7194c6e8eb3a3e2eb77f2701
     restart: unless-stopped
     ports:
       - "8080:8090"
