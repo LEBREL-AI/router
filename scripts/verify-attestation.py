@@ -17,7 +17,15 @@ What it checks, in order:
   4. The verified compose-hash equals RELEASES.md's row; app-id and the receipt key equal what you
      expect when given; the document's own statements equal the verified log.
   5. With --reference, the quote's mr_td and rtmr0-2 (the OS image, measured before any app event)
-     equal the published reference measurements of the dstack image.
+     equal the reference measurements in the file. Today those are values OBSERVED on Phala's
+     machines, not an independent rebuild of the image (dstack publishes a different tdx_mrtd for
+     mkosi-os-v0.6.1, not yet reconciled): until reproduced, the OS identity rests on Phala.
+  5b. mr_config_id is recomputed from the verified app id, compose hash, instance id and the KMS
+     identity in --reference (0x03 || SHA-256("dstack-mr-config-v3:" || 0x00 || JCS(...))): a
+     hardware-measured record that binds app, compose, instance and KMS without the event log.
+  5c. With --compose-file, the measured app manifest (info.tcb_info.app_compose) hashes to the
+     measured compose hash and its docker_compose_file equals the file in the repository; the
+     pre-launch script's hash, allowed_envs and the deployment flags are printed.
   6. Intel's signature chain over the quote and the platform's TCB status, through `dcap-qvl`
      (cargo install dcap-qvl-cli). Without it the result is NOT "verified" unless you pass
      --allow-unverified-chain: steps 1-5 prove the binding, step 6 proves the hardware.
@@ -51,10 +59,29 @@ TD_REPORT10_SIZE = 584
 TEE_TYPE_TDX = 0x81
 
 
+class Unavailable(Exception):
+    """The document could not be obtained (a 429 that did not clear, a network failure): not a
+    verification failure, the machine was not reached."""
+
+
 def fetch(base: str, nonce: bytes) -> dict:
+    """Fetches the document; a 429 (the machine is quoting for others) is retried after Retry-After,
+    up to three times."""
     url = base.rstrip("/") + "/.well-known/attestation?nonce=" + nonce.hex()
-    with urllib.request.urlopen(urllib.request.Request(url, headers={"Accept": "application/json"}), timeout=30) as response:
-        return json.load(response)
+    import time
+    import urllib.error
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"Accept": "application/json"}), timeout=30) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as error:
+            if error.code == 429 and attempt < 3:
+                time.sleep(min(float(error.headers.get("Retry-After") or 5), 30))
+                continue
+            raise Unavailable(f"HTTP {error.code} from the router") from error
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            raise Unavailable(str(error)) from error
+    raise Unavailable("the router kept answering 429")
 
 
 def td_report(quote: bytes) -> dict[str, bytes]:
@@ -138,25 +165,26 @@ def dcap_qvl(quote: bytes) -> tuple[str, str]:
     if run.returncode != 0:
         return "failed", output[-400:]
     status = None
+    statuses_not_up_to_date: dict[str, str] = {}
+    advisories: list = []
     for line in output.splitlines():
         line = line.strip()
         if line.startswith("{"):
             try:
                 report = json.loads(line)
-                status = (report.get("status") or (report.get("platform_status") or {}).get("status") or
-                          (report.get("qe_status") or {}).get("status"))
-                platform = (report.get("platform_status") or {}).get("status")
-                qe = (report.get("qe_status") or {}).get("status")
-                if platform and qe:
-                    status = platform if platform != "UpToDate" else qe
-                advisories = (report.get("platform_status") or {}).get("advisory_ids") or report.get("advisory_ids") or []
             except json.JSONDecodeError:
                 continue
+            found = {"overall": report.get("status"), "platform": (report.get("platform_status") or {}).get("status"), "qe": (report.get("qe_status") or {}).get("status")}
+            found = {k: v for k, v in found.items() if v}
+            if found:
+                status = "seen"
+                statuses_not_up_to_date = {k: v for k, v in found.items() if v != "UpToDate"}
+                advisories = (report.get("platform_status") or {}).get("advisory_ids") or report.get("advisory_ids") or []
     if status is None:
         return "failed", "dcap-qvl verified the signature but reported no TCB status: " + output[-200:]
-    if status != "UpToDate":
-        return "failed", f"signature chain ok but TCB status is {status} (advisories {advisories})"
-    return "passed", f"signature chain ok, TCB {status}"
+    if statuses_not_up_to_date:
+        return "failed", f"signature chain ok but TCB status is not UpToDate: {statuses_not_up_to_date} (advisories {advisories})"
+    return "passed", "signature chain ok, TCB UpToDate (platform, QE and overall)"
 
 
 def main() -> int:
@@ -166,7 +194,9 @@ def main() -> int:
     parser.add_argument("--app-id", help="the dstack app id the router is expected to run as")
     parser.add_argument("--public-key", help="the receipt-signing public key (hex) you expect, e.g. from a receipt's manifest")
     parser.add_argument("--os-image-hash", help="the dstack OS image hash expected")
-    parser.add_argument("--reference", help="JSON file with reference measurements of the OS image: mr_td, rtmr0, rtmr1, rtmr2 (hex)")
+    parser.add_argument("--reference", help="JSON file with reference measurements: mr_td, rtmr0, rtmr1, rtmr2 (hex) and kms_id (the KMS's key_provider_id)")
+    parser.add_argument("--key-id", help="the receipt key id (hex) RELEASES.md lists for the row")
+    parser.add_argument("--compose-file", help="path to the compose file of the row: the measured app manifest must carry it byte for byte")
     parser.add_argument("--nonce", help="hex nonce (default: 32 random bytes)")
     parser.add_argument("--allow-unverified-chain", action="store_true", help="count the result as verified even when dcap-qvl is not installed")
     parser.add_argument("--json", action="store_true", help="print the checks as JSON")
@@ -181,6 +211,9 @@ def main() -> int:
     try:
         document = fetch(args.base_url, nonce)
         check("document", True, f"kind={document.get('kind')} instance={document.get('instance_id')} issued_at={document.get('issued_at')} key_source={document.get('key_source')}")
+    except Unavailable as error:
+        print(f"NOT OBTAINED: {error}")
+        return 3
     except Exception as error:  # noqa: BLE001
         check("document", False, str(error))
         return finish(checks, args)
@@ -194,6 +227,8 @@ def main() -> int:
               f"public_key={public_key.hex()} nonce={nonce.hex()[:16]}…")
         if args.public_key:
             check("receipt key equals the expected one", public_key.hex() == args.public_key.lower(), f"expected={args.public_key}")
+        if args.key_id:
+            check("receipt key id equals RELEASES.md", str(document.get("signing_key_id", "")).lower() == args.key_id.lower(), f"document={document.get('signing_key_id')}")
     except Exception as error:  # noqa: BLE001
         check("report_data binds the receipt key and our nonce", False, str(error))
         return finish(checks, args)
@@ -232,16 +267,43 @@ def main() -> int:
     if args.os_image_hash:
         check("os image hash equals the expected dstack image", os_image == args.os_image_hash.lower(), f"expected={args.os_image_hash}")
 
+    instance_id = verified_payload(event_log, "instance-id")
     if args.reference:
         try:
             reference = json.load(open(args.reference))
             for field in ("mr_td", "rtmr0", "rtmr1", "rtmr2"):
                 want = str(reference.get(field, "")).lower()
-                check(f"{field} equals the reference measurement", bool(want) and report[field].hex() == want, f"quote={report[field].hex()[:24]}… reference={want[:24]}…")
+                check(f"{field} equals the reference measurement (observed, see --reference)", bool(want) and report[field].hex() == want, f"quote={report[field].hex()[:24]}… reference={want[:24]}…")
+            kms_id = str(reference.get("kms_id", "")).lower()
+            if kms_id and key_provider:
+                provider = json.loads(bytes.fromhex(key_provider).decode())
+                check("key provider id equals the reference KMS", str(provider.get("id", "")).lower() == kms_id, f"measured id={str(provider.get('id',''))[:24]}…")
+                if app_id and compose and instance_id:
+                    record = {"app_id": app_id, "compose_hash": compose, "init_script_hashes": [], "instance_id": instance_id,
+                              "key_provider": provider.get("name"), "key_provider_id": provider.get("id"), "version": 3}
+                    jcs = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+                    expected_config = (b"\x03" + hashlib.sha256(b"dstack-mr-config-v3:" + b"\x00" + jcs).digest()).ljust(48, b"\x00")
+                    check("mr_config_id recomputes from app id, compose, instance and KMS", report["mr_config_id"] == expected_config, f"mr_config_id={report['mr_config_id'].hex()[:24]}…")
         except Exception as error:  # noqa: BLE001
             check("reference measurements", False, str(error))
     else:
         check("mr_td / rtmr0-2 against reference measurements", None, f"no --reference given; mr_td={report['mr_td'].hex()}")
+
+    if args.compose_file:
+        try:
+            tcb = json.loads(info.get("tcb_info") or "{}")
+            manifest_text = tcb.get("app_compose") or ""
+            measured = hashlib.sha256(manifest_text.encode()).hexdigest()
+            check("measured app manifest hashes to the measured compose hash", bool(manifest_text) and measured == compose, f"sha256(app_compose)={measured[:24]}…")
+            manifest = json.loads(manifest_text) if manifest_text else {}
+            expected_compose = open(args.compose_file, encoding="utf-8").read()
+            # Trailing whitespace is not part of a compose: a dashboard paste drops the final newline.
+            check("the manifest's docker_compose_file equals the repository file", str(manifest.get("docker_compose_file", "")).rstrip() == expected_compose.rstrip(), f"file={args.compose_file}")
+            prelaunch = hashlib.sha256(str(manifest.get("pre_launch_script", "")).encode()).hexdigest()
+            flags = {k: manifest.get(k) for k in ("public_logs", "public_sysinfo", "public_tcbinfo", "key_provider", "kms_enabled", "secure_time", "gateway_enabled")}
+            check("manifest details", True, f"pre_launch_script sha256={prelaunch[:16]}… allowed_envs={manifest.get('allowed_envs')} flags={flags}")
+        except Exception as error:  # noqa: BLE001
+            check("measured app manifest", False, str(error))
 
     status, detail = dcap_qvl(quote)
     check("Intel signature chain and TCB status (dcap-qvl)", True if status == "passed" else (None if status == "skipped" else False), detail)

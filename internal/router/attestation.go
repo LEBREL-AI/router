@@ -32,8 +32,10 @@ const attestationCacheFor = 5 * time.Minute
 const attestationInFlight = 2
 
 // attestationPerClient is how many fresh quotes (with a nonce) one client address may ask per
-// minute; without a nonce the cached document costs nothing.
-const attestationPerClient = 12
+// minute; without a nonce the cached document costs nothing. Behind a gateway or proxy every
+// request carries the gateway's address, so this is in practice a limit for all verifiers together:
+// generous enough for honest use, small enough that the agent's serial quoting is never drained.
+const attestationPerClient = 30
 
 // AttestationReportData is what the quote's 64-byte report data commits to: the receipt-signing
 // public key, with the verifier's nonce when one is given. report_data = SHA-512(domain || public
@@ -60,9 +62,12 @@ type AttestationDocument struct {
 	InstanceID   string `json:"instance_id"`
 	Nonce        string `json:"nonce"`
 	ReportData   string `json:"report_data"`
-	// Quote is the TDX quote, hex; EventLog explains RTMR3 (JSON, as the agent gives it).
+	// Quote is the TDX quote, hex; EventLog explains RTMR3 (JSON, as the agent gives it); VMConfig
+	// is the VM's launch configuration as the agent states it, which dstack-verifier and dstack-mr
+	// need to recompute the OS measurements (MRTD, RTMR0-2) from the published image.
 	Quote    string          `json:"quote"`
 	EventLog json.RawMessage `json:"event_log"`
+	VMConfig json.RawMessage `json:"vm_config,omitempty"`
 	// Info is the app's identity as the guest agent states it.
 	Info     dstack.Info `json:"info"`
 	IssuedAt int64       `json:"issued_at"`
@@ -106,6 +111,10 @@ func (c *attestationCache) admit(client string, fresh bool, now time.Time) (rele
 		}
 		if entry.count >= attestationPerClient {
 			return nil, "too_many_quotes"
+		}
+		// A request refused for a full machine is not one of the client's quotes.
+		if c.inUse >= attestationInFlight {
+			return nil, "attestation_busy"
 		}
 		entry.count++
 	}
@@ -158,11 +167,18 @@ func (s *Server) attestation(ctx context.Context, nonce []byte) (*AttestationDoc
 	if !json.Valid(eventLog) {
 		eventLog, _ = json.Marshal(quote.EventLog)
 	}
+	var vmConfig json.RawMessage
+	if quote.VMConfig != "" {
+		vmConfig = json.RawMessage(quote.VMConfig)
+		if !json.Valid(vmConfig) {
+			vmConfig, _ = json.Marshal(quote.VMConfig)
+		}
+	}
 	document := &AttestationDocument{
 		Kind: "lebrel-router-attestation", Scheme: "report_data = sha512(\"" + attestationDomain + "\" || public_key || nonce)",
 		PublicKey: hex.EncodeToString(s.settings.Signer.Public), SigningKeyID: s.settings.Signer.KeyID, KeySource: s.settings.KeySource, InstanceID: s.settings.Signer.InstanceID,
 		Nonce: hex.EncodeToString(nonce), ReportData: hex.EncodeToString(reportData),
-		Quote: hex.EncodeToString(quote.Quote), EventLog: eventLog, Info: info, IssuedAt: now.Unix(),
+		Quote: hex.EncodeToString(quote.Quote), EventLog: eventLog, VMConfig: vmConfig, Info: info, IssuedAt: now.Unix(),
 	}
 	if len(nonce) == 0 {
 		s.attestations.mu.Lock()
@@ -195,6 +211,18 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 	client, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		client = r.RemoteAddr
+	}
+	// A fresh cached document costs the machine nothing: served before any limit applies.
+	if len(nonce) == 0 {
+		s.attestations.mu.Lock()
+		cached, expires := s.attestations.document, s.attestations.expires
+		s.attestations.mu.Unlock()
+		if cached != nil && s.settings.Now().Before(expires) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			_ = json.NewEncoder(w).Encode(cached)
+			return
+		}
 	}
 	release, refused := s.attestations.admit(client, len(nonce) > 0, s.settings.Now())
 	if refused != "" {

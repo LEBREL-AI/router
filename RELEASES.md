@@ -5,7 +5,7 @@ check that the running machine is this code:
 
 | Version | Git tag | Image digest | dstack compose hash | Receipt key id | Since |
 |---|---|---|---|---|---|
-| 1.2.0 (custom domain, instance A) | `v1.2.0` | `sha256:de4aaa36efa8750a85ce3a90331e0259bcf6c2bfd04e5232152452a147ac58a6` + dstack-ingress 2.2 (`deploy/dstack/docker-compose.custom-domain.yml`, router-tee.lebrel.ai) | `0b5563830f207a2f2ff03042505985d7ecd96935f2f7a1f074e84b493c8cba17` | `75b981a701b150c5…` (derived inside, compose in the path) | 2026-11-04 |
+| 1.2.0 (custom domain, instance A) | `v1.2.0` | `sha256:de4aaa36efa8750a85ce3a90331e0259bcf6c2bfd04e5232152452a147ac58a6` + dstack-ingress 2.2 (`deploy/dstack/docker-compose.custom-domain.yml`, router-tee.lebrel.ai) | `0b5563830f207a2f2ff03042505985d7ecd96935f2f7a1f074e84b493c8cba17` | `75b981a701b150c565d05500191dbe6a83dfa0c1bcabe8752234f41067a05204`, public key `161dc88748c3d05ee654bd56285b71115c1c5dfabc5ff9967f6ffbc21287588d` (derived inside, compose in the path) | 2026-11-04 |
 | 1.2.0 | `v1.2.0` | `sha256:de4aaa36efa8750a85ce3a90331e0259bcf6c2bfd04e5232152452a147ac58a6` (linux/amd64, BuildKit v0.27.1, OCI media types) | `a28254ec21ff869593b25cf2d749c15c82563be1d676af4087cea5e9603bf9bf` | `24850d5e65638769…` (derived inside, compose in the path) | 2026-11-04 |
 | 1.1.0 | `v1.1.0` | `sha256:31eb44606b599012143e85ea630e80b90095b080bc65442f8f6ba7e88e0dfd5d` (linux/amd64) | `3ba7b773f9c3b844ec4f4641c7384437a383051ed8328742c1595aac6a372c58` | `19bd924d…` (derived inside, app-wide path) | 2026-11-04 |
 | 1.0.2 | `v1.0.2` | `sha256:66962f2e136059cbaefed0b2ef7b7edddf756c4b4c035a6f9b0ae466f9157fc5` (linux/amd64) | `50d65ee7c8b31f316a3dbbf5060f884df6ef522dd2a4f6df5c953799e4b5c03c` | handed in (`RECEIPT_SIGNING_SEED`) | 2026-11-04 |
@@ -20,7 +20,8 @@ here the compose hash dstack reports, the image digest, and the receipt key id t
 derives.
 
 How anyone checks a running router: `scripts/verify-attestation.py <router> --compose-hash <row>
---app-id 4d72eae647c67ad42c972d24175d7c32ce9c871a --reference deploy/dstack/reference-measurements/dstack-0.6.1.json`.
+--app-id 4d72eae647c67ad42c972d24175d7c32ce9c871a --key-id <row> --reference deploy/dstack/reference-measurements/dstack-0.6.1.json
+--compose-file deploy/dstack/<the row's compose>`.
 It asks the machine for a quote with a fresh nonce, verifies Intel's chain (dcap-qvl), recomputes
 every runtime event of the log and replays the log into the RTMRs, reads the compose hash, app id
 and key provider from the verified log, and compares them with the row and the arguments.
@@ -30,7 +31,10 @@ What the key proves, exactly. The receipt-signing key is derived by the VM's KMS
 derivation path: a receipt signed with the key of a row was signed by a VM running that app under
 that measured compose. The trust anchors are Intel (the quote), the KMS operator (it releases keys
 only to measured VMs of the app) and the app's owner, who alone can register new composes for the
-app: a later row has a different key. Every container of a measured compose can reach the guest
+app: a later row has a different key, and the owner, through a new compose, could derive the
+keys of earlier rows (the KMS derives from the app's root key and the path): a receipt is
+attributable to a row only as far as the owner is trusted not to do that, which is why the owner
+is named here as an anchor. Every container of a measured compose can reach the guest
 agent's socket, so the claim covers the whole compose, not the router container alone. The hash
 covers dstack's whole app manifest, not only the compose file: the deployment flags (public logs
 off, public system info off, public attestation data on, KMS key provider) are part of it, so a
