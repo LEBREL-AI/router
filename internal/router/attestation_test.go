@@ -321,6 +321,11 @@ func TestAFullLineOrAWaitThatRunsOutIsToldAsBusy(t *testing.T) {
 	if cached, _ := getAttestation(t, ts, ""); cached.StatusCode != http.StatusOK {
 		t.Fatalf("the cached document was refused while busy: %d", cached.StatusCode)
 	}
+	// The shared document is renewed outside the line: with every slot taken it is still served.
+	cache.invalidate()
+	if renewed, _ := getAttestation(t, ts, ""); renewed.StatusCode != http.StatusOK {
+		t.Fatalf("the shared document was not renewed while the line was full: %d", renewed.StatusCode)
+	}
 	cache.mu.Lock()
 	for i := 0; i < attestationInFlight; i++ {
 		<-cache.slots
@@ -329,7 +334,7 @@ func TestAFullLineOrAWaitThatRunsOutIsToldAsBusy(t *testing.T) {
 	vm.mu.Lock()
 	quotes := len(vm.asked)
 	vm.mu.Unlock()
-	if quotes != 1 {
-		t.Fatalf("a refused request reached the VM: %d quotes", quotes)
+	if quotes != 2 {
+		t.Fatalf("the VM was asked %d times, want 2 (the first document and its renewal; no refused request)", quotes)
 	}
 }

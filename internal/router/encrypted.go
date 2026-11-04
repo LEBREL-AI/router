@@ -21,6 +21,7 @@ import (
 	"github.com/tinfoilsh/encrypted-http-body-protocol/identity"
 	"github.com/tinfoilsh/encrypted-http-body-protocol/protocol"
 	"lebrel-router/internal/auth"
+	"lebrel-router/internal/limit"
 )
 
 // End-to-end encryption of routed requests (EHBP, the same protocol the editions' runtime speaks):
@@ -46,9 +47,37 @@ const (
 	encryptedClockSkew        = 5 * time.Minute
 	encryptedReplayFor        = 2*encryptedClockSkew + time.Minute
 	encryptedReplayEntries    = 1_000_000
-	encryptedReplayPerAccount = 65_536
+	encryptedReplayPerAccount = 262_144
 	encryptedSweepEvery       = time.Second
 )
+
+// Bytes in flight are bounded per key as well as requests: a key's concurrency slots alone would
+// let it hold that many 8 MiB uploads, several copies each while they are decrypted and parsed,
+// which on a small machine is the machine. Each request takes one unit per MiB of its body (the
+// whole 8 MiB when the length is unknown) out of encryptedBytesInFlightUnits per key.
+const (
+	encryptedBudgetUnit         = 1 << 20
+	encryptedBytesInFlightUnits = 128
+)
+
+// acquireUnits takes units slots of key from the limiter, all or none.
+func acquireUnits(ctx context.Context, limiter limit.ConcurrencyLimiter, key string, units, maximum int) (func(), error) {
+	releases := make([]limit.ReleaseFunc, 0, units)
+	release := func() {
+		for _, r := range releases {
+			r()
+		}
+	}
+	for i := 0; i < units; i++ {
+		r, err := limiter.Acquire(ctx, key, maximum)
+		if err != nil {
+			release()
+			return nil, err
+		}
+		releases = append(releases, r)
+	}
+	return release, nil
+}
 
 // EncryptedRequestMax bounds an encrypted request body: the edge forwards at most 8 MiB.
 const EncryptedRequestMax = 8 << 20
@@ -300,11 +329,11 @@ func (e *Encryption) remember(encapsulation []byte, account string, now time.Tim
 	if entry, seen := e.replays[digest]; seen && now.Before(entry.expiry) {
 		return false, false
 	}
-	e.inserts++
-	// Expired entries are swept now and then, and when a cap is reached at most once a second: a
-	// full table costs its holder a sweep per second, never one per request.
+	// Expired entries are swept every few thousand insertions and when a cap is reached, at most
+	// once a second either way: a full table, or a crowd of refusals, costs a sweep per second,
+	// never one per request. Only insertions count, so refused requests drive no sweep.
 	capped := len(e.replays) >= encryptedReplayEntries || e.accounts[account] >= encryptedReplayPerAccount
-	if (capped && now.Sub(e.lastSweep) >= encryptedSweepEvery) || e.inserts%4096 == 0 {
+	if (capped || (e.inserts > 0 && e.inserts%4096 == 0)) && now.Sub(e.lastSweep) >= encryptedSweepEvery {
 		e.lastSweep = now
 		for key, entry := range e.replays {
 			if !now.Before(entry.expiry) {
@@ -320,6 +349,7 @@ func (e *Encryption) remember(encapsulation []byte, account string, now time.Tim
 	}
 	e.replays[digest] = replayEntry{expiry: now.Add(encryptedReplayFor), account: account}
 	e.accounts[account]++
+	e.inserts++
 	return true, false
 }
 
@@ -501,6 +531,17 @@ func (s *Server) handleEncryptedCompletion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	defer releaseAccount()
+	units := EncryptedRequestMax / encryptedBudgetUnit
+	if r.ContentLength > 0 && r.ContentLength <= EncryptedRequestMax {
+		units = int((r.ContentLength + encryptedBudgetUnit - 1) / encryptedBudgetUnit)
+	}
+	releaseBytes, err := acquireUnits(r.Context(), s.settings.Limiter, "bytes:"+principal.APIKeyID, units, encryptedBytesInFlightUnits)
+	if err != nil {
+		w.Header().Set("Retry-After", "1")
+		s.writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "too many bytes in flight for this key; try again in a moment")
+		return
+	}
+	defer releaseBytes()
 	current, previous := encryption.keys()
 	key := current
 	if expected := r.Header.Get("X-Lebrel-Encryption-Key-Id"); expected != "" && expected != current.keyID {
@@ -539,12 +580,14 @@ func (s *Server) handleEncryptedCompletion(w http.ResponseWriter, r *http.Reques
 	}
 	plaintext, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	_ = r.Body.Close()
+	r.Body, ciphertext = http.NoBody, nil // the ciphertext is not needed again
 	if err != nil || int64(len(plaintext)) > limit {
 		s.writeError(w, http.StatusBadRequest, "invalid_ciphertext", "invalid encrypted request")
 		return
 	}
 	encapsulation, _ := hex.DecodeString(r.Header.Get(protocol.EncapsulatedKeyHeader))
-	fresh, full := encryption.remember(encapsulation, principal.AccountID, s.settings.Now())
+	now := s.settings.Now()
+	fresh, full := encryption.remember(encapsulation, principal.AccountID, now)
 	ew, err := key.identity.SetupDerivedResponseEncryption(w, responseContext)
 	if err != nil {
 		encryption.forget(encapsulation)
@@ -562,12 +605,13 @@ func (s *Server) handleEncryptedCompletion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	body, salt, sentAt, err := stripClientFields(plaintext)
+	plaintext = nil // only the body without the client's fields stays live
 	if err != nil {
 		encryption.forget(encapsulation)
 		s.writeError(ew, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	if age := s.settings.Now().Sub(time.Unix(sentAt, 0)); age > encryptedClockSkew || age < -encryptedClockSkew {
+	if age := now.Sub(time.Unix(sentAt, 0)); age > encryptedClockSkew || age < -encryptedClockSkew {
 		encryption.forget(encapsulation)
 		s.writeError(ew, http.StatusBadRequest, "request_expired", SentAtField+" is outside the accepted window (five minutes either way): check the clock and send the request again")
 		return

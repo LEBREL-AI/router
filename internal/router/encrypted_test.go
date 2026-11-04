@@ -820,7 +820,55 @@ func TestTheConcurrencySlotsAreTakenOnceBeforeTheBodyIsRead(t *testing.T) {
 	counting.mu.Lock()
 	keys := append([]string(nil), counting.keys...)
 	counting.mu.Unlock()
-	if len(keys) != 2 || !strings.HasPrefix(keys[0], "key:") || !strings.HasPrefix(keys[1], "account:") {
+	if len(keys) < 3 || !strings.HasPrefix(keys[0], "key:") || !strings.HasPrefix(keys[1], "account:") {
 		t.Fatalf("slots taken: %v", keys)
+	}
+	// Then the body's bytes: one unit per MiB, or the whole 8 MiB when the length is unknown.
+	units := 0
+	for _, key := range keys[2:] {
+		if !strings.HasPrefix(key, "bytes:") {
+			t.Fatalf("slots taken: %v", keys)
+		}
+		units++
+	}
+	if units != 1 && units != EncryptedRequestMax/encryptedBudgetUnit {
+		t.Fatalf("%d byte units taken for a small body", units)
+	}
+}
+
+type refusingBytesLimiter struct{ limit.ConcurrencyLimiter }
+
+func (r *refusingBytesLimiter) Acquire(ctx context.Context, key string, maximum int) (limit.ReleaseFunc, error) {
+	if strings.HasPrefix(key, "bytes:") {
+		return nil, limit.ErrConcurrencyExceeded
+	}
+	return r.ConcurrencyLimiter.Acquire(ctx, key, maximum)
+}
+
+// A key with too many bytes in flight is told so in clear, before any byte is read or remembered.
+func TestAKeyWithTooManyBytesInFlightIsRefusedBeforeReading(t *testing.T) {
+	lab := newFakeUpstream(t, okJSON(`{}`))
+	encryption, err := NewEncryption(bytes.Repeat([]byte{9}, 32), "router-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, signer := encryptedServerWith(t, lab, encryption, func(s *Settings) { s.Limiter = &refusingBytesLimiter{limit.NewInMemory()} })
+	client, keyID := clientIdentity(t, ts, signer)
+	request, _ := http.NewRequest(http.MethodPost, ts.URL+"/m/deepseek--deepseek-v4.1-flash/v1/chat/completions", strings.NewReader(withSentAt(`{"model":"deepseek/deepseek-v4.1-flash","messages":[]}`)))
+	request.Header.Set("Authorization", "Bearer "+testKey)
+	request.Header.Set("X-Lebrel-Encryption-Key-Id", keyID)
+	if _, err := client.EncryptRequestWithContext(request); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusTooManyRequests || !strings.Contains(string(raw), "bytes in flight") || response.Header.Get(protocol.ResponseNonceHeader) != "" || response.Header.Get("Retry-After") != "1" {
+		t.Fatalf("%d %s %v", response.StatusCode, raw, response.Header)
+	}
+	if len(encryption.replays) != 0 || len(lab.requests) != 0 {
+		t.Fatal("a refused upload was remembered or reached the lab")
 	}
 }
