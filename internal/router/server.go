@@ -257,7 +257,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleSettlementHealth(w, r)
 	case path == "/.well-known/proof-of-edition":
 		s.handleManifest(w, r, scoped)
-	case path == AttestationPath && scoped == nil:
+	case path == AttestationPath:
+		// The machine's attestation is the same for every route it serves; a route path answers it too.
 		s.handleAttestation(w, r)
 	case path == EncryptionMetadataPath:
 		s.handleEncryptionMetadata(w, r, scoped)
