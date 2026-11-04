@@ -92,14 +92,30 @@ func run(logger *log.Logger) error {
 	// compose signs with the same key, and nothing outside can obtain it. An explicit
 	// RECEIPT_SIGNING_SEED still wins (the non-attested deployment).
 	var attester dstack.Attester
+	keySource := "env"
 	seedText := env("RECEIPT_SIGNING_SEED", "")
 	var seed []byte
 	if socket := env("DSTACK_SOCKET", dstack.DefaultSocket); dstack.Available(socket) {
 		client := dstack.New(socket)
 		attester = client
+		if seedText != "" && production {
+			// A handed-in key inside the VM would let a human sign "attested" receipts: refused.
+			return errors.New("RECEIPT_SIGNING_SEED must not be set inside an attested VM in production: the key is derived by the VM's KMS")
+		}
 		if seedText == "" {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			derived, err := client.Key(ctx, "lebrel-router/receipt-signing", "ed25519 seed of the receipt-signing key", "ed25519")
+			// The compose hash goes into the derivation path: a receipt key names the exact
+			// measured compose that signed with it, not only the app.
+			info, err := client.Info(ctx)
+			if err != nil {
+				cancel()
+				return fmt.Errorf("app identity from the VM: %w", err)
+			}
+			if len(info.ComposeHash) < 32 {
+				cancel()
+				return errors.New("the VM reports no compose hash")
+			}
+			derived, err := client.Key(ctx, "lebrel-router/receipt-signing/"+info.ComposeHash, "ed25519 seed of the receipt-signing key", "ed25519")
 			cancel()
 			if err != nil {
 				return fmt.Errorf("receipt-signing seed from the VM's KMS: %w", err)
@@ -108,7 +124,8 @@ func run(logger *log.Logger) error {
 				return errors.New("receipt-signing seed from the VM's KMS is shorter than 32 bytes")
 			}
 			seed = derived[:32]
-			logger.Printf("receipt signing seed derived inside the attested VM")
+			keySource = "vm-kms"
+			logger.Printf("receipt signing seed derived inside the attested VM for compose %s", info.ComposeHash)
 		}
 	}
 	if seedText == "" && seed == nil {
@@ -223,7 +240,7 @@ func run(logger *log.Logger) error {
 		HealthToken: strings.TrimSpace(env("HEALTH_TOKEN", "")),
 		Receipts:    router.NewReceiptStore(24*time.Hour, 100_000), Verification: verification,
 		BoardURL: env("BOARD_URL", ""), EdgeProxySecret: env("EDGE_PROXY_SECRET", ""), MaxRequestBytes: maxBytes, Logger: logger,
-		Attester: attester,
+		Attester: attester, KeySource: keySource,
 	})
 	if err != nil {
 		return err

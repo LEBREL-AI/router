@@ -3,27 +3,45 @@
 Every release of the router that serves traffic is listed here with what a third party needs to
 check that the running machine is this code:
 
-| Version | Git tag | Image digest | dstack compose hash | Since |
-|---|---|---|---|---|
-| 1.1.0 | `v1.1.0` | `sha256:31eb44606b599012143e85ea630e80b90095b080bc65442f8f6ba7e88e0dfd5d` (linux/amd64) | `3ba7b773f9c3b844ec4f4641c7384437a383051ed8328742c1595aac6a372c58` | 2026-11-04 |
-| 1.0.2 | `v1.0.2` | `sha256:66962f2e136059cbaefed0b2ef7b7edddf756c4b4c035a6f9b0ae466f9157fc5` (linux/amd64) | `50d65ee7c8b31f316a3dbbf5060f884df6ef522dd2a4f6df5c953799e4b5c03c` | 2026-11-04 |
-| 1.0.1 | `v1.0.1` | `sha256:1b0079066e90ca902c0e11db6b139dc7e40ea0aa00c9eb796ebc6741da23e574` | `8b33778884c7441d04adc00bcd19b5398084bcdf72caec5097d553af0a934d4e` | 2026-11-04 |
-| 1.0.0 | `v1.0.0` | `sha256:67566c5629e9541d9188feee2955034b6bb16def2ecf9d1a6585317363c9c465` | `38b091826b3ce68e832d61e95282b358104717e1825b778c12c3d231b1980c24` | 2026-11-04 |
+| Version | Git tag | Image digest | dstack compose hash | Receipt key id | Since |
+|---|---|---|---|---|---|
+| 1.1.0 | `v1.1.0` | `sha256:31eb44606b599012143e85ea630e80b90095b080bc65442f8f6ba7e88e0dfd5d` (linux/amd64) | `3ba7b773f9c3b844ec4f4641c7384437a383051ed8328742c1595aac6a372c58` | `19bd924d…` (derived inside, app-wide path) | 2026-11-04 |
+| 1.0.2 | `v1.0.2` | `sha256:66962f2e136059cbaefed0b2ef7b7edddf756c4b4c035a6f9b0ae466f9157fc5` (linux/amd64) | `50d65ee7c8b31f316a3dbbf5060f884df6ef522dd2a4f6df5c953799e4b5c03c` | handed in (`RECEIPT_SIGNING_SEED`) | 2026-11-04 |
+| 1.0.1 | `v1.0.1` | `sha256:1b0079066e90ca902c0e11db6b139dc7e40ea0aa00c9eb796ebc6741da23e574` | `8b33778884c7441d04adc00bcd19b5398084bcdf72caec5097d553af0a934d4e` | handed in; never served (restarted) | 2026-11-04 |
+| 1.0.0 | `v1.0.0` | `sha256:67566c5629e9541d9188feee2955034b6bb16def2ecf9d1a6585317363c9c465` | `38b091826b3ce68e832d61e95282b358104717e1825b778c12c3d231b1980c24` | handed in; never served (restarted) | 2026-11-04 |
 
-How a release is made: tag the commit; run `scripts/reproducible-build.sh <tag>` (two clean builds,
-same digest, or the release stops); push that image to `ghcr.io/lebrel-ai/router` and pin its digest
-in `deploy/dstack/docker-compose.yml`; deploy the compose with dstack; record the compose hash dstack
-reports and the image digest here. The hash covers dstack's whole app manifest, not only
-the compose file: the deployment flags (public logs off, public system info off, public attestation
-data on, KMS key provider) are part of it, so a change of any of them is a new row.
+How a release is made: tag the commit; run `scripts/reproducible-build.sh <tag>` on a clean tree
+(two clean builds with the pinned BuildKit named in the script, same manifest digest and same
+compression-independent identity, or the release stops); push that image with the same builder to
+`ghcr.io/lebrel-ai/router` and pin its digest in the compose; deploy the compose with dstack; record
+here the compose hash dstack reports, the image digest, and the receipt key id the deployment
+derives.
 
-How anyone checks a running router: fetch its attestation quote, verify Intel's signature chain
-(`dstack-verifier` or `dcap-qvl`), read the compose hash out of the quote and compare it with the
-row above; rebuild the image from the tag and compare the digest. The key the router publishes at
-`/.well-known/proof-of-edition` is bound to that quote, so a receipt signed with it was signed by
-this code and nothing else.
+How anyone checks a running router: `scripts/verify-attestation.py <router> --compose-hash <row>
+--app-id 4d72eae647c67ad42c972d24175d7c32ce9c871a --reference deploy/dstack/reference-measurements/dstack-0.6.1.json`.
+It asks the machine for a quote with a fresh nonce, verifies Intel's chain (dcap-qvl), recomputes
+every runtime event of the log and replays the log into the RTMRs, reads the compose hash, app id
+and key provider from the verified log, and compares them with the row and the arguments.
+
+What the key proves, exactly. The receipt-signing key is derived by the VM's KMS (Phala's, named
+`kms` in the measured key-provider event) for this app id, with the compose hash in the
+derivation path: a receipt signed with the key of a row was signed by a VM running that app under
+that measured compose. The trust anchors are Intel (the quote), the KMS operator (it releases keys
+only to measured VMs of the app) and the app's owner, who alone can register new composes for the
+app: a later row has a different key. Every container of a measured compose can reach the guest
+agent's socket, so the claim covers the whole compose, not the router container alone. The hash
+covers dstack's whole app manifest, not only the compose file: the deployment flags (public logs
+off, public system info off, public attestation data on, KMS key provider) are part of it, so a
+change of any of them is a new row.
+
+Rows 1.0.0–1.0.2 were deployed with the seed handed in as an encrypted environment variable
+(`RECEIPT_SIGNING_SEED`), which a human held: their receipts prove the measured compose only as
+far as that human is trusted. From 1.1.0 the seed is derived inside; from 1.2.0 the derivation
+includes the compose hash and an explicit seed is refused inside a VM in production.
 
 Two compose files are kept: `deploy/dstack/docker-compose.yml` (the machine reached through the
-dstack gateway hostname) and `deploy/dstack/docker-compose.custom-domain.yml` (the same router with
-dstack-ingress beside it, terminating TLS for router.lebrel.ai inside the VM). Each has its own
-compose hash; the ledger names which one a row was deployed from.
+dstack gateway hostname; its TLS terminates at Phala's gateway, outside the quote) and
+`deploy/dstack/docker-compose.custom-domain.yml` (the same router with dstack-ingress beside it,
+terminating TLS for router-tee.lebrel.ai inside the VM). Each has its own compose hash; the ledger
+names which one a row was deployed from. Reference measurements of the dstack OS image, as
+observed on the quotes (not an independent rebuild): `deploy/dstack/reference-measurements/`.

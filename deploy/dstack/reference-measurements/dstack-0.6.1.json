@@ -1,0 +1,11 @@
+{
+  "os_image": "dstack-0.6.1",
+  "os_image_hash": "ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6",
+  "instance_type": "tdx.large (4 vCPU, 8 GB)",
+  "observed_on": "Phala Cloud prod9 and prod5, 4 Nov 2026",
+  "how": "read from the TDX quotes of lebrel-router-a and its replica; not an independent rebuild of the image (dstack publishes the image hash, not yet reference RTMRs we could reproduce here)",
+  "mr_td": "2a674327c50218dba880066b349b8d559d749ed68dce33fd651c184a877d084b07a9e583767a7ad5da13ed91deec2b70",
+  "rtmr0": "fb14dc139f33d6fcf474bc8332cac001259fb31cfbcb6b34d4ceeb552a2c4466884a0cbde45ad98a05c5c060c23ad65a",
+  "rtmr1": "89ef86c5125b986c325f0a94acfa87718a4ef3a4d4f237dbb72dda3cf777fd2c054555fb4407eb53338d7d67329a7333",
+  "rtmr2": "e9000e338f33233e8f51b7fd031e1c158bdcf8572eab041c0bc8eb7fef48b23259a6a556e6c8e2af99999fc39c793179"
+}
