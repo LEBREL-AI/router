@@ -1,0 +1,7 @@
+.git
+/dist
+*.tar
+*.log
+.env
+*.env
+/router

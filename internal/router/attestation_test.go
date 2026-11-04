@@ -50,7 +50,7 @@ func attestedServer(t *testing.T, attester dstack.Attester) (*httptest.Server, *
 	}
 	server, err := New(Settings{Routes: Config{Routes: []Route{routeFor(upstream("deepseek/api", "http://127.0.0.1:1", 1))}}, Auth: authenticator, Ledger: inMemory, Signer: signer,
 		Receipts: NewReceiptStore(time.Hour, 100), Settlements: runningQueue(t, inMemory), Verification: NewVerification(""), BoardURL: "https://models.lebrel.ai/watch",
-		Now: func() time.Time { return time.Unix(1_900_000_000, 0) }, Attester: attester})
+		Now: func() time.Time { return time.Unix(1_900_000_000, 0) }, Attester: attester, KeySource: "vm-kms"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,8 +95,8 @@ func TestTheAttestationBindsTheReceiptKeyIntoTheQuotesReportData(t *testing.T) {
 	if len(vm.asked) != 1 || hex.EncodeToString(vm.asked[0]) != want {
 		t.Fatalf("the VM was asked %x", vm.asked)
 	}
-	if document.Info.ComposeHash != "50d6" || !json.Valid(document.EventLog) || document.Quote[:8] != "04000200" {
-		t.Fatalf("identity or quote missing: %+v", document)
+	if document.Info.ComposeHash != "50d6" || !json.Valid(document.EventLog) || document.Quote[:8] != "04000200" || document.KeySource != "vm-kms" {
+		t.Fatalf("identity, quote or key source missing: %+v", document)
 	}
 	if response.Header.Get("Access-Control-Allow-Origin") != "*" || response.Header.Get("Cache-Control") != "no-store" {
 		t.Fatalf("not served as a public document: %v", response.Header)
@@ -156,5 +156,42 @@ func TestTheReportDataIsDeterministicAndDomainSeparated(t *testing.T) {
 	plain := sha512.Sum512(key)
 	if hex.EncodeToString(a) == hex.EncodeToString(plain[:]) {
 		t.Fatal("report data is a bare hash of the key: no domain separation")
+	}
+}
+
+// The VM quotes one at a time: a client asking fresh quotes faster than a dozen a minute is told
+// to slow down, and the cached document (no nonce) keeps answering meanwhile.
+func TestFreshQuotesPerClientAreLimitedAndTheCachedDocumentIsNot(t *testing.T) {
+	vm := &fakeAttester{}
+	ts, _ := attestedServer(t, vm)
+	nonce := "0102030405060708"
+	var last int
+	for i := 0; i < attestationPerClient+1; i++ {
+		response, _ := getAttestation(t, ts, "?nonce="+nonce)
+		last = response.StatusCode
+	}
+	if last != http.StatusTooManyRequests {
+		t.Fatalf("the %dth fresh quote in a minute was admitted: %d", attestationPerClient+1, last)
+	}
+	if len(vm.asked) != attestationPerClient {
+		t.Fatalf("the VM was asked %d times, want %d", len(vm.asked), attestationPerClient)
+	}
+	response, _ := getAttestation(t, ts, "")
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("the cached document was refused: %d", response.StatusCode)
+	}
+}
+
+// The agent's error text never reaches the outside: a failing VM is told as a plain 503.
+func TestAFailingVMsErrorTextStaysInside(t *testing.T) {
+	ts, _ := attestedServer(t, &fakeAttester{fail: true})
+	response, err := http.Get(ts.URL + AttestationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable || bytes.Contains(raw, []byte("unexpected EOF")) {
+		t.Fatalf("status %d body %s", response.StatusCode, raw)
 	}
 }

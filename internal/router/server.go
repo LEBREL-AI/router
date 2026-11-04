@@ -104,6 +104,8 @@ type Settings struct {
 	// Attester is the confidential VM's guest agent when the router runs in one: it serves the
 	// quote at /.well-known/attestation bound to the receipt-signing key. Nil outside a VM.
 	Attester dstack.Attester
+	// KeySource names where the receipt-signing seed came from: "vm-kms" or "env".
+	KeySource string
 }
 
 type Server struct {

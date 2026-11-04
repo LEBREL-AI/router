@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -26,6 +27,14 @@ const attestationNonceMax = 32
 // attestationCacheFor is how long a quote without a nonce is reused.
 const attestationCacheFor = 5 * time.Minute
 
+// attestationInFlight bounds the quotes asked of the VM at once: the guest agent makes them one at
+// a time, so beyond this the answer is a 429, never a queue that drains the agent.
+const attestationInFlight = 2
+
+// attestationPerClient is how many fresh quotes (with a nonce) one client address may ask per
+// minute; without a nonce the cached document costs nothing.
+const attestationPerClient = 12
+
 // AttestationReportData is what the quote's 64-byte report data commits to: the receipt-signing
 // public key, with the verifier's nonce when one is given. report_data = SHA-512(domain || public
 // key || nonce), so a verifier recomputes it from the document and compares it with the quote.
@@ -42,9 +51,12 @@ type AttestationDocument struct {
 	Kind string `json:"kind"`
 	// Scheme names how report_data is derived, for verifiers.
 	Scheme string `json:"scheme"`
-	// PublicKey and SigningKeyID are the receipt-signing key the quote is bound to.
+	// PublicKey and SigningKeyID are the receipt-signing key the quote is bound to; KeySource says
+	// where the key came from: "vm-kms" (derived inside, by the VM's KMS for this app and compose)
+	// or "env" (handed in; never inside a VM in production).
 	PublicKey    string `json:"public_key"`
 	SigningKeyID string `json:"signing_key_id"`
+	KeySource    string `json:"key_source"`
 	InstanceID   string `json:"instance_id"`
 	Nonce        string `json:"nonce"`
 	ReportData   string `json:"report_data"`
@@ -60,6 +72,52 @@ type attestationCache struct {
 	mu       sync.Mutex
 	document *AttestationDocument
 	expires  time.Time
+	// info is the app's identity, read once: it cannot change while the VM runs.
+	info    *dstack.Info
+	inUse   int
+	clients map[string]*attestationClient
+}
+
+type attestationClient struct {
+	count   int
+	resetAt time.Time
+}
+
+// admit reserves one of the quote slots and one of the client's fresh quotes for this minute;
+// it returns the code of the refusal when it cannot.
+func (c *attestationCache) admit(client string, fresh bool, now time.Time) (release func(), refused string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if fresh {
+		if c.clients == nil {
+			c.clients = map[string]*attestationClient{}
+		}
+		if len(c.clients) > 4096 {
+			for key, entry := range c.clients {
+				if now.After(entry.resetAt) {
+					delete(c.clients, key)
+				}
+			}
+		}
+		entry := c.clients[client]
+		if entry == nil || now.After(entry.resetAt) {
+			entry = &attestationClient{resetAt: now.Add(time.Minute)}
+			c.clients[client] = entry
+		}
+		if entry.count >= attestationPerClient {
+			return nil, "too_many_quotes"
+		}
+		entry.count++
+	}
+	if c.inUse >= attestationInFlight {
+		return nil, "attestation_busy"
+	}
+	c.inUse++
+	return func() {
+		c.mu.Lock()
+		c.inUse--
+		c.mu.Unlock()
+	}, ""
 }
 
 // attestation builds the document; without a nonce the last one is reused for a few minutes.
@@ -81,9 +139,20 @@ func (s *Server) attestation(ctx context.Context, nonce []byte) (*AttestationDoc
 	if err != nil {
 		return nil, err
 	}
-	info, err := s.settings.Attester.Info(ctx)
-	if err != nil {
-		return nil, err
+	s.attestations.mu.Lock()
+	cachedInfo := s.attestations.info
+	s.attestations.mu.Unlock()
+	var info dstack.Info
+	if cachedInfo != nil {
+		info = *cachedInfo
+	} else {
+		info, err = s.settings.Attester.Info(ctx)
+		if err != nil {
+			return nil, err
+		}
+		s.attestations.mu.Lock()
+		s.attestations.info = &info
+		s.attestations.mu.Unlock()
 	}
 	eventLog := json.RawMessage(quote.EventLog)
 	if !json.Valid(eventLog) {
@@ -91,7 +160,7 @@ func (s *Server) attestation(ctx context.Context, nonce []byte) (*AttestationDoc
 	}
 	document := &AttestationDocument{
 		Kind: "lebrel-router-attestation", Scheme: "report_data = sha512(\"" + attestationDomain + "\" || public_key || nonce)",
-		PublicKey: hex.EncodeToString(s.settings.Signer.Public), SigningKeyID: s.settings.Signer.KeyID, InstanceID: s.settings.Signer.InstanceID,
+		PublicKey: hex.EncodeToString(s.settings.Signer.Public), SigningKeyID: s.settings.Signer.KeyID, KeySource: s.settings.KeySource, InstanceID: s.settings.Signer.InstanceID,
 		Nonce: hex.EncodeToString(nonce), ReportData: hex.EncodeToString(reportData),
 		Quote: hex.EncodeToString(quote.Quote), EventLog: eventLog, Info: info, IssuedAt: now.Unix(),
 	}
@@ -123,9 +192,23 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusNotFound, "attestation_unavailable", "this instance does not run in an attested VM")
 		return
 	}
+	client, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		client = r.RemoteAddr
+	}
+	release, refused := s.attestations.admit(client, len(nonce) > 0, s.settings.Now())
+	if refused != "" {
+		w.Header().Set("Retry-After", "5")
+		s.writeError(w, http.StatusTooManyRequests, refused, "the attestation is being asked faster than the machine can quote; try again in a few seconds")
+		return
+	}
+	defer release()
 	document, err := s.attestation(r.Context(), nonce)
 	if err != nil {
-		s.writeError(w, http.StatusServiceUnavailable, "attestation_unavailable", err.Error())
+		if s.settings.Logger != nil {
+			s.settings.Logger.Printf("attestation: %v", err)
+		}
+		s.writeError(w, http.StatusServiceUnavailable, "attestation_unavailable", "the machine could not produce a quote right now")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

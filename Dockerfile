@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # Reproducible image of the Lebrel router: pinned toolchain and base images (by digest), no CGO,
 # no build ids, no timestamps. `scripts/reproducible-build.sh` builds it twice and compares.
 # The build stage runs on the builder's own architecture and cross-compiles for the target: the

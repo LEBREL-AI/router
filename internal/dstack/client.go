@@ -73,6 +73,9 @@ func New(socket string) *Client {
 				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 					return dialer.DialContext(ctx, "unix", socket)
 				},
+				// The agent answers quotes one at a time: a few connections are all it can use.
+				MaxConnsPerHost:     4,
+				MaxIdleConnsPerHost: 2,
 			},
 		},
 	}
