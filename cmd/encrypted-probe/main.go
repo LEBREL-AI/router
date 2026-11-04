@@ -90,7 +90,7 @@ func main() {
 	must(err, "key configuration")
 	fmt.Printf("key document signed by the attested key, encryption key %s… matches the quote\n", metadata.KeyID[:16])
 
-	inner, _ := json.Marshal(map[string]any{"model": *model, "messages": []map[string]string{{"role": "user", "content": *prompt}}, "max_tokens": 16})
+	inner, _ := json.Marshal(map[string]any{"model": *model, "messages": []map[string]string{{"role": "user", "content": *prompt}}, "max_tokens": 64})
 	salt := make([]byte, 16)
 	_, _ = rand.Read(salt)
 	// The salt goes first: the router cuts it out and salts the receipt's digests with it.
@@ -121,6 +121,10 @@ func main() {
 		if choices, ok := parsed["choices"].([]any); ok && len(choices) > 0 {
 			if message, ok := choices[0].(map[string]any)["message"].(map[string]any); ok {
 				text = str(message["content"])
+				if text == "" {
+					// A thinking model may spend its tokens reasoning: show that it answered at all.
+					fmt.Printf("reasoning (decrypted, first 200 chars): %.200s\n", str(message["reasoning"])+str(message["reasoning_content"]))
+				}
 			}
 		}
 	}
