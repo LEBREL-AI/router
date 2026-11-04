@@ -5,7 +5,7 @@ check that the running machine is this code:
 
 | Version | Git tag | Image digest | dstack compose hash | Since |
 |---|---|---|---|---|
-| 1.0.0 | `v1.0.0` | `sha256:67566c5629e9541d9188feee2955034b6bb16def2ecf9d1a6585317363c9c465` | _(recorded at the first deployment)_ | 2026-11-04 |
+| 1.0.0 | `v1.0.0` | `sha256:67566c5629e9541d9188feee2955034b6bb16def2ecf9d1a6585317363c9c465` | `38b091826b3ce68e832d61e95282b358104717e1825b778c12c3d231b1980c24` | 2026-11-04 |
 
 How a release is made: tag the commit; run `scripts/reproducible-build.sh <tag>` (two clean builds,
 same digest, or the release stops); push that image to `ghcr.io/lebrel-ai/router` and pin its digest
