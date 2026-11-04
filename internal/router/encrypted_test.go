@@ -2,6 +2,7 @@ package router
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 	"github.com/tinfoilsh/encrypted-http-body-protocol/protocol"
 	"lebrel-router/internal/auth"
 	"lebrel-router/internal/ledger"
+	"lebrel-router/internal/limit"
 )
 
 // encryptedServer is the router as the attested VM runs it: with an encryption identity born from
@@ -107,9 +110,23 @@ func clientIdentity(t *testing.T, ts *httptest.Server, signer *Signer) (*identit
 	return id, metadata.KeyID
 }
 
+// withSentAt puts the moment of sending (the test clock) first inside a body, after the salt if
+// the body carries one; a body that already names it is left alone.
+func withSentAt(body string) string {
+	if strings.Contains(body, `"lebrel_sent_at"`) {
+		return body
+	}
+	stamp := `"lebrel_sent_at":1900000000,`
+	if prefix := `{"lebrel_receipt_salt":"`; strings.HasPrefix(body, prefix) {
+		end := strings.Index(body[len(prefix):], `",`) + len(prefix) + 2
+		return body[:end] + stamp + body[end:]
+	}
+	return "{" + stamp + body[1:]
+}
+
 func encryptedPost(t *testing.T, ts *httptest.Server, client *identity.Identity, keyID string, body string, key string) (*http.Response, []byte) {
 	t.Helper()
-	request, _ := http.NewRequest(http.MethodPost, ts.URL+"/m/deepseek--deepseek-v4.1-flash/v1/chat/completions", strings.NewReader(body))
+	request, _ := http.NewRequest(http.MethodPost, ts.URL+"/m/deepseek--deepseek-v4.1-flash/v1/chat/completions", strings.NewReader(withSentAt(body)))
 	request.Header.Set("Authorization", "Bearer "+key)
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Lebrel-Encryption-Key-Id", keyID)
@@ -183,7 +200,7 @@ func TestReplayStaleKeyAndBadFramingAreRefused(t *testing.T) {
 	lab := newFakeUpstream(t, okJSON(`{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}`))
 	ts, signer, _ := encryptedServer(t, lab)
 	client, keyID := clientIdentity(t, ts, signer)
-	request, _ := http.NewRequest(http.MethodPost, ts.URL+"/m/deepseek--deepseek-v4.1-flash/v1/chat/completions", strings.NewReader(`{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`))
+	request, _ := http.NewRequest(http.MethodPost, ts.URL+"/m/deepseek--deepseek-v4.1-flash/v1/chat/completions", strings.NewReader(withSentAt(`{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`)))
 	request.Header.Set("Authorization", "Bearer "+testKey)
 	context, err := client.EncryptRequestWithContext(request)
 	if err != nil {
@@ -448,7 +465,7 @@ func TestTheEncryptionKeyRotatesDailyAndYesterdaysKeyStillServes(t *testing.T) {
 	if err := encryption.Rotate(day(6)); err != nil {
 		t.Fatal(err)
 	}
-	request, _ := http.NewRequest(http.MethodPost, ts.URL+"/m/deepseek--deepseek-v4.1-flash/v1/chat/completions", strings.NewReader(`{"model":"deepseek/deepseek-v4.1-flash","messages":[]}`))
+	request, _ := http.NewRequest(http.MethodPost, ts.URL+"/m/deepseek--deepseek-v4.1-flash/v1/chat/completions", strings.NewReader(withSentAt(`{"model":"deepseek/deepseek-v4.1-flash","messages":[]}`)))
 	request.Header.Set("Authorization", "Bearer "+testKey)
 	request.Header.Set("X-Lebrel-Encryption-Key-Id", first)
 	if _, err := client.EncryptRequestWithContext(request); err != nil {
@@ -474,8 +491,8 @@ func TestTheEncryptionKeyRotatesDailyAndYesterdaysKeyStillServes(t *testing.T) {
 // of tomorrow) and forgotten after; one account cannot fill the table for everyone, and a request
 // forgotten (refused before credit was reserved) frees its account's share.
 func TestAReplayIsRememberedWhileItsKeyLivesAndForgottenAfter(t *testing.T) {
-	if encryptedReplayFor < 48*time.Hour+time.Hour {
-		t.Fatalf("replays are forgotten (%s) before a key can be gone (two days and the clock's skew)", encryptedReplayFor)
+	if encryptedReplayFor < 2*encryptedClockSkew+time.Minute {
+		t.Fatalf("replays are forgotten (%s) while a request's moment of sending is still accepted (%s either way)", encryptedReplayFor, encryptedClockSkew)
 	}
 	encryption, err := NewEncryption(bytes.Repeat([]byte{9}, 32), "router-test")
 	if err != nil {
@@ -531,7 +548,7 @@ func TestTheKeyIsCheckedBeforeDecryptionAndARefusedRequestIsForgotten(t *testing
 	}
 	ts, signer := encryptedServerWith(t, lab, encryption, func(s *Settings) { s.Ledger = ledger.NewInMemory(map[string]int64{"acct_test_000001": 0}) })
 	client, keyID := clientIdentity(t, ts, signer)
-	request, _ := http.NewRequest(http.MethodPost, ts.URL+"/m/deepseek--deepseek-v4.1-flash/v1/chat/completions", strings.NewReader(`{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`))
+	request, _ := http.NewRequest(http.MethodPost, ts.URL+"/m/deepseek--deepseek-v4.1-flash/v1/chat/completions", strings.NewReader(withSentAt(`{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`)))
 	request.Header.Set("Authorization", "Bearer leb_live_wrong_key")
 	request.Header.Set("X-Lebrel-Encryption-Key-Id", keyID)
 	if _, err := client.EncryptRequestWithContext(request); err != nil {
@@ -621,7 +638,7 @@ func TestTheEdgeIsCheckedBeforeAnythingIsReadOrRemembered(t *testing.T) {
 	}
 	ts, signer := encryptedServerWith(t, lab, encryption, func(s *Settings) { s.EdgeProxySecret = "edge-secret" })
 	client, keyID := clientIdentity(t, ts, signer)
-	request, _ := http.NewRequest(http.MethodPost, ts.URL+"/m/deepseek--deepseek-v4.1-flash/v1/chat/completions", strings.NewReader(`{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`))
+	request, _ := http.NewRequest(http.MethodPost, ts.URL+"/m/deepseek--deepseek-v4.1-flash/v1/chat/completions", strings.NewReader(withSentAt(`{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`)))
 	request.Header.Set("Authorization", "Bearer "+testKey)
 	request.Header.Set("X-Lebrel-Encryption-Key-Id", keyID)
 	context, err := client.EncryptRequestWithContext(request)
@@ -684,5 +701,126 @@ func TestAnEncryptedBodyBeyondTheLimitIsRefusedBeforeDecryption(t *testing.T) {
 	}
 	if len(lab.requests) != 0 {
 		t.Fatal("the lab was called")
+	}
+}
+
+// The client's fields are cut out exactly: the salt (optional) first, then the moment of sending
+// (required); anything else about them is the client's error.
+func TestTheClientFieldsAreCutOutExactly(t *testing.T) {
+	salt := strings.Repeat("ab", 16)
+	good := map[string]struct {
+		body, want string
+		salted     bool
+	}{
+		"salt then sent_at": {`{"lebrel_receipt_salt":"` + salt + `","lebrel_sent_at":1900000000,"model":"m","a":[1, 2]}`, `{"model":"m","a":[1, 2]}`, true},
+		"sent_at only":      {`{"lebrel_sent_at":1900000000,"model":"m"}`, `{"model":"m"}`, false},
+		"nothing after":     {`{"lebrel_sent_at":1900000000}`, `{}`, false},
+	}
+	for name, c := range good {
+		body, got, sentAt, err := stripClientFields([]byte(c.body))
+		if err != nil || string(body) != c.want || sentAt != 1900000000 || (len(got) > 0) != c.salted {
+			t.Fatalf("%s: body %q salt %x sent_at %d err %v", name, body, got, sentAt, err)
+		}
+	}
+	bad := map[string]string{
+		"no sent_at":          `{"model":"m"}`,
+		"salt without sent":   `{"lebrel_receipt_salt":"` + salt + `","model":"m"}`,
+		"sent_at not first":   `{"model":"m","lebrel_sent_at":1900000000}`,
+		"sent_at twice":       `{"lebrel_sent_at":1900000000,"lebrel_sent_at":1900000001,"model":"m"}`,
+		"sent_at not digits":  `{"lebrel_sent_at":"1900000000","model":"m"}`,
+		"sent_at too long":    `{"lebrel_sent_at":1900000000000000,"model":"m"}`,
+		"salt after sent_at":  `{"lebrel_sent_at":1900000000,"lebrel_receipt_salt":"` + salt + `","model":"m"}`,
+		"space before comma":  `{"lebrel_receipt_salt":"` + salt + `" ,"lebrel_sent_at":1900000000,"model":"m"}`,
+		"leading whitespace":  ` {"lebrel_sent_at":1900000000,"model":"m"}`,
+		"dangling after sent": `{"lebrel_sent_at":1900000000}x`,
+	}
+	for name, body := range bad {
+		if _, _, _, err := stripClientFields([]byte(body)); err == nil {
+			t.Fatalf("%s: accepted", name)
+		}
+	}
+}
+
+// A request sent outside the five-minute window, or without its moment of sending, is refused
+// inside the envelope and forgotten; nothing reaches the lab.
+func TestARequestOutsideTheClockWindowIsRefusedAndForgotten(t *testing.T) {
+	lab := newFakeUpstream(t, okJSON(`{}`))
+	encryption, err := NewEncryption(bytes.Repeat([]byte{9}, 32), "router-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, signer := encryptedServerWith(t, lab, encryption, nil)
+	client, keyID := clientIdentity(t, ts, signer)
+	for name, body := range map[string]string{
+		"ten minutes old":      `{"lebrel_sent_at":1899999400,"model":"deepseek/deepseek-v4.1-flash","messages":[]}`,
+		"ten minutes ahead":    `{"lebrel_sent_at":1900000600,"model":"deepseek/deepseek-v4.1-flash","messages":[]}`,
+		"no moment of sending": `{"lebrel_receipt_salt":"` + strings.Repeat("ab", 16) + `","model":"deepseek/deepseek-v4.1-flash","messages":[]}`,
+	} {
+		// Posted raw: the helper would give the salted body the field it lacks on purpose.
+		request, _ := http.NewRequest(http.MethodPost, ts.URL+"/m/deepseek--deepseek-v4.1-flash/v1/chat/completions", strings.NewReader(body))
+		request.Header.Set("Authorization", "Bearer "+testKey)
+		request.Header.Set("X-Lebrel-Encryption-Key-Id", keyID)
+		context, err := client.EncryptRequestWithContext(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := context.DecryptResponse(response); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		plain, _ := io.ReadAll(response.Body)
+		if response.StatusCode != http.StatusBadRequest || !(strings.Contains(string(plain), "request_expired") || strings.Contains(string(plain), "lebrel_sent_at")) {
+			t.Fatalf("%s: %d %s", name, response.StatusCode, plain)
+		}
+		if len(encryption.replays) != 0 {
+			t.Fatalf("%s: the refused request stayed remembered", name)
+		}
+	}
+	if len(lab.requests) != 0 {
+		t.Fatal("the lab was called")
+	}
+	// Four minutes either way is within the window.
+	response, plain := encryptedPost(t, ts, client, keyID, `{"lebrel_sent_at":1899999760,"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`, testKey)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("four minutes old: %d %s", response.StatusCode, plain)
+	}
+}
+
+type countingLimiter struct {
+	limit.ConcurrencyLimiter
+	mu   sync.Mutex
+	keys []string
+}
+
+func (c *countingLimiter) Acquire(ctx context.Context, key string, maximum int) (limit.ReleaseFunc, error) {
+	c.mu.Lock()
+	c.keys = append(c.keys, key)
+	c.mu.Unlock()
+	return c.ConcurrencyLimiter.Acquire(ctx, key, maximum)
+}
+
+// The key's and the account's concurrency slots are taken once, before the encrypted body is
+// read, and handed down to the completion handler.
+func TestTheConcurrencySlotsAreTakenOnceBeforeTheBodyIsRead(t *testing.T) {
+	lab := newFakeUpstream(t, okJSON(`{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}`))
+	encryption, err := NewEncryption(bytes.Repeat([]byte{9}, 32), "router-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	counting := &countingLimiter{ConcurrencyLimiter: limit.NewInMemory()}
+	ts, signer := encryptedServerWith(t, lab, encryption, func(s *Settings) { s.Limiter = counting })
+	client, keyID := clientIdentity(t, ts, signer)
+	response, plain := encryptedPost(t, ts, client, keyID, `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`, testKey)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("%d %s", response.StatusCode, plain)
+	}
+	counting.mu.Lock()
+	keys := append([]string(nil), counting.keys...)
+	counting.mu.Unlock()
+	if len(keys) != 2 || !strings.HasPrefix(keys[0], "key:") || !strings.HasPrefix(keys[1], "account:") {
+		t.Fatalf("slots taken: %v", keys)
 	}
 }
