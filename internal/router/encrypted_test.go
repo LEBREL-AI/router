@@ -823,16 +823,21 @@ func TestTheConcurrencySlotsAreTakenOnceBeforeTheBodyIsRead(t *testing.T) {
 	if len(keys) < 3 || !strings.HasPrefix(keys[0], "key:") || !strings.HasPrefix(keys[1], "account:") {
 		t.Fatalf("slots taken: %v", keys)
 	}
-	// Then the body's bytes: one unit per MiB, or the whole 8 MiB when the length is unknown.
-	units := 0
+	// Then the body's bytes, per key, per account and for the machine: one unit per MiB, or the
+	// whole 8 MiB when the length is unknown.
+	units := map[string]int{}
 	for _, key := range keys[2:] {
-		if !strings.HasPrefix(key, "bytes:") {
+		switch {
+		case strings.HasPrefix(key, "bytes:key:"), strings.HasPrefix(key, "bytes:account:"), key == "bytes:machine":
+			units[strings.SplitN(key, ":", 3)[1]]++
+		default:
 			t.Fatalf("slots taken: %v", keys)
 		}
-		units++
 	}
-	if units != 1 && units != EncryptedRequestMax/encryptedBudgetUnit {
-		t.Fatalf("%d byte units taken for a small body", units)
+	for _, scope := range []string{"key", "account", "machine"} {
+		if units[scope] != 1 && units[scope] != EncryptedRequestMax/encryptedBudgetUnit {
+			t.Fatalf("%d byte units taken for the %s with a small body", units[scope], scope)
+		}
 	}
 }
 

@@ -326,6 +326,15 @@ func TestAFullLineOrAWaitThatRunsOutIsToldAsBusy(t *testing.T) {
 	if renewed, _ := getAttestation(t, ts, ""); renewed.StatusCode != http.StatusOK {
 		t.Fatalf("the shared document was not renewed while the line was full: %d", renewed.StatusCode)
 	}
+	// A renewal already in flight is waited for a bounded time, then the asker is told busy.
+	cache.invalidate()
+	cache.mu.Lock()
+	cache.renew <- struct{}{}
+	cache.mu.Unlock()
+	if busy, _ := getAttestation(t, ts, ""); busy.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("a renewal in flight did not bound the wait: %d", busy.StatusCode)
+	}
+	<-cache.renew
 	cache.mu.Lock()
 	for i := 0; i < attestationInFlight; i++ {
 		<-cache.slots

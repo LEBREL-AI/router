@@ -82,10 +82,12 @@ and the account's concurrency slots are taken before the encrypted body is read,
 path. A route's attestation is quoted again, once, when the encryption key rotates while the
 machine quotes.
 
-From 1.3.4 bytes in flight are bounded per key as well (one unit per MiB of body, 128 per key),
-the per-account share of the replay table is 262,144 entries, the shared attestation document is
-renewed outside the quote line (one renewal at a time, so a crowd asking for fresh quotes starves
-nobody), and a document is not cached if the key rotated since its quote.
+From 1.3.4 bytes in flight are bounded as well (one unit per MiB of body: 128 per key or the
+key's own concurrency when higher, 256 per account or the account's, 1,024 for the machine), the
+per-account share of the replay table is 262,144 entries, the shared attestation document is
+renewed outside the quote line (one renewal at a time, the others waiting for it ten seconds at
+most, so a crowd asking for fresh quotes starves nobody and a slow agent lines nobody up), and a
+document is not cached if the key rotated since its quote.
 
 Two compose files are kept: `deploy/dstack/docker-compose.yml` (the machine reached through the
 dstack gateway hostname; its TLS terminates at Phala's gateway, outside the quote) and
