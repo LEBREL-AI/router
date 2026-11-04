@@ -27,6 +27,17 @@ import (
 // a fixed secret, one route to a fake lab, and a known API key.
 func encryptedServer(t *testing.T, lab *fakeUpstream) (*httptest.Server, *Signer, *Encryption) {
 	t.Helper()
+	encryption, err := NewEncryption(bytes.Repeat([]byte{9}, 32), "router-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, signer := encryptedServerWith(t, lab, encryption, nil)
+	return ts, signer, encryption
+}
+
+// encryptedServerWith is encryptedServer with the given identity and any settings tuned.
+func encryptedServerWith(t *testing.T, lab *fakeUpstream, encryption *Encryption, tune func(*Settings)) (*httptest.Server, *Signer) {
+	t.Helper()
 	t.Setenv("TEST_UPSTREAM_KEY", "sk-upstream-secret")
 	secret := make([]byte, 32)
 	_, _ = rand.Read(secret)
@@ -36,20 +47,20 @@ func encryptedServer(t *testing.T, lab *fakeUpstream) (*httptest.Server, *Signer
 	if err != nil {
 		t.Fatal(err)
 	}
-	encryption, err := NewEncryption(bytes.Repeat([]byte{9}, 32), "router-test")
-	if err != nil {
-		t.Fatal(err)
-	}
 	route := routeFor(upstream("deepseek/api", lab.server.URL, 1))
-	server, err := New(Settings{Routes: Config{Routes: []Route{route}}, Auth: authenticator, Ledger: inMemory, Signer: signer,
+	settings := Settings{Routes: Config{Routes: []Route{route}}, Auth: authenticator, Ledger: inMemory, Signer: signer,
 		Receipts: NewReceiptStore(time.Hour, 100), Settlements: runningQueue(t, inMemory), Verification: NewVerification(""), BoardURL: "https://models.lebrel.ai/watch",
-		Now: func() time.Time { return time.Unix(1_900_000_000, 0) }, Encryption: encryption, KeySource: "vm-kms", MaxRequestBytes: 8 << 20})
+		Now: func() time.Time { return time.Unix(1_900_000_000, 0) }, Encryption: encryption, KeySource: "vm-kms", MaxRequestBytes: 8 << 20}
+	if tune != nil {
+		tune(&settings)
+	}
+	server, err := New(settings)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(server)
 	t.Cleanup(ts.Close)
-	return ts, signer, encryption
+	return ts, signer
 }
 
 // A client as the SDK behaves: fetches the route's signed key document, checks the signature with
@@ -262,7 +273,7 @@ func TestTheAttestationBindsTheEncryptionKeyToo(t *testing.T) {
 		t.Fatalf("status %d", response.StatusCode)
 	}
 	want := hex.EncodeToString(AttestationReportData(signer.Public, encryption.PublicKey(), nil))
-	if document.ReportData != want || document.EncryptionPublicKey != hex.EncodeToString(encryption.PublicKey()) || document.EncryptionKeyID != encryption.KeyID() || !strings.Contains(document.Scheme, "encryption_public_key") {
+	if document.ReportData != want || document.EncryptionPublicKey != hex.EncodeToString(encryption.PublicKey()) || document.EncryptionKeyID != encryption.KeyID() || !strings.Contains(document.Scheme, "len(encryption_public_key) || encryption_public_key") {
 		t.Fatalf("encryption key not bound: %+v", document)
 	}
 }
@@ -285,5 +296,275 @@ func TestAStreamedAnswerIsEncryptedFrameByFrame(t *testing.T) {
 	}
 	if len(lines) != 5 || lines[4] != "data: [DONE]" || !strings.Contains(lines[0], "hello") {
 		t.Fatalf("decrypted stream: %q", lines)
+	}
+}
+
+// receiptOf decodes the receipt a response carries and checks its signature.
+func receiptOf(t *testing.T, response *http.Response, signer *Signer) map[string]any {
+	t.Helper()
+	decoded, err := base64.StdEncoding.DecodeString(response.Header.Get(receiptHeader))
+	if err != nil || len(decoded) == 0 {
+		t.Fatalf("no receipt on the answer: %v", response.Header)
+	}
+	var document SignedDocument
+	if err := json.Unmarshal(decoded, &document); err != nil {
+		t.Fatal(err)
+	}
+	if !Verify(document, signer.Public) {
+		t.Fatal("receipt signature does not verify")
+	}
+	return document.Payload
+}
+
+func saltedDigest(salt []byte, body string) string {
+	h := sha256.New()
+	h.Write(salt)
+	h.Write([]byte(body))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// A salt the client puts first inside the encrypted body is cut out before the lab sees the
+// request and salts the receipt's digests: anyone reading the receipt can no longer confirm a
+// guessed prompt or answer, while the client, who knows the salt, still can. Streamed answers too.
+func TestAClientSaltKeepsTheReceiptsDigestsPrivateToTheTwoEnds(t *testing.T) {
+	salt := bytes.Repeat([]byte{0xA5}, 16)
+	inner := `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`
+	body := `{"` + ReceiptSaltField + `":"` + hex.EncodeToString(salt) + `",` + inner[1:]
+
+	lab := newFakeUpstream(t, okJSON(`{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}`))
+	ts, signer, _ := encryptedServer(t, lab)
+	client, keyID := clientIdentity(t, ts, signer)
+	response, plain := encryptedPost(t, ts, client, keyID, body, testKey)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status %d body %s", response.StatusCode, plain)
+	}
+	if _, leaked := lab.last(t).body[ReceiptSaltField]; leaked {
+		t.Fatal("the salt reached the lab")
+	}
+	payload := receiptOf(t, response, signer)
+	if payload["hash_salt_scheme"] != ReceiptSaltScheme || payload["prompt_sha256"] != saltedDigest(salt, inner) || payload["response_sha256"] != saltedDigest(salt, "hello world") {
+		t.Fatalf("digests not salted as the scheme says: %v", payload)
+	}
+	if payload["prompt_sha256"] == SHA256Hex([]byte(inner)) || payload["response_sha256"] == SHA256Hex([]byte("hello world")) {
+		t.Fatal("a plain digest is still in the receipt")
+	}
+
+	// Without a salt the digests are plain and the receipt names no scheme.
+	response, plain = encryptedPost(t, ts, client, keyID, inner, testKey)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status %d body %s", response.StatusCode, plain)
+	}
+	payload = receiptOf(t, response, signer)
+	if _, named := payload["hash_salt_scheme"]; named || payload["prompt_sha256"] != SHA256Hex([]byte(inner)) {
+		t.Fatalf("an unsalted receipt changed: %v", payload)
+	}
+
+	// A streamed answer: the receipt stored afterwards carries the salted digest of the whole text.
+	streamed := newFakeUpstream(t, sseHandler)
+	ts, signer, _ = encryptedServer(t, streamed)
+	client, keyID = clientIdentity(t, ts, signer)
+	streamBody := `{"` + ReceiptSaltField + `":"` + hex.EncodeToString(salt) + `","model":"deepseek/deepseek-v4.1-flash","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	response, plain = encryptedPost(t, ts, client, keyID, streamBody, testKey)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(plain), "[DONE]") {
+		t.Fatalf("stream: %d %s", response.StatusCode, plain)
+	}
+	store := ts.Config.Handler.(*Server).settings.Receipts
+	requestID := response.Header.Get("X-Request-ID")
+	var document SignedDocument
+	var stored bool
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline) && !stored; {
+		if document, stored = store.Get(requestID); !stored {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if !stored || document.Payload["hash_salt_scheme"] != ReceiptSaltScheme || document.Payload["response_sha256"] != saltedDigest(salt, "hello world") || document.Payload["prompt_sha256"] != saltedDigest(salt, `{"model":"deepseek/deepseek-v4.1-flash","stream":true,"messages":[{"role":"user","content":"hi"}]}`) {
+		t.Fatalf("stream receipt not salted: stored=%v %v", stored, document.Payload)
+	}
+}
+
+// A salt that is malformed, or not the first field, is the client's error, told inside the
+// envelope before any lab is called.
+func TestAMalformedOrMisplacedSaltIsRefusedInsideTheEnvelope(t *testing.T) {
+	lab := newFakeUpstream(t, okJSON(`{}`))
+	ts, signer, _ := encryptedServer(t, lab)
+	client, keyID := clientIdentity(t, ts, signer)
+	for name, body := range map[string]string{
+		"not hex":      `{"` + ReceiptSaltField + `":"zz","model":"deepseek/deepseek-v4.1-flash","messages":[]}`,
+		"too short":    `{"` + ReceiptSaltField + `":"abcd","model":"deepseek/deepseek-v4.1-flash","messages":[]}`,
+		"not a string": `{"` + ReceiptSaltField + `":12,"model":"deepseek/deepseek-v4.1-flash","messages":[]}`,
+		"not first":    `{"model":"deepseek/deepseek-v4.1-flash","` + ReceiptSaltField + `":"` + strings.Repeat("ab", 16) + `","messages":[]}`,
+	} {
+		response, plain := encryptedPost(t, ts, client, keyID, body, testKey)
+		if response.StatusCode != http.StatusBadRequest || !strings.Contains(string(plain), ReceiptSaltField) {
+			t.Fatalf("%s: status %d body %s", name, response.StatusCode, plain)
+		}
+	}
+	if len(lab.requests) != 0 {
+		t.Fatal("the lab was called")
+	}
+}
+
+// The encryption key is born per UTC day: after midnight the key document names the new key, a
+// client still holding yesterday's key document is served, and one from two days ago is told to
+// fetch the document again. Within a day Rotate changes nothing; a derivation that fails keeps the
+// key in use.
+func TestTheEncryptionKeyRotatesDailyAndYesterdaysKeyStillServes(t *testing.T) {
+	derive := func(epoch string) ([]byte, error) {
+		if epoch == "2026-11-07" {
+			return nil, fmt.Errorf("kms unreachable")
+		}
+		secret := sha256.Sum256([]byte("secret:" + epoch))
+		return secret[:], nil
+	}
+	day := func(d int) time.Time { return time.Date(2026, 11, d, 0, 0, 5, 0, time.UTC) }
+	encryption, err := NewRotatingEncryption(derive, "router-test", day(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lab := newFakeUpstream(t, okJSON(`{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}`))
+	ts, signer := encryptedServerWith(t, lab, encryption, nil)
+	client, keyID := clientIdentity(t, ts, signer)
+	first := encryption.KeyID()
+	if keyID != first {
+		t.Fatal("the published key is not today's")
+	}
+	if err := encryption.Rotate(day(4).Add(20 * time.Hour)); err != nil || encryption.KeyID() != first {
+		t.Fatalf("rotated within the day: %v %s", err, encryption.KeyID())
+	}
+	if err := encryption.Rotate(day(5)); err != nil {
+		t.Fatal(err)
+	}
+	second := encryption.KeyID()
+	if second == first {
+		t.Fatal("a new day did not bring a new key")
+	}
+	if _, published := clientIdentity(t, ts, signer); published != second {
+		t.Fatal("the key document does not name the new key")
+	}
+	response, plain := encryptedPost(t, ts, client, first, `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`, testKey)
+	if response.StatusCode != http.StatusOK || response.Header.Get("X-Lebrel-Encryption-Key-Id") != first {
+		t.Fatalf("yesterday's key refused: %d %s", response.StatusCode, plain)
+	}
+	if err := encryption.Rotate(day(6)); err != nil {
+		t.Fatal(err)
+	}
+	request, _ := http.NewRequest(http.MethodPost, ts.URL+"/m/deepseek--deepseek-v4.1-flash/v1/chat/completions", strings.NewReader(`{"model":"deepseek/deepseek-v4.1-flash","messages":[]}`))
+	request.Header.Set("Authorization", "Bearer "+testKey)
+	request.Header.Set("X-Lebrel-Encryption-Key-Id", first)
+	if _, err := client.EncryptRequestWithContext(request); err != nil {
+		t.Fatal(err)
+	}
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusUnprocessableEntity || !strings.Contains(response.Header.Get("Content-Type"), "problem+json") {
+		t.Fatalf("a key two days old: %d %s", response.StatusCode, response.Header.Get("Content-Type"))
+	}
+	third := encryption.KeyID()
+	if err := encryption.Rotate(day(7)); err == nil || encryption.KeyID() != third {
+		t.Fatalf("a failed derivation changed the key: %v %s", err, encryption.KeyID())
+	}
+	if len(lab.requests) != 1 {
+		t.Fatalf("the lab was called %d times", len(lab.requests))
+	}
+}
+
+// A remembered encapsulation is forgotten once its key is gone: the table never grows without
+// bound and a restart's empty table is no weaker than a table whose entries have expired.
+func TestAReplayIsRememberedWhileItsKeyLivesAndForgottenAfter(t *testing.T) {
+	encryption, err := NewEncryption(bytes.Repeat([]byte{9}, 32), "router-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encapsulation := bytes.Repeat([]byte{1}, 32)
+	start := time.Unix(1_900_000_000, 0)
+	if fresh, _ := encryption.remember(encapsulation, start); !fresh {
+		t.Fatal("first sight not fresh")
+	}
+	if fresh, _ := encryption.remember(encapsulation, start.Add(encryptedReplayFor-time.Minute)); fresh {
+		t.Fatal("a replay within the key's life was admitted")
+	}
+	if fresh, _ := encryption.remember(encapsulation, start.Add(encryptedReplayFor+time.Minute)); !fresh {
+		t.Fatal("an encapsulation whose key is gone is still remembered")
+	}
+	if len(encryption.replays) != 1 {
+		t.Fatalf("expired entries are kept: %d", len(encryption.replays))
+	}
+}
+
+// The edge is checked before the body is read or anything remembered: an outsider's ciphertext is
+// refused in clear and leaves no trace, so the same request through the edge is not a replay.
+func TestTheEdgeIsCheckedBeforeAnythingIsReadOrRemembered(t *testing.T) {
+	lab := newFakeUpstream(t, okJSON(`{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}`))
+	encryption, err := NewEncryption(bytes.Repeat([]byte{9}, 32), "router-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, signer := encryptedServerWith(t, lab, encryption, func(s *Settings) { s.EdgeProxySecret = "edge-secret" })
+	client, keyID := clientIdentity(t, ts, signer)
+	request, _ := http.NewRequest(http.MethodPost, ts.URL+"/m/deepseek--deepseek-v4.1-flash/v1/chat/completions", strings.NewReader(`{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Authorization", "Bearer "+testKey)
+	request.Header.Set("X-Lebrel-Encryption-Key-Id", keyID)
+	context, err := client.EncryptRequestWithContext(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(request.Body)
+	send := func(edge bool) *http.Response {
+		again, _ := http.NewRequest(http.MethodPost, request.URL.String(), bytes.NewReader(body))
+		again.Header = request.Header.Clone()
+		again.Header.Del("Transfer-Encoding")
+		if edge {
+			again.Header.Set(edgeAuthorizationHeader, "v1="+DeriveEdgeProxyToken("edge-secret"))
+		}
+		response, err := http.DefaultClient.Do(again)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	outsider := send(false)
+	raw, _ := io.ReadAll(outsider.Body)
+	if outsider.StatusCode != http.StatusUnauthorized || !strings.Contains(string(raw), "edge_unauthorized") || outsider.Header.Get(protocol.ResponseNonceHeader) != "" {
+		t.Fatalf("outsider: %d %s", outsider.StatusCode, raw)
+	}
+	if len(encryption.replays) != 0 {
+		t.Fatal("the outsider's ciphertext was remembered")
+	}
+	through := send(true)
+	if err := context.DecryptResponse(through); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = io.ReadAll(through.Body)
+	if through.StatusCode != http.StatusOK {
+		t.Fatalf("through the edge: %d %s", through.StatusCode, raw)
+	}
+	if len(lab.requests) != 1 {
+		t.Fatalf("the lab was called %d times", len(lab.requests))
+	}
+}
+
+// An encrypted body beyond the limit is refused before any decryption is tried.
+func TestAnEncryptedBodyBeyondTheLimitIsRefusedBeforeDecryption(t *testing.T) {
+	lab := newFakeUpstream(t, okJSON(`{}`))
+	encryption, err := NewEncryption(bytes.Repeat([]byte{9}, 32), "router-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, _ := encryptedServerWith(t, lab, encryption, func(s *Settings) { s.MaxRequestBytes = 1024 })
+	request, _ := http.NewRequest(http.MethodPost, ts.URL+"/m/deepseek--deepseek-v4.1-flash/v1/chat/completions", bytes.NewReader(make([]byte, 2048)))
+	request.Header.Set("Authorization", "Bearer "+testKey)
+	request.Header.Set(protocol.EncapsulatedKeyHeader, strings.Repeat("ab", 32))
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusRequestEntityTooLarge || !strings.Contains(string(raw), "request_too_large") || response.Header.Get(protocol.ResponseNonceHeader) != "" {
+		t.Fatalf("over the limit: %d %s", response.StatusCode, raw)
+	}
+	if len(lab.requests) != 0 {
+		t.Fatal("the lab was called")
 	}
 }

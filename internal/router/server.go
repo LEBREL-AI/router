@@ -712,9 +712,13 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 	}
 	receipt := ReceiptInput{
 		RequestID: requestID, ModelID: route.ModelID, ManifestIdentity: manifestIdentity, Upstream: upstream.Name, UpstreamModel: upstream.Model,
-		Verification: status, PromptSHA256: SHA256Hex(original), FeeBPS: route.Pricing.FeeBPS, Streamed: info.Stream,
-		PricingTier: PricingTier(percent), MultiplierPercent: percent,
+		Verification: status, FeeBPS: route.Pricing.FeeBPS, Streamed: info.Stream,
+		PricingTier: PricingTier(percent), MultiplierPercent: percent, HashSalt: receiptSalt(ctx),
 	}
+	if len(receipt.HashSalt) > 0 {
+		receipt.HashSaltScheme = ReceiptSaltScheme
+	}
+	receipt.PromptSHA256 = receipt.Digest(original)
 	started := s.settings.Now()
 	var cut bool
 	if info.Stream {
@@ -1039,7 +1043,7 @@ func (s *Server) finishBuffered(w http.ResponseWriter, response *http.Response, 
 	assistant := extractAssistant(body)
 	receipt.ServedModel, receipt.Provider = assistant.Model, assistant.Provider
 	receipt.UpstreamResponseID, receipt.UpstreamSystemFingerprint = assistant.ResponseID, assistant.SystemFingerprint
-	receipt.ResponseSHA256 = SHA256Hex([]byte(assistant.Text))
+	receipt.ResponseSHA256 = receipt.Digest([]byte(assistant.Text))
 	receipt.PromptTokens, receipt.CompletionTokens, receipt.CachedTokens = usage.PromptTokens, usage.CompletionTokens, usage.CachedTokens
 	receipt.UsageExact, receipt.PriceMicrousd = exact, actual
 	document, err := s.settings.Signer.RouteReceipt(receipt, s.settings.Now())
@@ -1190,7 +1194,7 @@ func (s *Server) finishStream(w http.ResponseWriter, response *http.Response, up
 	}
 	receipt.ServedModel, receipt.Provider = servedModel, provider
 	receipt.UpstreamResponseID, receipt.UpstreamSystemFingerprint = responseID, systemFingerprint
-	receipt.ResponseSHA256 = SHA256Hex([]byte(text.String()))
+	receipt.ResponseSHA256 = receipt.Digest([]byte(text.String()))
 	receipt.PromptTokens, receipt.CompletionTokens, receipt.CachedTokens = usage.PromptTokens, usage.CompletionTokens, usage.CachedTokens
 	receipt.UsageExact, receipt.PriceMicrousd = exact, actual
 	if document, err := s.settings.Signer.RouteReceipt(receipt, s.settings.Now()); err == nil {

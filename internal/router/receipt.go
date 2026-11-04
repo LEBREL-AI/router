@@ -178,6 +178,22 @@ type ReceiptInput struct {
 	// the lab's own record of the answer: its response id and the backend configuration it reported
 	UpstreamResponseID        string
 	UpstreamSystemFingerprint string
+	// HashSalt is the client's salt for the digests (sent inside an encrypted request); empty means
+	// plain SHA-256. HashSaltScheme names it in the receipt (ReceiptSaltScheme).
+	HashSalt       []byte
+	HashSaltScheme string
+}
+
+// Digest is the receipt's digest of a body: plain SHA-256, or SHA-256 over the client's salt and
+// the body when the request carried one.
+func (input ReceiptInput) Digest(body []byte) string {
+	if len(input.HashSalt) == 0 {
+		return SHA256Hex(body)
+	}
+	h := sha256.New()
+	h.Write(input.HashSalt)
+	h.Write(body)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func (s *Signer) RouteReceipt(input ReceiptInput, now time.Time) (SignedDocument, error) {
@@ -208,6 +224,9 @@ func (s *Signer) RouteReceipt(input ReceiptInput, now time.Time) (SignedDocument
 		"issued_at":                   now.Unix(),
 		"instance_id":                 s.InstanceID,
 		"signing_key_id":              s.KeyID,
+	}
+	if input.HashSaltScheme != "" {
+		payload["hash_salt_scheme"] = input.HashSaltScheme
 	}
 	return s.Sign(payload)
 }

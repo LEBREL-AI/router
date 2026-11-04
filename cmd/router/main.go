@@ -93,7 +93,7 @@ func run(logger *log.Logger) error {
 	// RECEIPT_SIGNING_SEED still wins (the non-attested deployment).
 	var attester dstack.Attester
 	keySource := "env"
-	var encryptionSeed []byte
+	var deriveEncryption func(epoch string) ([]byte, error)
 	seedText := env("RECEIPT_SIGNING_SEED", "")
 	var seed []byte
 	if socket := env("DSTACK_SOCKET", dstack.DefaultSocket); dstack.Available(socket) {
@@ -127,17 +127,21 @@ func run(logger *log.Logger) error {
 			seed = derived[:32]
 			keySource = "vm-kms"
 			logger.Printf("receipt signing seed derived inside the attested VM for compose %s", info.ComposeHash)
-			// The HPKE key clients encrypt to is born inside too, under its own path.
-			ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
-			encryptionSecret, err := client.Key(ctx2, "lebrel-router/encryption/"+info.ComposeHash, "x25519 secret of the request-encryption key", "ed25519")
-			cancel2()
-			if err != nil {
-				return fmt.Errorf("encryption key from the VM's KMS: %w", err)
+			// The HPKE key clients encrypt to is born inside too, under its own path, one key per
+			// UTC day: a ciphertext captured today is beyond reach once its day's key is gone.
+			compose := info.ComposeHash
+			deriveEncryption = func(epoch string) ([]byte, error) {
+				ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel2()
+				secret, err := client.Key(ctx2, "lebrel-router/encryption/"+compose+"/"+epoch, "x25519 secret of the request-encryption key", "ed25519")
+				if err != nil {
+					return nil, fmt.Errorf("encryption key from the VM's KMS: %w", err)
+				}
+				if len(secret) < 32 {
+					return nil, errors.New("encryption key from the VM's KMS is shorter than 32 bytes")
+				}
+				return secret[:32], nil
 			}
-			if len(encryptionSecret) < 32 {
-				return errors.New("encryption key from the VM's KMS is shorter than 32 bytes")
-			}
-			encryptionSeed = encryptionSecret[:32]
 		}
 	}
 	if seedText == "" && seed == nil {
@@ -170,12 +174,13 @@ func run(logger *log.Logger) error {
 	// Encrypted requests are accepted only where the key is born inside the attested VM; a
 	// deployment outside one serves plaintext routed requests as before.
 	var encryption *router.Encryption
-	if encryptionSeed != nil {
-		encryption, err = router.NewEncryption(encryptionSeed, instance)
+	if deriveEncryption != nil {
+		encryption, err = router.NewRotatingEncryption(deriveEncryption, instance, time.Now())
 		if err != nil {
 			return fmt.Errorf("encryption identity: %w", err)
 		}
-		logger.Printf("encryption key id=%s public=%s (derived inside the attested VM)", encryption.KeyID(), hex.EncodeToString(encryption.PublicKey()))
+		encryption.RotateDaily(context.Background(), time.Now, func(err error) { logger.Printf("encryption key rotation: %v", err) })
+		logger.Printf("encryption key id=%s public=%s (derived inside the attested VM for today's epoch)", encryption.KeyID(), hex.EncodeToString(encryption.PublicKey()))
 	}
 
 	verification := router.NewVerification(env("BOARD_SOURCE", ""))
