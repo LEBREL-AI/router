@@ -2,14 +2,16 @@
 # no build ids, no timestamps. `scripts/reproducible-build.sh` builds it twice and compares.
 # The build stage runs on the builder's own architecture and cross-compiles for the target: the
 # confidential VMs are x86-64, so the published image is linux/amd64 (scripts/reproducible-build.sh).
-FROM --platform=$BUILDPLATFORM golang:1.24.11-alpine@sha256:ef75fa8822a4c0fb53a390548b3dc1c39639339ec3373c58f5441117e1ff46ae AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.3-alpine@sha256:91eda9776261207ea25fd06b5b7fed8d397dd2c0a283e77f2ab6e91bfa71079d AS build
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum ./
+COPY vendor ./vendor
 COPY cmd ./cmd
 COPY internal ./internal
-ENV CGO_ENABLED=0 GOFLAGS=-trimpath GOOS=$TARGETOS GOARCH=$TARGETARCH
+# The one dependency (Tinfoil's EHBP, MIT) is vendored: the build touches no network.
+ENV CGO_ENABLED=0 GOFLAGS="-trimpath -mod=vendor" GOOS=$TARGETOS GOARCH=$TARGETARCH GOTOOLCHAIN=local
 RUN go build -ldflags="-s -w -buildid=" -o /out/lebrel-router ./cmd/router && mkdir -p /out/state
 
 # distroless static: CA certificates for the labs' TLS, no shell, runs as nonroot.

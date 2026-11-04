@@ -7,8 +7,10 @@
 
 What it checks, in order:
   1. The document at /.well-known/attestation answers, with a fresh nonce of our choosing.
-  2. The TDX quote's report data equals SHA-512("lebrel-router-attestation-v1" || public_key ||
-     nonce): the quote was made for this receipt-signing key and for our nonce, now.
+  2. The TDX quote's report data equals SHA-512("lebrel-router-attestation-v2" || public_key ||
+     encryption_public_key || nonce): the quote was made for this receipt-signing key, for the key
+     clients encrypt requests to, and for our nonce, now (v1 documents, without an encryption key,
+     used the v1 domain and no encryption key).
   3. Every runtime event (RTMR3) in the event log is recomputed from its type, name and payload
      (digest = SHA-384(le32(type) || ":" || name || ":" || payload)) and the whole log replays into
      the RTMRs the quote carries (RTMR[i] = SHA-384(RTMR[i] || digest) from 48 zero bytes). Only
@@ -47,7 +49,8 @@ import sys
 import tempfile
 import urllib.request
 
-DOMAIN = b"lebrel-router-attestation-v1"
+DOMAIN_V1 = b"lebrel-router-attestation-v1"
+DOMAIN_V2 = b"lebrel-router-attestation-v2"
 QUOTE_HEADER = 48
 TD_REPORT_OFFSETS = {
     "tee_tcb_svn": (0, 16), "mr_seam": (16, 48), "mr_signer_seam": (64, 48), "seam_attributes": (112, 8),
@@ -222,9 +225,16 @@ def main() -> int:
         public_key = bytes.fromhex(document["public_key"])
         quote = bytes.fromhex(document["quote"])
         report = td_report(quote)
-        expected = hashlib.sha512(DOMAIN + public_key + nonce).digest()
-        check("report_data binds the receipt key and our nonce", report["report_data"] == expected and document.get("report_data") == expected.hex(),
-              f"public_key={public_key.hex()} nonce={nonce.hex()[:16]}…")
+        scheme = str(document.get("scheme", ""))
+        encryption_key = bytes.fromhex(document.get("encryption_public_key") or "")
+        if "attestation-v2" in scheme:
+            expected = hashlib.sha512(DOMAIN_V2 + public_key + encryption_key + nonce).digest()
+            what = "report_data binds the receipt key, the encryption key and our nonce"
+        else:
+            expected = hashlib.sha512(DOMAIN_V1 + public_key + nonce).digest()
+            what = "report_data binds the receipt key and our nonce (v1 document, no encryption key)"
+        check(what, report["report_data"] == expected and document.get("report_data") == expected.hex(),
+              f"public_key={public_key.hex()} encryption_key={encryption_key.hex() or '(none)'} nonce={nonce.hex()[:16]}…")
         if args.public_key:
             check("receipt key equals the expected one", public_key.hex() == args.public_key.lower(), f"expected={args.public_key}")
         if args.key_id:

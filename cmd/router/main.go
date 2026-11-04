@@ -93,6 +93,7 @@ func run(logger *log.Logger) error {
 	// RECEIPT_SIGNING_SEED still wins (the non-attested deployment).
 	var attester dstack.Attester
 	keySource := "env"
+	var encryptionSeed []byte
 	seedText := env("RECEIPT_SIGNING_SEED", "")
 	var seed []byte
 	if socket := env("DSTACK_SOCKET", dstack.DefaultSocket); dstack.Available(socket) {
@@ -126,6 +127,17 @@ func run(logger *log.Logger) error {
 			seed = derived[:32]
 			keySource = "vm-kms"
 			logger.Printf("receipt signing seed derived inside the attested VM for compose %s", info.ComposeHash)
+			// The HPKE key clients encrypt to is born inside too, under its own path.
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+			encryptionSecret, err := client.Key(ctx2, "lebrel-router/encryption/"+info.ComposeHash, "x25519 secret of the request-encryption key", "ed25519")
+			cancel2()
+			if err != nil {
+				return fmt.Errorf("encryption key from the VM's KMS: %w", err)
+			}
+			if len(encryptionSecret) < 32 {
+				return errors.New("encryption key from the VM's KMS is shorter than 32 bytes")
+			}
+			encryptionSeed = encryptionSecret[:32]
 		}
 	}
 	if seedText == "" && seed == nil {
@@ -155,6 +167,16 @@ func run(logger *log.Logger) error {
 		return err
 	}
 	logger.Printf("receipt signing key id=%s public=%s", signer.KeyID, hex.EncodeToString(signer.Public))
+	// Encrypted requests are accepted only where the key is born inside the attested VM; a
+	// deployment outside one serves plaintext routed requests as before.
+	var encryption *router.Encryption
+	if encryptionSeed != nil {
+		encryption, err = router.NewEncryption(encryptionSeed, instance)
+		if err != nil {
+			return fmt.Errorf("encryption identity: %w", err)
+		}
+		logger.Printf("encryption key id=%s public=%s (derived inside the attested VM)", encryption.KeyID(), hex.EncodeToString(encryption.PublicKey()))
+	}
 
 	verification := router.NewVerification(env("BOARD_SOURCE", ""))
 	if keyHex := env("BOARD_PUBLIC_KEY_HEX", ""); keyHex != "" {
@@ -240,7 +262,7 @@ func run(logger *log.Logger) error {
 		HealthToken: strings.TrimSpace(env("HEALTH_TOKEN", "")),
 		Receipts:    router.NewReceiptStore(24*time.Hour, 100_000), Verification: verification,
 		BoardURL: env("BOARD_URL", ""), EdgeProxySecret: env("EDGE_PROXY_SECRET", ""), MaxRequestBytes: maxBytes, Logger: logger,
-		Attester: attester, KeySource: keySource,
+		Attester: attester, KeySource: keySource, Encryption: encryption,
 	})
 	if err != nil {
 		return err
