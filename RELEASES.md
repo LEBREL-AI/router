@@ -49,14 +49,23 @@ Rows 1.0.0–1.0.2 were deployed with the seed handed in as an encrypted environ
 far as that human is trusted. From 1.1.0 the seed is derived inside; from 1.2.0 the derivation
 includes the compose hash and an explicit seed is refused inside a VM in production.
 
-From 1.3.1 the request-encryption key is derived per UTC day (`lebrel-router/encryption/<compose
-hash>/<YYYY-MM-DD>`) and rotated at midnight, the previous day's key serving one more day, so the
-attestation names the key of the day rather than one fixed key per release; the quote's report data
-binds the receipt key, the encryption key and the verifier's nonce each behind its length (v3); fresh
-quotes wait their turn in a short line instead of being counted per address; and a client may put a
-salt first inside its encrypted body (`lebrel_receipt_salt`), which the router cuts out and uses to
-salt the receipt's digests (`hash_salt_scheme: client-salt-v1`), so a receipt's prompt and answer
-hashes are checkable by the two ends only.
+From 1.3.1 the quote's report data binds the receipt key, the encryption key and the verifier's
+nonce each behind its length (v3); fresh quotes wait their turn in a short line instead of being
+counted per address; and a client may put a salt first inside its encrypted body
+(`lebrel_receipt_salt`), which the router cuts out and uses to salt the receipt's digests
+(`hash_salt_scheme: client-salt-v1`), so a receipt's prompt and answer hashes are checkable by the
+two ends only.
+
+From 1.3.2 the request-encryption key is born at random inside the VM, per boot and per UTC day
+(the previous day's kept one more day), and is never derived from the VM's key service: that
+service derives keys per app, so a key taken from it could be derived again by any compose the
+app's owner registers, whereas a key born in the VM's memory exists nowhere else and the quote
+binds it. The receipt-signing key stays an app key derived inside the VM (the same for every
+compose registered under the app, which is what makes old receipts verifiable): a route manifest
+says with `attested: true` when its signer runs inside an attested VM, and a data note never claims
+more. The API key is checked before an encrypted body is read, an encapsulation is remembered under
+its account (4,096 live entries each, 50 hours, longer than a key's life) and forgotten again when
+the request is refused before credit is reserved.
 
 Two compose files are kept: `deploy/dstack/docker-compose.yml` (the machine reached through the
 dstack gateway hostname; its TLS terminates at Phala's gateway, outside the quote) and

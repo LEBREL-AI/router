@@ -101,8 +101,10 @@ func ManifestIdentity(payload map[string]any) (string, error) {
 
 // RouteManifest describes one route: the public model id, its level, the upstreams it
 // may use (host and model id, never keys) and the pricing. Signed and republished
-// every window like a serving manifest; receipts reference its identity.
-func (s *Signer) RouteManifest(route Route, boardURL string, now time.Time, window time.Duration) (SignedDocument, string, error) {
+// every window like a serving manifest; receipts reference its identity. attested says
+// whether the signer runs inside an attested VM (its quote at /.well-known/attestation
+// binds the signing key): a manifest signed elsewhere says so too.
+func (s *Signer) RouteManifest(route Route, boardURL string, now time.Time, window time.Duration, attested bool) (SignedDocument, string, error) {
 	upstreams := make([]any, 0, len(route.Upstreams))
 	for _, u := range route.Upstreams {
 		upstreams = append(upstreams, map[string]any{"name": u.Name, "base_url": u.BaseURL, "model": u.Model, "data_note": u.DataNote})
@@ -124,6 +126,7 @@ func (s *Signer) RouteManifest(route Route, boardURL string, now time.Time, wind
 		"data_note":             route.DataNote,
 		"verification_board":    boardURL,
 		"claims":                "route only: the receipt proves where a request went and what the last probe of that upstream said, not which weights answered",
+		"attested":              attested,
 		"issued_at":             now.Unix(),
 		"expires_at":            now.Add(window).Unix(),
 		"signing_key_id":        s.KeyID,

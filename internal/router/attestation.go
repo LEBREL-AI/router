@@ -96,6 +96,13 @@ type attestationCache struct {
 	wait time.Duration
 }
 
+// invalidate drops the cached document: the keys it names are no longer the current ones.
+func (c *attestationCache) invalidate() {
+	c.mu.Lock()
+	c.document = nil
+	c.mu.Unlock()
+}
+
 // admit takes a quote slot, waiting in line for up to attestationWait; it returns the code of the
 // refusal when the line is full or the wait ran out.
 func (c *attestationCache) admit(ctx context.Context) (release func(), refused string) {
@@ -147,8 +154,7 @@ func (s *Server) attestation(ctx context.Context, nonce []byte) (*AttestationDoc
 	var encryptionPublic []byte
 	encryptionKeyID := ""
 	if s.settings.Encryption != nil {
-		encryptionPublic = s.settings.Encryption.PublicKey()
-		encryptionKeyID = s.settings.Encryption.KeyID()
+		encryptionPublic, encryptionKeyID = s.settings.Encryption.Current()
 	}
 	reportData := AttestationReportData(s.settings.Signer.Public, encryptionPublic, nonce)
 	quote, err := s.settings.Attester.Quote(ctx, reportData)

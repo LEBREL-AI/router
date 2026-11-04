@@ -91,8 +91,11 @@ func Available(socket string) bool {
 }
 
 // Key asks the KMS-derived key for this app under path and purpose; algorithm is "ed25519" or
-// "secp256k1". The 32 bytes returned are deterministic for this app's measurement: every instance
-// of the same compose gets the same key, and nothing outside the measured VM can obtain it.
+// "secp256k1". The 32 bytes returned are deterministic for this app and path: every VM booted
+// from a compose registered under the app (by the app's owner) derives the same key for the same
+// path, and nothing outside such a VM can obtain it. The path names the compose by convention,
+// which is not a binding: a secret that must exist in one measured build only is born at random
+// inside that VM instead (the request-encryption key).
 func (c *Client) Key(ctx context.Context, path, purpose, algorithm string) ([]byte, error) {
 	var out struct {
 		Key            string   `json:"key"`

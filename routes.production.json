@@ -7,7 +7,7 @@
       "level": 2,
       "family": "deepseek-v4.1-flash",
       "claimed_revision": "deepseek-flash",
-      "data_note": "Relayed by Lebrel's attested router through OpenRouter, pinned to DeepSeek's own API: with the encrypted client only the router, inside its attested machine, reads the request; OpenRouter forwards it without storing it; DeepSeek sees it, not you, and keeps its own retention policy (China). If OpenRouter cannot answer, the request goes to DeepSeek's API directly. DeepSeek's off-peak rate plus 20%; its peak-hour surcharge (weekdays 01-04 and 06-10 UTC, except Chinese public holidays) is passed through.",
+      "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to DeepSeek's own API: with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; DeepSeek sees it, not you, and keeps its own retention policy (China). If OpenRouter cannot answer, the request goes to DeepSeek's API directly. DeepSeek's off-peak rate plus 20%; its peak-hour surcharge (weekdays 01-04 and 06-10 UTC, except Chinese public holidays) is passed through.",
       "upstreams": [
         {
           "name": "openrouter/deepseek",
@@ -91,7 +91,7 @@
       "level": 2,
       "family": "deepseek-v4-pro",
       "claimed_revision": "deepseek-v4-pro",
-      "data_note": "Relayed by Lebrel's attested router through OpenRouter, pinned to DeepSeek's own API: with the encrypted client only the router, inside its attested machine, reads the request; OpenRouter forwards it without storing it; DeepSeek sees it, not you, and keeps its own retention policy (China). If OpenRouter cannot answer, the request goes to DeepSeek's API directly. DeepSeek's off-peak rate plus 20%; its peak-hour surcharge (weekdays 01-04 and 06-10 UTC, except Chinese public holidays) is passed through.",
+      "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to DeepSeek's own API: with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; DeepSeek sees it, not you, and keeps its own retention policy (China). If OpenRouter cannot answer, the request goes to DeepSeek's API directly. DeepSeek's off-peak rate plus 20%; its peak-hour surcharge (weekdays 01-04 and 06-10 UTC, except Chinese public holidays) is passed through.",
       "upstreams": [
         {
           "name": "openrouter/deepseek",
@@ -175,7 +175,7 @@
       "level": 2,
       "family": "glm-5.3-flash",
       "claimed_revision": "glm-5.3-flash",
-      "data_note": "Relayed by Lebrel's attested router to Z.ai's own API: with the encrypted client only the router, inside its attested machine, reads the request; Z.ai sees it, not you, and keeps its own retention policy. Z.ai's published rate plus 20%.",
+      "data_note": "Relayed by Lebrel's router to Z.ai's own API: with the encrypted client only the router reads the request; Z.ai sees it, not you, and keeps its own retention policy. Z.ai's published rate plus 20%.",
       "upstreams": [
         {
           "name": "zai/api-flash",
@@ -207,7 +207,7 @@
       "level": 2,
       "family": "glm-5.3",
       "claimed_revision": "glm-5.3",
-      "data_note": "Relayed by Lebrel's attested router to Z.ai's own API: with the encrypted client only the router, inside its attested machine, reads the request; Z.ai sees it, not you, and keeps its own retention policy. Z.ai's published rate plus 20%.",
+      "data_note": "Relayed by Lebrel's router to Z.ai's own API: with the encrypted client only the router reads the request; Z.ai sees it, not you, and keeps its own retention policy. Z.ai's published rate plus 20%.",
       "upstreams": [
         {
           "name": "zai/api",
@@ -239,7 +239,7 @@
       "level": 2,
       "family": "kimi-k3",
       "claimed_revision": "kimi-k3",
-      "data_note": "Relayed by Lebrel's attested router to Moonshot AI's own API: with the encrypted client only the router, inside its attested machine, reads the request; Moonshot AI sees it, not you, and keeps its own retention policy. Moonshot AI's published rate plus 20%.",
+      "data_note": "Relayed by Lebrel's router to Moonshot AI's own API: with the encrypted client only the router reads the request; Moonshot AI sees it, not you, and keeps its own retention policy. Moonshot AI's published rate plus 20%.",
       "upstreams": [
         {
           "name": "moonshot/api",
@@ -271,7 +271,7 @@
       "level": 2,
       "family": "qwen3.8-max",
       "claimed_revision": "qwen/qwen3.8-max-0902",
-      "data_note": "Relayed by Lebrel's attested router through OpenRouter, pinned to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): with the encrypted client only the router, inside its attested machine, reads the request; OpenRouter forwards it without storing it; Alibaba sees it, not you, and keeps its own retention policy. Alibaba's list rate plus 20%. This endpoint always reasons: reasoning tokens are billed as output, and a client asking for no reasoning gets the lowest effort.",
+      "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; Alibaba sees it, not you, and keeps its own retention policy. Alibaba's list rate plus 20%. This endpoint always reasons: reasoning tokens are billed as output, and a client asking for no reasoning gets the lowest effort.",
       "upstreams": [
         {
           "name": "openrouter/alibaba",
@@ -317,7 +317,7 @@
       "level": 2,
       "family": "qwen3.8-flash",
       "claimed_revision": "qwen/qwen3.8-flash",
-      "data_note": "Relayed by Lebrel's attested router through OpenRouter, pinned to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): with the encrypted client only the router, inside its attested machine, reads the request; OpenRouter forwards it without storing it; Alibaba sees it, not you, and keeps its own retention policy. Alibaba's list rate plus 20%.",
+      "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; Alibaba sees it, not you, and keeps its own retention policy. Alibaba's list rate plus 20%.",
       "upstreams": [
         {
           "name": "openrouter/alibaba",

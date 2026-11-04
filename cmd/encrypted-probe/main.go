@@ -42,7 +42,7 @@ func main() {
 	edge := flag.String("edge-token", os.Getenv("LEBREL_EDGE_TOKEN"), "edge authorization (lebrel.ai's edge sets it; direct calls need it)")
 	prompt := flag.String("prompt", "Reply with the single word: encrypted", "prompt")
 	pinnedKey := flag.String("public-key", "", "receipt key (hex) the attestation must name: RELEASES.md's row")
-	pinnedCompose := flag.String("compose-hash", "", "compose hash (hex) the attestation must measure: RELEASES.md's row")
+	pinnedCompose := flag.String("compose-hash", "", "compose hash (hex) the attestation document must state: RELEASES.md's row (the measured value is what scripts/verify-attestation.py checks)")
 	flag.Parse()
 	if *key == "" {
 		fmt.Fprintln(os.Stderr, "an API key is required (-key or LEBREL_API_KEY)")
@@ -63,7 +63,7 @@ func main() {
 		fail("the attestation names receipt key " + str(attested["public_key"]) + ", not the pinned one")
 	}
 	if *pinnedCompose != "" && !strings.EqualFold(str(info["compose_hash"]), *pinnedCompose) {
-		fail("the attestation measures compose " + str(info["compose_hash"]) + ", not the pinned one")
+		fail("the attestation states compose " + str(info["compose_hash"]) + ", not the pinned one")
 	}
 	fmt.Printf("attested receipt key %s…, encryption key id %s…, compose %s…, instance %s (verify the quote with scripts/verify-attestation.py)\n", str(attested["signing_key_id"])[:16], encryptionKeyID[:16], str(info["compose_hash"])[:16], str(attested["instance_id"]))
 
@@ -144,7 +144,9 @@ func checkReceipt(encoded string, receiptKey ed25519.PublicKey, salt []byte, sen
 		Payload   map[string]any `json:"payload"`
 		Signature string         `json:"signature"`
 	}
-	must(json.Unmarshal(raw, &document), "receipt")
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	must(decoder.Decode(&document), "receipt")
 	canonical, err := canonicalJSON(document.Payload)
 	must(err, "receipt payload")
 	signature, _ := base64.StdEncoding.DecodeString(document.Signature)
@@ -205,6 +207,8 @@ func canonicalJSON(value any) ([]byte, error) {
 		}
 		buffer.WriteByte(']')
 		return buffer.Bytes(), nil
+	case json.Number:
+		return []byte(v), nil
 	case float64:
 		if v == float64(int64(v)) {
 			return []byte(strconv.FormatInt(int64(v), 10)), nil

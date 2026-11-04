@@ -215,6 +215,9 @@ func New(settings Settings) (*Server, error) {
 	if settings.EdgeProxySecret != "" {
 		server.edgeToken = DeriveEdgeProxyToken(settings.EdgeProxySecret)
 	}
+	if settings.Encryption != nil {
+		settings.Encryption.SetRotationHook(server.attestations.invalidate)
+	}
 	return server, nil
 }
 
@@ -374,7 +377,7 @@ func (s *Server) manifest(route *Route) (SignedDocument, string, error) {
 	if cached, ok := s.manifests[route.ModelID]; ok && now.Before(cached.expires.Add(-time.Minute)) {
 		return cached.document, cached.identity, nil
 	}
-	document, identity, err := s.settings.Signer.RouteManifest(*route, s.settings.BoardURL, now, s.settings.ManifestWindow)
+	document, identity, err := s.settings.Signer.RouteManifest(*route, s.settings.BoardURL, now, s.settings.ManifestWindow, s.settings.KeySource == "vm-kms")
 	if err != nil {
 		return SignedDocument{}, "", err
 	}
@@ -566,7 +569,12 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 	ctx, stop := context.WithCancelCause(r.Context())
 	defer stop(nil)
 	defer context.AfterFunc(s.cutCtx, func() { stop(errShutdownCut) })()
-	principal, err := s.settings.Auth.Authenticate(ctx, r.Header.Get("Authorization"))
+	// The encrypted path authenticates the key before decrypting and hands the principal over.
+	principal, already := ctx.Value(principalKey{}).(auth.Principal)
+	var err error
+	if !already {
+		principal, err = s.settings.Auth.Authenticate(ctx, r.Header.Get("Authorization"))
+	}
 	if err != nil {
 		if errors.Is(err, auth.ErrUnauthorized) {
 			s.writeError(w, http.StatusUnauthorized, "invalid_api_key", "invalid API key")
@@ -655,6 +663,9 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 			s.writeError(w, http.StatusServiceUnavailable, "billing_unavailable", "billing is temporarily unavailable")
 		}
 		return
+	}
+	if a, ok := ctx.Value(admissionKey{}).(*admission); ok {
+		a.reserved = true
 	}
 	settled := false
 	servedBy := ""

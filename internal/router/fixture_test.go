@@ -26,7 +26,7 @@ func TestWriteRouteFixture(t *testing.T) {
 	}
 	route := routeFor(Upstream{Name: "deepseek/api", BaseURL: "https://api.deepseek.com/v1", Model: "deepseek-flash", UsageFormat: "deepseek", DataNote: "the lab's own API"})
 	now := time.Unix(1_900_000_000, 0)
-	manifest, identity, err := signer.RouteManifest(route, "https://models.lebrel.ai/watch", now, time.Hour)
+	manifest, identity, err := signer.RouteManifest(route, "https://models.lebrel.ai/watch", now, time.Hour, false)
 	if err != nil {
 		t.Fatal(err)
 	}
