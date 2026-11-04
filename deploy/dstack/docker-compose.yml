@@ -5,10 +5,13 @@
 # variables, which the KMS releases only to this measured app.
 services:
   router:
-    image: ghcr.io/lebrel-ai/router@sha256:67566c5629e9541d9188feee2955034b6bb16def2ecf9d1a6585317363c9c465
+    image: ghcr.io/lebrel-ai/router@sha256:1b0079066e90ca902c0e11db6b139dc7e40ea0aa00c9eb796ebc6741da23e574
     restart: unless-stopped
     ports:
       - "8080:8090"
+    volumes:
+      # Settlement journal on the CVM's encrypted disk: owed settlements survive a restart.
+      - router-state:/var/lib/lebrel-router
     environment:
       # Measured, public.
       - ENVIRONMENT=production
@@ -33,3 +36,5 @@ services:
       - ZAI_API_KEY=${ZAI_API_KEY}
       - MOONSHOT_API_KEY=${MOONSHOT_API_KEY}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+volumes:
+  router-state:
