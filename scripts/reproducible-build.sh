@@ -18,6 +18,12 @@ if [ "${SKIP_GIT_CHECK:-}" != "1" ]; then
     echo "HEAD is not tag $TAG ($(git describe --tags --always))" >&2; exit 1
   fi
 fi
+if docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
+  if ! docker buildx inspect "$BUILDER" | grep -q "BuildKit version: *v0.27.1"; then
+    echo "builder $BUILDER runs another BuildKit; recreating it with $BUILDKIT_IMAGE" >&2
+    docker buildx rm "$BUILDER" >/dev/null
+  fi
+fi
 docker buildx inspect "$BUILDER" >/dev/null 2>&1 || docker buildx create --name "$BUILDER" --driver docker-container --driver-opt "image=$BUILDKIT_IMAGE" --bootstrap >/dev/null
 mkdir -p "$OUT"
 build() {

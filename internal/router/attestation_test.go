@@ -195,3 +195,30 @@ func TestAFailingVMsErrorTextStaysInside(t *testing.T) {
 		t.Fatalf("status %d body %s", response.StatusCode, raw)
 	}
 }
+
+// A refusal for a full machine is not counted against the client, and a fresh cached document is
+// served even while the machine is busy quoting.
+func TestARefusalDoesNotCountAndTheCacheIsServedWhileBusy(t *testing.T) {
+	vm := &fakeAttester{}
+	ts, _ := attestedServer(t, vm)
+	getAttestation(t, ts, "")
+	cache := &ts.Config.Handler.(*Server).attestations
+	cache.mu.Lock()
+	cache.inUse = attestationInFlight
+	cache.mu.Unlock()
+	response, _ := getAttestation(t, ts, "?nonce=0102")
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("a full machine admitted a fresh quote: %d", response.StatusCode)
+	}
+	cached, _ := getAttestation(t, ts, "")
+	if cached.StatusCode != http.StatusOK {
+		t.Fatalf("the cached document was refused while busy: %d", cached.StatusCode)
+	}
+	cache.mu.Lock()
+	count := cache.clients["127.0.0.1"].count
+	cache.inUse = 0
+	cache.mu.Unlock()
+	if count != 0 {
+		t.Fatalf("the refused request was counted: %d", count)
+	}
+}
