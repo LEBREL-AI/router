@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ecdh"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/tinfoilsh/encrypted-http-body-protocol/identity"
 	"github.com/tinfoilsh/encrypted-http-body-protocol/protocol"
+	"lebrel-router/internal/auth"
 )
 
 // End-to-end encryption of routed requests (EHBP, the same protocol the editions' runtime speaks):
@@ -32,12 +34,16 @@ const EncryptionMetadataPath = "/.well-known/lebrel-encryption"
 // encryptionMetadataLifetime bounds how long a published key document is valid; clients refetch.
 const encryptionMetadataLifetime = 5 * time.Minute
 
-// encryptedReplayEntries bounds the encapsulations remembered against replay; each is forgotten
-// after encryptedReplayFor, and the key under which it was made rotates daily, so a captured
-// ciphertext is worthless once its key is gone.
+// encryptedReplayEntries bounds the encapsulations remembered against replay, and
+// encryptedReplayPerAccount those of one account, so a key without credit cannot fill the table for
+// everyone. An entry is forgotten after encryptedReplayFor, longer than its key's life (today's key
+// serves until the end of tomorrow), and a request refused before credit was reserved is forgotten
+// at once. The table lives in memory with the keys: a restart empties both, so nothing captured
+// before it can be decrypted or replayed after.
 const (
-	encryptedReplayEntries = 200_000
-	encryptedReplayFor     = 36 * time.Hour
+	encryptedReplayEntries    = 400_000
+	encryptedReplayPerAccount = 4_096
+	encryptedReplayFor        = 50 * time.Hour
 )
 
 // EncryptedRequestMax bounds an encrypted request body: the edge forwards at most 8 MiB.
@@ -55,8 +61,8 @@ const ReceiptSaltField = "lebrel_receipt_salt"
 // ReceiptSaltScheme names the salting in the receipt.
 const ReceiptSaltScheme = "client-salt-v1"
 
-// EpochOf names the daily key epoch of a moment: the encryption key is derived per compose and per
-// UTC day, and the previous day's key is kept while a client may still hold its key document.
+// EpochOf names the daily key epoch of a moment: the encryption key is born per UTC day, and the
+// previous day's key is kept while a client may still hold its key document.
 func EpochOf(now time.Time) string { return now.UTC().Format("2006-01-02") }
 
 type encryptionKey struct {
@@ -92,7 +98,7 @@ func newEncryptionKey(secret []byte, epoch string) (*encryptionKey, error) {
 
 // Encryption is the router's HPKE identity, its daily rotation and what goes with it.
 type Encryption struct {
-	// derive hands the 32-byte secret of an epoch's key (the KMS, inside a VM); nil means the
+	// derive hands the 32-byte secret of an epoch's key (random bytes inside a VM); nil means the
 	// identity given at construction never rotates (tests, development).
 	derive func(epoch string) ([]byte, error)
 	// instanceID is the 32-hex instance identifier the metadata names.
@@ -100,8 +106,16 @@ type Encryption struct {
 	mu         sync.Mutex
 	current    *encryptionKey
 	previous   *encryptionKey
-	replays    map[[32]byte]time.Time
-	inserts    int
+	// onRotate runs after a rotation: the cached attestation names the key before it.
+	onRotate func()
+	replays  map[[32]byte]replayEntry
+	accounts map[string]int
+	inserts  int
+}
+
+type replayEntry struct {
+	expiry  time.Time
+	account string
 }
 
 // NewEncryption builds a router identity from a fixed 32-byte X25519 secret that never rotates.
@@ -110,17 +124,31 @@ func NewEncryption(secret []byte, instanceID string) (*Encryption, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Encryption{instanceID: instanceIdentifier(instanceID), current: key, replays: map[[32]byte]time.Time{}}, nil
+	return &Encryption{instanceID: instanceIdentifier(instanceID), current: key, replays: map[[32]byte]replayEntry{}, accounts: map[string]int{}}, nil
 }
 
 // NewRotatingEncryption derives the key of the current epoch (and keeps the previous epoch's)
 // through derive, and rotates when Rotate is called with a new epoch.
 func NewRotatingEncryption(derive func(epoch string) ([]byte, error), instanceID string, now time.Time) (*Encryption, error) {
-	e := &Encryption{derive: derive, instanceID: instanceIdentifier(instanceID), replays: map[[32]byte]time.Time{}}
+	e := &Encryption{derive: derive, instanceID: instanceIdentifier(instanceID), replays: map[[32]byte]replayEntry{}, accounts: map[string]int{}}
 	if err := e.Rotate(now); err != nil {
 		return nil, err
 	}
 	return e, nil
+}
+
+// NewEphemeralEncryption is the identity of a router inside an attested VM: a key born at random in
+// the VM's memory for today's UTC day, a new one at each midnight (the previous day's kept) and at
+// each boot. The quote binds the public key; the secret exists nowhere else, and in particular not
+// in the VM's key service, which derives keys per app rather than per measured compose.
+func NewEphemeralEncryption(instanceID string, now time.Time) (*Encryption, error) {
+	return NewRotatingEncryption(func(string) ([]byte, error) {
+		secret := make([]byte, 32)
+		if _, err := rand.Read(secret); err != nil {
+			return nil, err
+		}
+		return secret, nil
+	}, instanceID, now)
 }
 
 func instanceIdentifier(instanceID string) string {
@@ -150,7 +178,11 @@ func (e *Encryption) Rotate(now time.Time) error {
 	}
 	e.mu.Lock()
 	e.previous, e.current = e.current, key
+	hook := e.onRotate
 	e.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	return nil
 }
 
@@ -200,6 +232,20 @@ func (e *Encryption) KeyID() string {
 	return current.keyID
 }
 
+// Current is the current public key and its id, read together: an attestation never pairs one
+// day's key with another day's id.
+func (e *Encryption) Current() (publicKey []byte, keyID string) {
+	current, _ := e.keys()
+	return current.identity.MarshalPublicKey(), current.keyID
+}
+
+// SetRotationHook runs hook after every rotation (the server drops its cached attestation).
+func (e *Encryption) SetRotationHook(hook func()) {
+	e.mu.Lock()
+	e.onRotate = hook
+	e.mu.Unlock()
+}
+
 // encryptionMetadata is the signed document a client verifies before encrypting: the same shape the
 // editions' runtime publishes, signed here by the receipt-signing key, which the attestation quote
 // binds to this machine.
@@ -233,28 +279,53 @@ func (e *Encryption) SignedMetadata(signer *Signer, modelID string, now time.Tim
 	return json.Marshal(encryptionEnvelope{Version: 1, Payload: base64.StdEncoding.EncodeToString(payload), Signature: base64.StdEncoding.EncodeToString(ed25519.Sign(signer.private, payload))})
 }
 
-// remember records an encapsulation; false when it was seen before (a replay) or the table is full
-// of live entries. Expired entries are swept as the table grows.
-func (e *Encryption) remember(encapsulation []byte, now time.Time) (fresh bool, full bool) {
+// remember records an encapsulation under the account that sent it; false when it was seen before
+// (a replay), or when the table, or the account's share of it, is full of live entries. Expired
+// entries are swept as the table grows.
+func (e *Encryption) remember(encapsulation []byte, account string, now time.Time) (fresh bool, full bool) {
 	digest := sha256.Sum256(encapsulation)
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if expiry, seen := e.replays[digest]; seen && now.Before(expiry) {
+	if entry, seen := e.replays[digest]; seen && now.Before(entry.expiry) {
 		return false, false
 	}
 	e.inserts++
-	if len(e.replays) >= encryptedReplayEntries || e.inserts%4096 == 0 {
-		for key, expiry := range e.replays {
-			if !now.Before(expiry) {
-				delete(e.replays, key)
+	if len(e.replays) >= encryptedReplayEntries || e.accounts[account] >= encryptedReplayPerAccount || e.inserts%4096 == 0 {
+		for key, entry := range e.replays {
+			if !now.Before(entry.expiry) {
+				e.drop(key, entry)
 			}
 		}
 	}
-	if len(e.replays) >= encryptedReplayEntries {
+	if len(e.replays) >= encryptedReplayEntries || e.accounts[account] >= encryptedReplayPerAccount {
 		return false, true
 	}
-	e.replays[digest] = now.Add(encryptedReplayFor)
+	if entry, seen := e.replays[digest]; seen {
+		e.drop(digest, entry)
+	}
+	e.replays[digest] = replayEntry{expiry: now.Add(encryptedReplayFor), account: account}
+	e.accounts[account]++
 	return true, false
+}
+
+// forget releases an encapsulation whose request was refused before credit was reserved: nothing
+// reached the lab, so there is nothing to replay.
+func (e *Encryption) forget(encapsulation []byte) {
+	digest := sha256.Sum256(encapsulation)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if entry, seen := e.replays[digest]; seen {
+		e.drop(digest, entry)
+	}
+}
+
+func (e *Encryption) drop(digest [32]byte, entry replayEntry) {
+	delete(e.replays, digest)
+	if e.accounts[entry.account] <= 1 {
+		delete(e.accounts, entry.account)
+	} else {
+		e.accounts[entry.account]--
+	}
 }
 
 // validFrames checks EHBP request framing within an already bounded buffer: 4-byte big-endian
@@ -346,9 +417,10 @@ func stripReceiptSalt(plaintext []byte) (body []byte, salt []byte, err error) {
 
 // handleEncryptedCompletion decrypts an EHBP request and runs it through the ordinary completion
 // path with an encrypting response writer: every byte of the answer, errors included, leaves
-// encrypted to the client's key for this request. The edge is checked before anything is read, so
-// nobody outside it can make the machine decrypt or remember anything; the API key is checked by
-// the completion handler as for any request, and travels in clear (it is not content).
+// encrypted to the client's key for this request. The edge and the API key (in clear: it is not
+// content) are checked before anything is read, so nobody outside the edge, and no key that is not
+// a customer's, can make the machine decrypt or remember anything; an encapsulation is remembered
+// under its account, and forgotten again if the request is refused before credit is reserved.
 func (s *Server) handleEncryptedCompletion(w http.ResponseWriter, r *http.Request, scoped *Route) {
 	encryption := s.settings.Encryption
 	if encryption == nil {
@@ -365,6 +437,15 @@ func (s *Server) handleEncryptedCompletion(w http.ResponseWriter, r *http.Reques
 	}
 	if len(r.Header.Values(protocol.EncapsulatedKeyHeader)) != 1 || len(r.Header.Get(protocol.EncapsulatedKeyHeader)) != 64 {
 		s.writeError(w, http.StatusBadRequest, "invalid_ciphertext", "one EHBP encapsulated key is required")
+		return
+	}
+	principal, err := s.settings.Auth.Authenticate(r.Context(), r.Header.Get("Authorization"))
+	if err != nil {
+		if errors.Is(err, auth.ErrUnauthorized) {
+			s.writeError(w, http.StatusUnauthorized, "invalid_api_key", "invalid API key")
+		} else {
+			s.writeError(w, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
+		}
 		return
 	}
 	current, previous := encryption.keys()
@@ -410,7 +491,7 @@ func (s *Server) handleEncryptedCompletion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	encapsulation, _ := hex.DecodeString(r.Header.Get(protocol.EncapsulatedKeyHeader))
-	fresh, full := encryption.remember(encapsulation, s.settings.Now())
+	fresh, full := encryption.remember(encapsulation, principal.AccountID, s.settings.Now())
 	ew, err := key.identity.SetupDerivedResponseEncryption(w, responseContext)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "encryption_failed", "response encryption unavailable")
@@ -431,7 +512,8 @@ func (s *Server) handleEncryptedCompletion(w http.ResponseWriter, r *http.Reques
 		s.writeError(ew, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	ctx := r.Context()
+	admitted := &admission{}
+	ctx := context.WithValue(context.WithValue(r.Context(), principalKey{}, principal), admissionKey{}, admitted)
 	if len(salt) > 0 {
 		ctx = context.WithValue(ctx, receiptSaltKey{}, salt)
 	}
@@ -442,4 +524,17 @@ func (s *Server) handleEncryptedCompletion(w http.ResponseWriter, r *http.Reques
 	inner.ContentLength = int64(len(body))
 	inner.Body = io.NopCloser(bytes.NewReader(body))
 	s.handleCompletion(ew, inner, scoped)
+	if !admitted.reserved {
+		// Refused before credit was reserved (no slot, no credit, unknown model...): nothing reached
+		// the lab, so there is nothing to replay and nothing to remember.
+		encryption.forget(encapsulation)
+	}
 }
+
+// principalKey carries a principal the encrypted path authenticated before decrypting; admissionKey
+// carries the record the completion handler marks once the request's credit is reserved.
+type (
+	principalKey struct{}
+	admissionKey struct{}
+	admission    struct{ reserved bool }
+)

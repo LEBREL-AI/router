@@ -470,26 +470,144 @@ func TestTheEncryptionKeyRotatesDailyAndYesterdaysKeyStillServes(t *testing.T) {
 	}
 }
 
-// A remembered encapsulation is forgotten once its key is gone: the table never grows without
-// bound and a restart's empty table is no weaker than a table whose entries have expired.
+// A remembered encapsulation is kept as long as its key can live (today's key serves until the end
+// of tomorrow) and forgotten after; one account cannot fill the table for everyone, and a request
+// forgotten (refused before credit was reserved) frees its account's share.
 func TestAReplayIsRememberedWhileItsKeyLivesAndForgottenAfter(t *testing.T) {
+	if encryptedReplayFor < 48*time.Hour+time.Hour {
+		t.Fatalf("replays are forgotten (%s) before a key can be gone (two days and the clock's skew)", encryptedReplayFor)
+	}
 	encryption, err := NewEncryption(bytes.Repeat([]byte{9}, 32), "router-test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	encapsulation := bytes.Repeat([]byte{1}, 32)
 	start := time.Unix(1_900_000_000, 0)
-	if fresh, _ := encryption.remember(encapsulation, start); !fresh {
+	if fresh, _ := encryption.remember(encapsulation, "acct_a", start); !fresh {
 		t.Fatal("first sight not fresh")
 	}
-	if fresh, _ := encryption.remember(encapsulation, start.Add(encryptedReplayFor-time.Minute)); fresh {
+	if fresh, _ := encryption.remember(encapsulation, "acct_a", start.Add(encryptedReplayFor-time.Minute)); fresh {
 		t.Fatal("a replay within the key's life was admitted")
 	}
-	if fresh, _ := encryption.remember(encapsulation, start.Add(encryptedReplayFor+time.Minute)); !fresh {
+	if fresh, _ := encryption.remember(encapsulation, "acct_a", start.Add(encryptedReplayFor+time.Minute)); !fresh {
 		t.Fatal("an encapsulation whose key is gone is still remembered")
 	}
-	if len(encryption.replays) != 1 {
-		t.Fatalf("expired entries are kept: %d", len(encryption.replays))
+	if len(encryption.replays) != 1 || encryption.accounts["acct_a"] != 1 {
+		t.Fatalf("expired entries are kept: %d entries, %v", len(encryption.replays), encryption.accounts)
+	}
+	var first []byte
+	for i := 0; i < encryptedReplayPerAccount; i++ {
+		e := sha256.Sum256([]byte{byte(i), byte(i >> 8), byte(i >> 16)})
+		if i == 0 {
+			first = e[:]
+		}
+		if fresh, full := encryption.remember(e[:], "acct_b", start); !fresh || full {
+			t.Fatalf("entry %d of the account's share refused", i)
+		}
+	}
+	if fresh, full := encryption.remember([]byte("one more of b"), "acct_b", start); fresh || !full {
+		t.Fatal("an account beyond its share was admitted")
+	}
+	if fresh, full := encryption.remember([]byte("another account"), "acct_c", start); !fresh || full {
+		t.Fatal("another account was refused for b's share")
+	}
+	encryption.forget(first)
+	if fresh, _ := encryption.remember([]byte("one more of b"), "acct_b", start); !fresh {
+		t.Fatal("forgetting did not free the account's share")
+	}
+	if encryption.accounts["acct_b"] != encryptedReplayPerAccount {
+		t.Fatalf("account count drifted: %d", encryption.accounts["acct_b"])
+	}
+}
+
+// The API key is checked before anything is read or decrypted: a wrong key is refused in clear and
+// leaves no trace; a customer's key without credit is refused inside the envelope, and the request
+// is forgotten again, so a key with no credit cannot fill the table.
+func TestTheKeyIsCheckedBeforeDecryptionAndARefusedRequestIsForgotten(t *testing.T) {
+	lab := newFakeUpstream(t, okJSON(`{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}`))
+	encryption, err := NewEncryption(bytes.Repeat([]byte{9}, 32), "router-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, signer := encryptedServerWith(t, lab, encryption, func(s *Settings) { s.Ledger = ledger.NewInMemory(map[string]int64{"acct_test_000001": 0}) })
+	client, keyID := clientIdentity(t, ts, signer)
+	request, _ := http.NewRequest(http.MethodPost, ts.URL+"/m/deepseek--deepseek-v4.1-flash/v1/chat/completions", strings.NewReader(`{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Authorization", "Bearer leb_live_wrong_key")
+	request.Header.Set("X-Lebrel-Encryption-Key-Id", keyID)
+	if _, err := client.EncryptRequestWithContext(request); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusUnauthorized || !strings.Contains(string(raw), "invalid_api_key") || response.Header.Get(protocol.ResponseNonceHeader) != "" {
+		t.Fatalf("wrong key: %d %s", response.StatusCode, raw)
+	}
+	if len(encryption.replays) != 0 {
+		t.Fatal("a wrong key's ciphertext was remembered")
+	}
+	response, plain := encryptedPost(t, ts, client, keyID, `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`, testKey)
+	if response.StatusCode != http.StatusPaymentRequired || !strings.Contains(string(plain), "insufficient_credit") {
+		t.Fatalf("no credit: %d %s", response.StatusCode, plain)
+	}
+	if len(encryption.replays) != 0 || len(encryption.accounts) != 0 {
+		t.Fatalf("a request refused before credit was reserved stayed remembered: %d %v", len(encryption.replays), encryption.accounts)
+	}
+	if len(lab.requests) != 0 {
+		t.Fatal("the lab was called")
+	}
+}
+
+// Inside a VM the key is born at random: two boots never share it, a new day brings a new one and
+// keeps yesterday's.
+func TestAnEphemeralKeyIsNewAtEveryBootAndEveryDay(t *testing.T) {
+	day := func(d int) time.Time { return time.Date(2026, 11, d, 0, 0, 5, 0, time.UTC) }
+	a, err := NewEphemeralEncryption("router-test", day(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewEphemeralEncryption("router-test", day(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.KeyID() == b.KeyID() {
+		t.Fatal("two boots share a key")
+	}
+	first := a.KeyID()
+	if err := a.Rotate(day(5)); err != nil {
+		t.Fatal(err)
+	}
+	current, previous := a.keys()
+	if current.keyID == first || previous == nil || previous.keyID != first {
+		t.Fatal("a new day did not bring a new key with yesterday's kept")
+	}
+}
+
+// After a rotation the cached attestation (no nonce) names the new key, never the old one.
+func TestARotationDropsTheCachedAttestationDocument(t *testing.T) {
+	derive := func(epoch string) ([]byte, error) {
+		secret := sha256.Sum256([]byte("secret:" + epoch))
+		return secret[:], nil
+	}
+	day := func(d int) time.Time { return time.Date(2026, 11, d, 0, 0, 5, 0, time.UTC) }
+	encryption, err := NewRotatingEncryption(derive, "router-test", day(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lab := newFakeUpstream(t, okJSON(`{}`))
+	ts, _ := encryptedServerWith(t, lab, encryption, func(s *Settings) { s.Attester = &fakeAttester{} })
+	_, before := getAttestation(t, ts, "")
+	if before.EncryptionKeyID != encryption.KeyID() {
+		t.Fatal("the document does not name the current key")
+	}
+	if err := encryption.Rotate(day(5)); err != nil {
+		t.Fatal(err)
+	}
+	_, after := getAttestation(t, ts, "")
+	if after.EncryptionKeyID != encryption.KeyID() || after.EncryptionKeyID == before.EncryptionKeyID {
+		t.Fatalf("after the rotation the document names %s, the key is %s", after.EncryptionKeyID, encryption.KeyID())
 	}
 }
 

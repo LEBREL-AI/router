@@ -195,6 +195,31 @@ func TestAFailingVMsErrorTextStaysInside(t *testing.T) {
 	}
 }
 
+// A route manifest says whether its signer runs inside an attested VM: true from the attested
+// machine, false from a plain deployment, so a signed data note never implies an attestation that
+// the signer cannot show.
+func TestTheRouteManifestSaysWhetherItsSignerIsAttested(t *testing.T) {
+	attested, _ := attestedServer(t, &fakeAttester{})
+	plain := newHarness(t, routeFor(upstream("deepseek/api", "http://127.0.0.1:1", 1)), board)
+	for name, c := range map[string]struct {
+		url  string
+		want bool
+	}{"attested": {attested.URL, true}, "plain": {plain.server.URL, false}} {
+		response, err := http.Get(c.url + "/m/deepseek--deepseek-v4.1-flash/.well-known/proof-of-edition")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var document SignedDocument
+		if err := json.NewDecoder(response.Body).Decode(&document); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		response.Body.Close()
+		if document.Payload["attested"] != c.want {
+			t.Fatalf("%s manifest says attested=%v, want %v", name, document.Payload["attested"], c.want)
+		}
+	}
+}
+
 // fetch asks for the attestation from any goroutine (t.Fatal belongs to the test's).
 func fetchAttestation(ts *httptest.Server, query string) (int, error) {
 	response, err := http.Get(ts.URL + AttestationPath + query)
