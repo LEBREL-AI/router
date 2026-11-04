@@ -7,7 +7,7 @@
 # CERTBOT_EMAIL travel as dstack encrypted environment variables.
 services:
   router:
-    image: ghcr.io/lebrel-ai/router@sha256:9f8e09106cc27aca032c6563fe9025867f492061221428c501ae29c52548d75e
+    image: ghcr.io/lebrel-ai/router@sha256:0c59d65c11d366a1fd8f61e49158a92c21d0baa79219b6ffda907bcc92c37179
     restart: unless-stopped
     ports:
       - "8080:8090"
