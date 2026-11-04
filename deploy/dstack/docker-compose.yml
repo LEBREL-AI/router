@@ -1,7 +1,8 @@
 # The router inside a confidential VM (Intel TDX) run by dstack (https://github.com/Dstack-TEE/dstack).
 # dstack measures this file, image digest included, into the attestation quote: the quote names
-# exactly this compose and exactly this image. Secrets never appear here: they are passed as
-# dstack encrypted environment variables, which the KMS releases only to this measured app.
+# exactly this compose and exactly this image. Public configuration is written here so that it is
+# measured too; secrets never appear here: they are passed as dstack encrypted environment
+# variables, which the KMS releases only to this measured app.
 services:
   router:
     image: ghcr.io/lebrel-ai/router@sha256:REPLACED_PER_RELEASE
@@ -9,10 +10,25 @@ services:
     ports:
       - "8090:8090"
     environment:
+      # Measured, public.
+      - ENVIRONMENT=production
+      - LISTEN_ADDR=:8090
+      - ROUTES_FILE=/etc/lebrel-router/routes.json
       - CONTROL_PLANE_URL=https://lebrel.ai
-      - CONTROL_PLANE_SECRET=${CONTROL_PLANE_SECRET}
-      - RECEIPT_SIGNING_SEED=${RECEIPT_SIGNING_SEED}
+      - BOARD_SOURCE=https://models.lebrel.ai/v1/watch
+      - BOARD_URL=https://models.lebrel.ai/watch
+      - BOARD_REFRESH_SECONDS=300
+      - BOARD_PUBLIC_KEY_HEX=536a6eaa6c97091b653519008b0ffc1d76e5e32067b36f3802c7574aebf498c4
+      - MAX_REQUEST_BYTES=33554432
+      - SETTLEMENT_CONCURRENCY=8
+      - SETTLEMENT_ALERT_SECONDS=5
+      - SHUTDOWN_SECONDS=600
+      # Encrypted at deploy time, released by the KMS to this measurement only.
       - INSTANCE_ID=${INSTANCE_ID}
+      - CONTROL_PLANE_SECRET=${CONTROL_PLANE_SECRET}
+      - EDGE_PROXY_SECRET=${EDGE_PROXY_SECRET}
+      - HEALTH_TOKEN=${HEALTH_TOKEN}
+      - RECEIPT_SIGNING_SEED=${RECEIPT_SIGNING_SEED}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - ZAI_API_KEY=${ZAI_API_KEY}
       - MOONSHOT_API_KEY=${MOONSHOT_API_KEY}
