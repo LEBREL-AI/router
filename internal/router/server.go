@@ -106,6 +106,9 @@ type Settings struct {
 	Attester dstack.Attester
 	// KeySource names where the receipt-signing seed came from: "vm-kms" or "env".
 	KeySource string
+	// Encryption is the router's HPKE identity when it accepts end-to-end encrypted requests
+	// (inside the attested VM); nil means plaintext only.
+	Encryption *Encryption
 }
 
 type Server struct {
@@ -244,6 +247,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	switch {
+	case path == completionPath && r.Header.Get("Ehbp-Encapsulated-Key") != "":
+		s.handleEncryptedCompletion(w, r, scoped)
 	case path == completionPath:
 		s.handleCompletion(w, r, scoped)
 	case path == "/readyz":
@@ -254,6 +259,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleManifest(w, r, scoped)
 	case path == AttestationPath && scoped == nil:
 		s.handleAttestation(w, r)
+	case path == EncryptionMetadataPath:
+		s.handleEncryptionMetadata(w, r, scoped)
 	case strings.HasPrefix(path, "/v1/receipts/"):
 		s.handleReceipt(w, r, strings.TrimPrefix(path, "/v1/receipts/"))
 	case path == "/v1/models":
@@ -1204,7 +1211,7 @@ func textOf(raw json.RawMessage) string {
 
 // publicDocumentPath is true for the signed documents anyone may read from any origin.
 func publicDocumentPath(path string) bool {
-	return path == "/.well-known/proof-of-edition" || path == AttestationPath || path == "/v1/models" || strings.HasPrefix(path, "/v1/receipts/")
+	return path == "/.well-known/proof-of-edition" || path == AttestationPath || path == EncryptionMetadataPath || path == "/v1/models" || strings.HasPrefix(path, "/v1/receipts/")
 }
 
 // boundedID keeps an upstream identifier printable and short enough for a receipt.

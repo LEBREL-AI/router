@@ -18,8 +18,9 @@ import (
 // confidential VM it runs in, bound to its receipt-signing key.
 const AttestationPath = "/.well-known/attestation"
 
-// attestationDomain separates this binding from any other use of the quote's report data.
-const attestationDomain = "lebrel-router-attestation-v1"
+// attestationDomain separates this binding from any other use of the quote's report data. v2 binds
+// the receipt-signing key and the request-encryption key; v1 (no encryption key) bound the first.
+const attestationDomain = "lebrel-router-attestation-v2"
 
 // attestationNonceMax bounds the nonce a verifier may ask into the report data.
 const attestationNonceMax = 32
@@ -38,12 +39,14 @@ const attestationInFlight = 2
 const attestationPerClient = 30
 
 // AttestationReportData is what the quote's 64-byte report data commits to: the receipt-signing
-// public key, with the verifier's nonce when one is given. report_data = SHA-512(domain || public
-// key || nonce), so a verifier recomputes it from the document and compares it with the quote.
-func AttestationReportData(publicKey []byte, nonce []byte) []byte {
+// public key, the request-encryption public key (empty where the instance accepts no encrypted
+// requests), and the verifier's nonce when one is given. report_data = SHA-512(domain ||
+// public_key || encryption_public_key || nonce), so a verifier recomputes it from the document.
+func AttestationReportData(publicKey []byte, encryptionPublicKey []byte, nonce []byte) []byte {
 	h := sha512.New()
 	h.Write([]byte(attestationDomain))
 	h.Write(publicKey)
+	h.Write(encryptionPublicKey)
 	h.Write(nonce)
 	return h.Sum(nil)
 }
@@ -59,9 +62,14 @@ type AttestationDocument struct {
 	PublicKey    string `json:"public_key"`
 	SigningKeyID string `json:"signing_key_id"`
 	KeySource    string `json:"key_source"`
-	InstanceID   string `json:"instance_id"`
-	Nonce        string `json:"nonce"`
-	ReportData   string `json:"report_data"`
+	// EncryptionPublicKey and EncryptionKeyID are the HPKE key clients encrypt requests to (raw
+	// X25519 public key, hex; key id = SHA-256 of the RFC 9458 configuration), bound by the quote
+	// beside the receipt key; empty where the instance accepts no encrypted requests.
+	EncryptionPublicKey string `json:"encryption_public_key,omitempty"`
+	EncryptionKeyID     string `json:"encryption_key_id,omitempty"`
+	InstanceID          string `json:"instance_id"`
+	Nonce               string `json:"nonce"`
+	ReportData          string `json:"report_data"`
 	// Quote is the TDX quote, hex; EventLog explains RTMR3 (JSON, as the agent gives it); VMConfig
 	// is the VM's launch configuration as the agent states it, which dstack-verifier and dstack-mr
 	// need to recompute the OS measurements (MRTD, RTMR0-2) from the published image.
@@ -143,7 +151,13 @@ func (s *Server) attestation(ctx context.Context, nonce []byte) (*AttestationDoc
 			return cached, nil
 		}
 	}
-	reportData := AttestationReportData(s.settings.Signer.Public, nonce)
+	var encryptionPublic []byte
+	encryptionKeyID := ""
+	if s.settings.Encryption != nil {
+		encryptionPublic = s.settings.Encryption.PublicKey()
+		encryptionKeyID = s.settings.Encryption.KeyID()
+	}
+	reportData := AttestationReportData(s.settings.Signer.Public, encryptionPublic, nonce)
 	quote, err := s.settings.Attester.Quote(ctx, reportData)
 	if err != nil {
 		return nil, err
@@ -175,8 +189,9 @@ func (s *Server) attestation(ctx context.Context, nonce []byte) (*AttestationDoc
 		}
 	}
 	document := &AttestationDocument{
-		Kind: "lebrel-router-attestation", Scheme: "report_data = sha512(\"" + attestationDomain + "\" || public_key || nonce)",
-		PublicKey: hex.EncodeToString(s.settings.Signer.Public), SigningKeyID: s.settings.Signer.KeyID, KeySource: s.settings.KeySource, InstanceID: s.settings.Signer.InstanceID,
+		Kind: "lebrel-router-attestation", Scheme: "report_data = sha512(\"" + attestationDomain + "\" || public_key || encryption_public_key || nonce)",
+		PublicKey: hex.EncodeToString(s.settings.Signer.Public), SigningKeyID: s.settings.Signer.KeyID, KeySource: s.settings.KeySource,
+		EncryptionPublicKey: hex.EncodeToString(encryptionPublic), EncryptionKeyID: encryptionKeyID, InstanceID: s.settings.Signer.InstanceID,
 		Nonce: hex.EncodeToString(nonce), ReportData: hex.EncodeToString(reportData),
 		Quote: hex.EncodeToString(quote.Quote), EventLog: eventLog, VMConfig: vmConfig, Info: info, IssuedAt: now.Unix(),
 	}

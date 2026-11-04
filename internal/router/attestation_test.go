@@ -86,7 +86,7 @@ func TestTheAttestationBindsTheReceiptKeyIntoTheQuotesReportData(t *testing.T) {
 		t.Fatalf("status %d", response.StatusCode)
 	}
 	expected := sha512.New()
-	expected.Write([]byte("lebrel-router-attestation-v1"))
+	expected.Write([]byte("lebrel-router-attestation-v2"))
 	expected.Write(signer.Public)
 	want := hex.EncodeToString(expected.Sum(nil))
 	if document.ReportData != want || document.PublicKey != hex.EncodeToString(signer.Public) || document.SigningKeyID != signer.KeyID {
@@ -116,7 +116,7 @@ func TestANonceMakesAFreshQuoteAndNoNonceReusesTheLastOne(t *testing.T) {
 	nonce := "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
 	_, document := getAttestation(t, ts, "?nonce="+nonce)
 	nonceBytes, _ := hex.DecodeString(nonce)
-	want := hex.EncodeToString(AttestationReportData(signer.Public, nonceBytes))
+	want := hex.EncodeToString(AttestationReportData(signer.Public, nil, nonceBytes))
 	if document.Nonce != nonce || document.ReportData != want || len(vm.asked) != 2 {
 		t.Fatalf("nonce not honoured: %+v asked=%d", document, len(vm.asked))
 	}
@@ -147,9 +147,9 @@ func TestWithoutAVMThereIsNoAttestationAndAFailingVMIsTold(t *testing.T) {
 
 func TestTheReportDataIsDeterministicAndDomainSeparated(t *testing.T) {
 	key := make([]byte, 32)
-	a := AttestationReportData(key, nil)
-	b := AttestationReportData(key, nil)
-	c := AttestationReportData(key, []byte{1})
+	a := AttestationReportData(key, nil, nil)
+	b := AttestationReportData(key, nil, nil)
+	c := AttestationReportData(key, nil, []byte{1})
 	if hex.EncodeToString(a) != hex.EncodeToString(b) || hex.EncodeToString(a) == hex.EncodeToString(c) || len(a) != 64 {
 		t.Fatal("report data is not a deterministic 64-byte commitment")
 	}

@@ -1,8 +1,8 @@
 # Lebrel router
 
 OpenAI-compatible relay to third-party inference APIs with Lebrel's prepaid billing, a
-verification status per upstream and a signed route receipt per response. Standard
-library only, Go 1.24. It never logs prompt or completion content.
+verification status per upstream and a signed route receipt per response. Go 1.26, one
+vendored dependency (Tinfoil's EHBP library, MIT) for the end-to-end encryption. It never logs prompt or completion content.
 
 What a route receipt proves, honestly: where the request went, when, the hashes of
 what was sent and received, what the client paid, and what the last probe of that
@@ -34,6 +34,17 @@ and replays the event log, reads the compose hash from the verified log and comp
 `RELEASES.md`, and then knows that the key signing the receipts lives in this code on this hardware.
 `scripts/verify-attestation.py` does those checks; `RELEASES.md` says exactly what the key proves and
 who the trust anchors are (Intel, the KMS operator, the app's owner).
+
+End-to-end encryption. Inside the VM the router also derives an HPKE key (X25519, from the KMS under
+its own path with the compose hash), publishes it per route at `/m/{model}/.well-known/lebrel-encryption`
+as a document signed by the receipt key, and accepts requests encrypted to it with EHBP, the protocol
+the editions' runtime and the Lebrel SDKs already speak (Tinfoil's library, vendored): the body is
+sealed to the machine's key, the answer, streamed or not, comes back encrypted with keys derived
+from that exchange, and errors after decryption are encrypted too. The attestation's report data
+binds both keys (`lebrel-router-attestation-v2`), so a client that verified the quote knows the key
+it encrypts to lives in this code on this hardware; nothing between the client and the router, not
+lebrel.ai's edge, not Cloudflare, not Phala's gateway, sees the prompt or the answer. `cmd/encrypted-probe`
+sends one such request. Outside a VM no key is published and encrypted requests are refused in clear.
 
 What it does not prove: what the lab at the other end (DeepSeek, Z.ai, Moonshot AI, Alibaba Cloud)
 does with the request under its own policy, and which weights that lab ran. The first is their
