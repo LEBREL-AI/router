@@ -43,7 +43,7 @@ services:
     ports:
       - "443:443"
     environment:
-      - DOMAIN=router.lebrel.ai
+      - DOMAIN=router-tee.lebrel.ai
       - TARGET_ENDPOINT=router:8090
       - GATEWAY_DOMAIN=gateway.${DSTACK_GATEWAY_DOMAIN}
       - SET_CAA=true
