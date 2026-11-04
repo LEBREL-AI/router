@@ -22,3 +22,8 @@ How anyone checks a running router: fetch its attestation quote, verify Intel's 
 row above; rebuild the image from the tag and compare the digest. The key the router publishes at
 `/.well-known/proof-of-edition` is bound to that quote, so a receipt signed with it was signed by
 this code and nothing else.
+
+Two compose files are kept: `deploy/dstack/docker-compose.yml` (the machine reached through the
+dstack gateway hostname) and `deploy/dstack/docker-compose.custom-domain.yml` (the same router with
+dstack-ingress beside it, terminating TLS for router.lebrel.ai inside the VM). Each has its own
+compose hash; the ledger names which one a row was deployed from.
