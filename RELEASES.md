@@ -5,6 +5,7 @@ check that the running machine is this code:
 
 | Version | Git tag | Image digest | dstack compose hash | Receipt key id | Since |
 |---|---|---|---|---|---|
+| 1.3.0 (custom domain, instance A) | `v1.3.0` | `sha256:88f572f4830c4df1fbf29e9c36c4375760a803fcff9c3ba1499662a712a5e3e2` + dstack-ingress 2.2 (`deploy/dstack/docker-compose.custom-domain.yml`, router-tee.lebrel.ai) | `0a9e1b732dc2cffdcd4e65a3b11372da4aea0c61a470bdcf256eaae0aaf293a3` | receipt key id `fef2039efa223f3543068af08c854e9f755c559da5254b7ac6e6f35e3bdde138 ab1ef721a6aa2ae2bc093cebe92385af2e3834ac976ad852dab576b1ce825f93 b14f0b47bcdfd29414518257aa11df2db23de2c2e56ea2a76ae3f2b9682245b3 a2bc21eb45e0cd177eda827f9748f0a2538a328fa0053ce0b093dd149431511d`, public key ``; encryption key id ``, X25519 public key `` (both derived inside, compose in the path) | 2026-11-04 |
 | 1.3.0 | `v1.3.0` | `sha256:88f572f4830c4df1fbf29e9c36c4375760a803fcff9c3ba1499662a712a5e3e2` (linux/amd64, Go 1.26, BuildKit v0.27.1, OCI media types) | `8a1a1bd144c5bd23f1e9dd9244b1fd0ce64f956804fe70cd42420500bfe9ab02` (gateway compose, replica B) | receipt key id `7f9adc456058e8f5505bc065d161053010c958ac496115859c7e0c7d53b976f1 012bb8944ffa04104b1bf4a23578bf670ee9554e7e84f49319f9da4ac015b8d2 cb2dead9fad835a95677dac8740ddba5ecb225fe97d567d6ccd00d723a8f4809 91193f70bf5ee51cdd9ca8ace141f616d98db21a647e1a9fa1baa5914c48f212`, public key ``; encryption key id ``, X25519 public key `` (both derived inside, compose in the path) | 2026-11-04 |
 | 1.2.0 (custom domain, instance A) | `v1.2.0` | `sha256:de4aaa36efa8750a85ce3a90331e0259bcf6c2bfd04e5232152452a147ac58a6` + dstack-ingress 2.2 (`deploy/dstack/docker-compose.custom-domain.yml`, router-tee.lebrel.ai) | `0b5563830f207a2f2ff03042505985d7ecd96935f2f7a1f074e84b493c8cba17` | `75b981a701b150c565d05500191dbe6a83dfa0c1bcabe8752234f41067a05204`, public key `161dc88748c3d05ee654bd56285b71115c1c5dfabc5ff9967f6ffbc21287588d` (derived inside, compose in the path) | 2026-11-04 |
 | 1.2.0 | `v1.2.0` | `sha256:de4aaa36efa8750a85ce3a90331e0259bcf6c2bfd04e5232152452a147ac58a6` (linux/amd64, BuildKit v0.27.1, OCI media types) | `a28254ec21ff869593b25cf2d749c15c82563be1d676af4087cea5e9603bf9bf` | `24850d5e65638769…` (derived inside, compose in the path) | 2026-11-04 |
@@ -51,6 +52,7 @@ dstack gateway hostname; its TLS terminates at Phala's gateway, outside the quot
 `deploy/dstack/docker-compose.custom-domain.yml` (the same router with dstack-ingress beside it,
 terminating TLS for router-tee.lebrel.ai inside the VM). Each has its own compose hash; the ledger
 names which one a row was deployed from; the replica on prod5 keeps the gateway compose (one ingress
-per domain), so the two instances sign with different keys until the domain moves to a gateway-side
-setup. Reference measurements of the dstack OS image, as
+per domain), so the two instances sign with different keys. A compose-only update (`phala deploy
+--cvm-id … -c <compose>` without `-e`) keeps the instance's encrypted environment, verified on the
+replica with a real compose change. Reference measurements of the dstack OS image, as
 observed on the quotes (not an independent rebuild): `deploy/dstack/reference-measurements/`.
