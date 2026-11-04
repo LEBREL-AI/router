@@ -5,6 +5,7 @@ check that the running machine is this code:
 
 | Version | Git tag | Image digest | dstack compose hash | Receipt key id | Since |
 |---|---|---|---|---|---|
+| 1.2.0 (custom domain, instance A) | `v1.2.0` | `sha256:de4aaa36efa8750a85ce3a90331e0259bcf6c2bfd04e5232152452a147ac58a6` + dstack-ingress 2.2 (`deploy/dstack/docker-compose.custom-domain.yml`, router-tee.lebrel.ai) | `0b5563830f207a2f2ff03042505985d7ecd96935f2f7a1f074e84b493c8cba17` | `75b981a701b150c5…` (derived inside, compose in the path) | 2026-11-04 |
 | 1.2.0 | `v1.2.0` | `sha256:de4aaa36efa8750a85ce3a90331e0259bcf6c2bfd04e5232152452a147ac58a6` (linux/amd64, BuildKit v0.27.1, OCI media types) | `a28254ec21ff869593b25cf2d749c15c82563be1d676af4087cea5e9603bf9bf` | `24850d5e65638769…` (derived inside, compose in the path) | 2026-11-04 |
 | 1.1.0 | `v1.1.0` | `sha256:31eb44606b599012143e85ea630e80b90095b080bc65442f8f6ba7e88e0dfd5d` (linux/amd64) | `3ba7b773f9c3b844ec4f4641c7384437a383051ed8328742c1595aac6a372c58` | `19bd924d…` (derived inside, app-wide path) | 2026-11-04 |
 | 1.0.2 | `v1.0.2` | `sha256:66962f2e136059cbaefed0b2ef7b7edddf756c4b4c035a6f9b0ae466f9157fc5` (linux/amd64) | `50d65ee7c8b31f316a3dbbf5060f884df6ef522dd2a4f6df5c953799e4b5c03c` | handed in (`RECEIPT_SIGNING_SEED`) | 2026-11-04 |
@@ -44,5 +45,7 @@ Two compose files are kept: `deploy/dstack/docker-compose.yml` (the machine reac
 dstack gateway hostname; its TLS terminates at Phala's gateway, outside the quote) and
 `deploy/dstack/docker-compose.custom-domain.yml` (the same router with dstack-ingress beside it,
 terminating TLS for router-tee.lebrel.ai inside the VM). Each has its own compose hash; the ledger
-names which one a row was deployed from. Reference measurements of the dstack OS image, as
+names which one a row was deployed from; the replica on prod5 keeps the gateway compose (one ingress
+per domain), so the two instances sign with different keys until the domain moves to a gateway-side
+setup. Reference measurements of the dstack OS image, as
 observed on the quotes (not an independent rebuild): `deploy/dstack/reference-measurements/`.
