@@ -25,6 +25,7 @@ import (
 	"lebrel-router/internal/alert"
 	"lebrel-router/internal/auth"
 	"lebrel-router/internal/controlplane"
+	"lebrel-router/internal/dstack"
 	"lebrel-router/internal/ledger"
 	"lebrel-router/internal/router"
 	"lebrel-router/internal/settle"
@@ -86,9 +87,31 @@ func run(logger *log.Logger) error {
 		logger.Printf("mode=local keys=%d (development only)", len(balances))
 	}
 
+	// Inside a dstack confidential VM the receipt-signing seed is born inside: the KMS derives it
+	// for this app's measurement and hands it only to the measured VM. Every instance of the same
+	// compose signs with the same key, and nothing outside can obtain it. An explicit
+	// RECEIPT_SIGNING_SEED still wins (the non-attested deployment).
+	var attester dstack.Attester
 	seedText := env("RECEIPT_SIGNING_SEED", "")
 	var seed []byte
-	if seedText == "" {
+	if socket := env("DSTACK_SOCKET", dstack.DefaultSocket); dstack.Available(socket) {
+		client := dstack.New(socket)
+		attester = client
+		if seedText == "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			derived, err := client.Key(ctx, "lebrel-router/receipt-signing", "ed25519 seed of the receipt-signing key", "ed25519")
+			cancel()
+			if err != nil {
+				return fmt.Errorf("receipt-signing seed from the VM's KMS: %w", err)
+			}
+			if len(derived) < 32 {
+				return errors.New("receipt-signing seed from the VM's KMS is shorter than 32 bytes")
+			}
+			seed = derived[:32]
+			logger.Printf("receipt signing seed derived inside the attested VM")
+		}
+	}
+	if seedText == "" && seed == nil {
 		if production {
 			return errors.New("RECEIPT_SIGNING_SEED is required in production")
 		}
@@ -97,7 +120,7 @@ func run(logger *log.Logger) error {
 			return err
 		}
 		logger.Printf("warning: ephemeral receipt signing key; receipts will not verify after restart")
-	} else {
+	} else if seedText != "" {
 		seed, err = base64.StdEncoding.DecodeString(seedText)
 		if err != nil || len(seed) != 32 {
 			return errors.New("RECEIPT_SIGNING_SEED must be standard base64 of exactly 32 bytes")
@@ -200,6 +223,7 @@ func run(logger *log.Logger) error {
 		HealthToken: strings.TrimSpace(env("HEALTH_TOKEN", "")),
 		Receipts:    router.NewReceiptStore(24*time.Hour, 100_000), Verification: verification,
 		BoardURL: env("BOARD_URL", ""), EdgeProxySecret: env("EDGE_PROXY_SECRET", ""), MaxRequestBytes: maxBytes, Logger: logger,
+		Attester: attester,
 	})
 	if err != nil {
 		return err
