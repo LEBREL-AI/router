@@ -89,13 +89,57 @@ type attestationCache struct {
 	expires  time.Time
 	// info is the app's identity, read once: it cannot change while the VM runs.
 	info *dstack.Info
-	// slots holds the quotes in flight; waiting counts the askers in line behind them. refresh
-	// serializes renewals of the shared document, which take no place in the line.
+	// slots holds the quotes in flight; waiting counts the askers in line behind them. renew holds
+	// the one renewal of the shared document in flight, which takes no place in the line.
 	slots   chan struct{}
 	waiting int
-	refresh sync.Mutex
+	renew   chan struct{}
 	// wait overrides attestationWait (tests).
 	wait time.Duration
+}
+
+// attestationRenewal bounds one renewal of the shared document: the asker's going away does not
+// cancel it (the next asker would only start another), and a hung agent cannot hold it for ever.
+const attestationRenewal = 35 * time.Second
+
+// sharedAttestation serves the cached document while it is fresh, else renews it: one renewal at a
+// time, the others waiting for it up to attestationWait and told busy past that, so a slow agent
+// never lines askers up without end.
+func (s *Server) sharedAttestation(ctx context.Context) (document *AttestationDocument, refused string) {
+	c := &s.attestations
+	c.mu.Lock()
+	if c.renew == nil {
+		c.renew = make(chan struct{}, 1)
+	}
+	renew, wait := c.renew, c.wait
+	cached, expires := c.document, c.expires
+	c.mu.Unlock()
+	if cached != nil && s.settings.Now().Before(expires) {
+		return cached, ""
+	}
+	if wait <= 0 {
+		wait = attestationWait
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case renew <- struct{}{}:
+	case <-timer.C:
+		return nil, "attestation_busy"
+	case <-ctx.Done():
+		return nil, "attestation_busy"
+	}
+	defer func() { <-renew }()
+	detached, cancel := context.WithTimeout(context.WithoutCancel(ctx), attestationRenewal)
+	defer cancel()
+	document, err := s.attestation(detached, nil) // served from the cache if a renewal just landed
+	if err != nil {
+		if s.settings.Logger != nil {
+			s.settings.Logger.Printf("attestation: %v", err)
+		}
+		return nil, "attestation_unavailable"
+	}
+	return document, ""
 }
 
 // invalidate drops the cached document: the keys it names are no longer the current ones.
@@ -247,19 +291,18 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 	// The shared document (no nonce) is served from the cache, or renewed outside the line, one
 	// renewal at a time: a crowd asking for fresh quotes never starves those who take the shared one.
 	if len(nonce) == 0 {
-		s.attestations.refresh.Lock()
-		document, err := s.attestation(r.Context(), nil)
-		s.attestations.refresh.Unlock()
-		if err != nil {
-			if s.settings.Logger != nil {
-				s.settings.Logger.Printf("attestation: %v", err)
-			}
+		document, refused := s.sharedAttestation(r.Context())
+		switch refused {
+		case "":
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			_ = json.NewEncoder(w).Encode(document)
+		case "attestation_busy":
+			w.Header().Set("Retry-After", "5")
+			s.writeError(w, http.StatusTooManyRequests, refused, "the machine is quoting for others; try again in a few seconds")
+		default:
 			s.writeError(w, http.StatusServiceUnavailable, "attestation_unavailable", "the machine could not produce a quote right now")
-			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-store")
-		_ = json.NewEncoder(w).Encode(document)
 		return
 	}
 	release, refused := s.attestations.admit(r.Context())

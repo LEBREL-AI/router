@@ -51,17 +51,31 @@ const (
 	encryptedSweepEvery       = time.Second
 )
 
-// Bytes in flight are bounded per key as well as requests: a key's concurrency slots alone would
-// let it hold that many 8 MiB uploads, several copies each while they are decrypted and parsed,
-// which on a small machine is the machine. Each request takes one unit per MiB of its body (the
-// whole 8 MiB when the length is unknown) out of encryptedBytesInFlightUnits per key.
+// Bytes in flight are bounded as well as requests: a key's concurrency slots alone would let it
+// hold that many 8 MiB uploads, several copies each while they are decrypted and parsed, which on
+// a small machine is the machine. Each request takes one unit per MiB of its body (the whole 8 MiB
+// when the length is unknown) out of a budget per key (encryptedBytesPerKeyUnits, or the key's
+// own concurrency when that is higher, so the budget never undercuts the published limit), per
+// account (encryptedBytesPerAccountUnits, or the account's concurrency) and for the whole machine
+// (encryptedBytesMachineUnits, 1 GiB of ciphertext at most).
 const (
-	encryptedBudgetUnit         = 1 << 20
-	encryptedBytesInFlightUnits = 128
+	encryptedBudgetUnit           = 1 << 20
+	encryptedBytesPerKeyUnits     = 128
+	encryptedBytesPerAccountUnits = 256
+	encryptedBytesMachineUnits    = 1024
 )
 
 // acquireUnits takes units slots of key from the limiter, all or none.
 func acquireUnits(ctx context.Context, limiter limit.ConcurrencyLimiter, key string, units, maximum int) (func(), error) {
+	if atOnce, ok := limiter.(interface {
+		AcquireN(context.Context, string, int, int) (limit.ReleaseFunc, error)
+	}); ok {
+		release, err := atOnce.AcquireN(ctx, key, units, maximum)
+		if err != nil {
+			return nil, err
+		}
+		return release, nil
+	}
 	releases := make([]limit.ReleaseFunc, 0, units)
 	release := func() {
 		for _, r := range releases {
@@ -535,13 +549,27 @@ func (s *Server) handleEncryptedCompletion(w http.ResponseWriter, r *http.Reques
 	if r.ContentLength > 0 && r.ContentLength <= EncryptedRequestMax {
 		units = int((r.ContentLength + encryptedBudgetUnit - 1) / encryptedBudgetUnit)
 	}
-	releaseBytes, err := acquireUnits(r.Context(), s.settings.Limiter, "bytes:"+principal.APIKeyID, units, encryptedBytesInFlightUnits)
+	releaseBytes, err := acquireUnits(r.Context(), s.settings.Limiter, "bytes:key:"+principal.APIKeyID, units, max(encryptedBytesPerKeyUnits, principal.Concurrency))
 	if err != nil {
 		w.Header().Set("Retry-After", "1")
 		s.writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "too many bytes in flight for this key; try again in a moment")
 		return
 	}
 	defer releaseBytes()
+	releaseAccountBytes, err := acquireUnits(r.Context(), s.settings.Limiter, "bytes:account:"+principal.AccountID, units, max(encryptedBytesPerAccountUnits, principal.AccountConcurrency))
+	if err != nil {
+		w.Header().Set("Retry-After", "1")
+		s.writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "too many bytes in flight for this account; try again in a moment")
+		return
+	}
+	defer releaseAccountBytes()
+	releaseMachineBytes, err := acquireUnits(r.Context(), s.settings.Limiter, "bytes:machine", units, encryptedBytesMachineUnits)
+	if err != nil {
+		w.Header().Set("Retry-After", "1")
+		s.writeError(w, http.StatusServiceUnavailable, "machine_busy", "the machine has too many bytes in flight; try again in a moment")
+		return
+	}
+	defer releaseMachineBytes()
 	current, previous := encryption.keys()
 	key := current
 	if expected := r.Header.Get("X-Lebrel-Encryption-Key-Id"); expected != "" && expected != current.keyID {
