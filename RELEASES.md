@@ -5,7 +5,7 @@ check that the running machine is this code:
 
 | Version | Git tag | Image digest | dstack compose hash | Receipt key id | Since |
 |---|---|---|---|---|---|
-| 1.2.0 | `v1.2.0` | `sha256:de4aaa36efa8750a85ce3a90331e0259bcf6c2bfd04e5232152452a147ac58a6` (linux/amd64, BuildKit v0.27.1, OCI media types) | _(recorded at deployment)_ | _(recorded at deployment)_ | 2026-11-04 |
+| 1.2.0 | `v1.2.0` | `sha256:de4aaa36efa8750a85ce3a90331e0259bcf6c2bfd04e5232152452a147ac58a6` (linux/amd64, BuildKit v0.27.1, OCI media types) | `a28254ec21ff869593b25cf2d749c15c82563be1d676af4087cea5e9603bf9bf` | `24850d5e65638769…` (derived inside, compose in the path) | 2026-11-04 |
 | 1.1.0 | `v1.1.0` | `sha256:31eb44606b599012143e85ea630e80b90095b080bc65442f8f6ba7e88e0dfd5d` (linux/amd64) | `3ba7b773f9c3b844ec4f4641c7384437a383051ed8328742c1595aac6a372c58` | `19bd924d…` (derived inside, app-wide path) | 2026-11-04 |
 | 1.0.2 | `v1.0.2` | `sha256:66962f2e136059cbaefed0b2ef7b7edddf756c4b4c035a6f9b0ae466f9157fc5` (linux/amd64) | `50d65ee7c8b31f316a3dbbf5060f884df6ef522dd2a4f6df5c953799e4b5c03c` | handed in (`RECEIPT_SIGNING_SEED`) | 2026-11-04 |
 | 1.0.1 | `v1.0.1` | `sha256:1b0079066e90ca902c0e11db6b139dc7e40ea0aa00c9eb796ebc6741da23e574` | `8b33778884c7441d04adc00bcd19b5398084bcdf72caec5097d553af0a934d4e` | handed in; never served (restarted) | 2026-11-04 |
