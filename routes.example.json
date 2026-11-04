@@ -1,0 +1,121 @@
+{
+  "routes": [
+    {
+      "model_id": "deepseek/deepseek-v4.1-flash",
+      "level": 2,
+      "family": "deepseek-v4.1-flash",
+      "claimed_revision": "deepseek-flash",
+      "data_note": "Anonymised relay to DeepSeek's own API (China): the provider sees the prompt, not you, and keeps its own retention policy. DeepSeek's peak-hour surcharge is passed through.",
+      "upstreams": [
+        {
+          "name": "deepseek/api",
+          "base_url": "https://api.deepseek.com/v1",
+          "model": "deepseek-flash",
+          "api_key_env": "DEEPSEEK_API_KEY",
+          "priority": 1,
+          "usage_format": "deepseek",
+          "data_note": "the lab's own API, forwarded as-is: DeepSeek's own defaults apply (deepseek-flash reasons unless the client sends thinking disabled)"
+        }
+      ],
+      "pricing": {
+        "input_microusd_per_million_tokens": 157500,
+        "cached_input_microusd_per_million_tokens": 3150,
+        "output_microusd_per_million_tokens": 630000,
+        "reservation_bps": 15000,
+        "fee_bps": 500,
+        "version": "router-v1",
+        "effective_at": "2026-09-23T00:00:00.000Z",
+        "peak": {
+          "multiplier_percent": 200,
+          "weekdays": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "windows_utc": [
+            [
+              "01:00",
+              "04:00"
+            ],
+            [
+              "06:00",
+              "10:00"
+            ]
+          ],
+          "holidays_utc": [
+            "2026-10-01",
+            "2026-10-02",
+            "2026-10-03",
+            "2026-10-04",
+            "2026-10-05",
+            "2026-10-06",
+            "2026-10-07"
+          ]
+        }
+      },
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 65536,
+      "default_max_output_tokens": 2048
+    },
+    {
+      "model_id": "z-ai/glm-5.3-flash",
+      "level": 2,
+      "family": "glm-5.3-flash",
+      "claimed_revision": "glm-5.3-flash",
+      "data_note": "Anonymised relay to Z.ai (China).",
+      "upstreams": [
+        {
+          "name": "zai/api",
+          "base_url": "https://api.z.ai/api/paas/v4",
+          "model": "glm-5.3-flash",
+          "api_key_env": "ZAI_API_KEY",
+          "priority": 1,
+          "usage_format": "openai"
+        }
+      ],
+      "pricing": {
+        "input_microusd_per_million_tokens": 157500,
+        "cached_input_microusd_per_million_tokens": 31500,
+        "output_microusd_per_million_tokens": 525000,
+        "reservation_bps": 15000,
+        "fee_bps": 500,
+        "version": "router-v1",
+        "effective_at": "2026-09-23T00:00:00.000Z"
+      },
+      "max_context_tokens": 200000,
+      "max_output_tokens": 65536,
+      "default_max_output_tokens": 2048
+    },
+    {
+      "model_id": "moonshot/kimi-k3",
+      "level": 2,
+      "family": "kimi-k3",
+      "claimed_revision": "kimi-k3",
+      "data_note": "Anonymised relay to Moonshot (China).",
+      "upstreams": [
+        {
+          "name": "moonshot/api",
+          "base_url": "https://api.moonshot.ai/v1",
+          "model": "kimi-k3",
+          "api_key_env": "MOONSHOT_API_KEY",
+          "priority": 1,
+          "usage_format": "openai"
+        }
+      ],
+      "pricing": {
+        "input_microusd_per_million_tokens": 3150000,
+        "cached_input_microusd_per_million_tokens": 315000,
+        "output_microusd_per_million_tokens": 15750000,
+        "reservation_bps": 15000,
+        "fee_bps": 500,
+        "version": "router-v1",
+        "effective_at": "2026-09-23T00:00:00.000Z"
+      },
+      "max_context_tokens": 256000,
+      "max_output_tokens": 32768,
+      "default_max_output_tokens": 2048
+    }
+  ]
+}

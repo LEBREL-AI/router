@@ -1,0 +1,19 @@
+# The router inside a confidential VM (Intel TDX) run by dstack (https://github.com/Dstack-TEE/dstack).
+# dstack measures this file, image digest included, into the attestation quote: the quote names
+# exactly this compose and exactly this image. Secrets never appear here: they are passed as
+# dstack encrypted environment variables, which the KMS releases only to this measured app.
+services:
+  router:
+    image: ghcr.io/lebrel-ai/router@sha256:REPLACED_PER_RELEASE
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    environment:
+      - CONTROL_PLANE_URL=https://lebrel.ai
+      - CONTROL_PLANE_SECRET=${CONTROL_PLANE_SECRET}
+      - RECEIPT_SIGNING_SEED=${RECEIPT_SIGNING_SEED}
+      - INSTANCE_ID=${INSTANCE_ID}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - ZAI_API_KEY=${ZAI_API_KEY}
+      - MOONSHOT_API_KEY=${MOONSHOT_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}

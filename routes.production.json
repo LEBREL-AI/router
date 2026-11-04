@@ -1,0 +1,359 @@
+{
+  "routes": [
+    {
+      "model_id": "deepseek/deepseek-v4.1-flash",
+      "display_name": "DeepSeek V4.1 Flash 1017",
+      "base_model": "DeepSeek V4.1 Flash",
+      "level": 2,
+      "family": "deepseek-v4.1-flash",
+      "claimed_revision": "deepseek-flash",
+      "data_note": "Anonymised relay through OpenRouter, pinned to DeepSeek's own API: OpenRouter forwards the prompt without storing it; DeepSeek sees it, not you, and keeps its own retention policy (China). If OpenRouter cannot answer, the request goes to DeepSeek's API directly. DeepSeek's off-peak rate plus 20%; its peak-hour surcharge (weekdays 01-04 and 06-10 UTC, except Chinese public holidays) is passed through.",
+      "upstreams": [
+        {
+          "name": "openrouter/deepseek",
+          "base_url": "https://openrouter.ai/api/v1",
+          "model": "deepseek/deepseek-v4.1-flash-1017",
+          "api_key_env": "OPENROUTER_API_KEY",
+          "priority": 1,
+          "usage_format": "openai",
+          "dialect": "openrouter",
+          "headers": {
+            "HTTP-Referer": "https://lebrel.ai",
+            "X-Title": "Lebrel"
+          },
+          "body": {
+            "provider": {
+              "order": [
+                "deepseek"
+              ],
+              "allow_fallbacks": false
+            }
+          },
+          "data_note": "OpenRouter's relay to DeepSeek's own API, provider pinned, never another host; OpenRouter forwards the prompt without storing it; reasoning on by default (clients send thinking disabled to turn it off, as DeepSeek documents)"
+        },
+        {
+          "name": "deepseek/api",
+          "base_url": "https://api.deepseek.com/v1",
+          "model": "deepseek-flash",
+          "api_key_env": "DEEPSEEK_API_KEY",
+          "priority": 2,
+          "usage_format": "deepseek",
+          "data_note": "DeepSeek's own API, reached directly when OpenRouter cannot answer; forwarded as-is (reasoning on by default, effort high)"
+        }
+      ],
+      "pricing": {
+        "input_microusd_per_million_tokens": 180000,
+        "cached_input_microusd_per_million_tokens": 3600,
+        "output_microusd_per_million_tokens": 720000,
+        "reservation_bps": 15000,
+        "fee_bps": 2000,
+        "version": "router-v2",
+        "effective_at": "2026-09-29T17:28:00.000Z",
+        "peak": {
+          "multiplier_percent": 200,
+          "weekdays": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "windows_utc": [
+            [
+              "01:00",
+              "04:00"
+            ],
+            [
+              "06:00",
+              "10:00"
+            ]
+          ],
+          "holidays_utc": [
+            "2026-09-25",
+            "2026-10-01",
+            "2026-10-02",
+            "2026-10-03",
+            "2026-10-04",
+            "2026-10-05",
+            "2026-10-06",
+            "2026-10-07"
+          ]
+        }
+      },
+      "max_context_tokens": 1048576,
+      "max_output_tokens": 393216,
+      "default_max_output_tokens": 32768
+    },
+    {
+      "model_id": "deepseek/deepseek-v4-pro",
+      "display_name": "DeepSeek V4 Pro",
+      "base_model": "DeepSeek V4 Pro",
+      "level": 2,
+      "family": "deepseek-v4-pro",
+      "claimed_revision": "deepseek-v4-pro",
+      "data_note": "Anonymised relay through OpenRouter, pinned to DeepSeek's own API: OpenRouter forwards the prompt without storing it; DeepSeek sees it, not you, and keeps its own retention policy (China). If OpenRouter cannot answer, the request goes to DeepSeek's API directly. DeepSeek's off-peak rate plus 20%; its peak-hour surcharge (weekdays 01-04 and 06-10 UTC, except Chinese public holidays) is passed through.",
+      "upstreams": [
+        {
+          "name": "openrouter/deepseek",
+          "base_url": "https://openrouter.ai/api/v1",
+          "model": "deepseek/deepseek-v4-pro-0813",
+          "api_key_env": "OPENROUTER_API_KEY",
+          "priority": 1,
+          "usage_format": "openai",
+          "dialect": "openrouter",
+          "headers": {
+            "HTTP-Referer": "https://lebrel.ai",
+            "X-Title": "Lebrel"
+          },
+          "body": {
+            "provider": {
+              "order": [
+                "deepseek"
+              ],
+              "allow_fallbacks": false
+            }
+          },
+          "data_note": "OpenRouter's relay to DeepSeek's own API, provider pinned, never another host; OpenRouter forwards the prompt without storing it; reasoning on by default (clients send thinking disabled to turn it off, as DeepSeek documents)"
+        },
+        {
+          "name": "deepseek/api-pro",
+          "base_url": "https://api.deepseek.com/v1",
+          "model": "deepseek-v4-pro",
+          "api_key_env": "DEEPSEEK_API_KEY",
+          "priority": 2,
+          "usage_format": "deepseek",
+          "data_note": "DeepSeek's own API, reached directly when OpenRouter cannot answer; forwarded as-is (reasoning on by default, effort high)"
+        }
+      ],
+      "pricing": {
+        "input_microusd_per_million_tokens": 792000,
+        "cached_input_microusd_per_million_tokens": 26400,
+        "output_microusd_per_million_tokens": 2376000,
+        "reservation_bps": 15000,
+        "fee_bps": 2000,
+        "version": "router-v2",
+        "effective_at": "2026-09-29T17:28:00.000Z",
+        "peak": {
+          "multiplier_percent": 200,
+          "weekdays": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "windows_utc": [
+            [
+              "01:00",
+              "04:00"
+            ],
+            [
+              "06:00",
+              "10:00"
+            ]
+          ],
+          "holidays_utc": [
+            "2026-09-25",
+            "2026-10-01",
+            "2026-10-02",
+            "2026-10-03",
+            "2026-10-04",
+            "2026-10-05",
+            "2026-10-06",
+            "2026-10-07"
+          ]
+        }
+      },
+      "max_context_tokens": 1048576,
+      "max_output_tokens": 393216,
+      "default_max_output_tokens": 32768
+    },
+    {
+      "model_id": "z-ai/glm-5.3-flash",
+      "display_name": "GLM-5.3 Flash",
+      "base_model": "GLM-5.3 Flash",
+      "level": 2,
+      "family": "glm-5.3-flash",
+      "claimed_revision": "glm-5.3-flash",
+      "data_note": "Anonymised relay to Z.ai's own API: Z.ai sees the prompt, not you, and keeps its own retention policy. Z.ai's published rate plus 20%.",
+      "upstreams": [
+        {
+          "name": "zai/api-flash",
+          "base_url": "https://api.z.ai/api/paas/v4",
+          "model": "glm-5.3-flash",
+          "api_key_env": "ZAI_API_KEY",
+          "priority": 1,
+          "usage_format": "openai",
+          "data_note": "Z.ai's own API, forwarded as-is (reasoning always on, effort max by default; clients lower it with reasoning_effort)"
+        }
+      ],
+      "pricing": {
+        "input_microusd_per_million_tokens": 180000,
+        "cached_input_microusd_per_million_tokens": 36000,
+        "output_microusd_per_million_tokens": 600000,
+        "reservation_bps": 15000,
+        "fee_bps": 2000,
+        "version": "router-v2",
+        "effective_at": "2026-09-29T17:28:00.000Z"
+      },
+      "max_context_tokens": 1048576,
+      "max_output_tokens": 131072,
+      "default_max_output_tokens": 32768
+    },
+    {
+      "model_id": "z-ai/glm-5.3",
+      "display_name": "GLM-5.3",
+      "base_model": "GLM-5.3",
+      "level": 2,
+      "family": "glm-5.3",
+      "claimed_revision": "glm-5.3",
+      "data_note": "Anonymised relay to Z.ai's own API: Z.ai sees the prompt, not you, and keeps its own retention policy. Z.ai's published rate plus 20%.",
+      "upstreams": [
+        {
+          "name": "zai/api",
+          "base_url": "https://api.z.ai/api/paas/v4",
+          "model": "glm-5.3",
+          "api_key_env": "ZAI_API_KEY",
+          "priority": 1,
+          "usage_format": "openai",
+          "data_note": "Z.ai's own API, forwarded as-is (reasoning always on, effort max by default; clients lower it with reasoning_effort)"
+        }
+      ],
+      "pricing": {
+        "input_microusd_per_million_tokens": 1680000,
+        "cached_input_microusd_per_million_tokens": 312000,
+        "output_microusd_per_million_tokens": 5280000,
+        "reservation_bps": 15000,
+        "fee_bps": 2000,
+        "version": "router-v2",
+        "effective_at": "2026-09-29T17:28:00.000Z"
+      },
+      "max_context_tokens": 1048576,
+      "max_output_tokens": 131072,
+      "default_max_output_tokens": 32768
+    },
+    {
+      "model_id": "moonshotai/kimi-k3",
+      "display_name": "Kimi K3",
+      "base_model": "Kimi K3",
+      "level": 2,
+      "family": "kimi-k3",
+      "claimed_revision": "kimi-k3",
+      "data_note": "Anonymised relay to Moonshot AI's own API: Moonshot AI sees the prompt, not you, and keeps its own retention policy. Moonshot AI's published rate plus 20%.",
+      "upstreams": [
+        {
+          "name": "moonshot/api",
+          "base_url": "https://api.moonshot.ai/v1",
+          "model": "kimi-k3",
+          "api_key_env": "MOONSHOT_API_KEY",
+          "priority": 1,
+          "usage_format": "openai",
+          "data_note": "Moonshot AI's own API, forwarded as-is (reasoning always on, effort max by default; clients lower it with reasoning_effort)"
+        }
+      ],
+      "pricing": {
+        "input_microusd_per_million_tokens": 3600000,
+        "cached_input_microusd_per_million_tokens": 360000,
+        "output_microusd_per_million_tokens": 18000000,
+        "reservation_bps": 15000,
+        "fee_bps": 2000,
+        "version": "router-v2",
+        "effective_at": "2026-09-29T17:28:00.000Z"
+      },
+      "max_context_tokens": 1048576,
+      "max_output_tokens": 131072,
+      "default_max_output_tokens": 32768
+    },
+    {
+      "model_id": "qwen/qwen3.8-max",
+      "display_name": "Qwen3.8 Max",
+      "base_model": "Qwen3.8-Max",
+      "level": 2,
+      "family": "qwen3.8-max",
+      "claimed_revision": "qwen/qwen3.8-max-0902",
+      "data_note": "Anonymised relay through OpenRouter, pinned to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): OpenRouter forwards the prompt without storing it; Alibaba sees it, not you, and keeps its own retention policy. Alibaba's list rate plus 20%. This endpoint always reasons: reasoning tokens are billed as output, and a client asking for no reasoning gets the lowest effort.",
+      "upstreams": [
+        {
+          "name": "openrouter/alibaba",
+          "base_url": "https://openrouter.ai/api/v1",
+          "model": "qwen/qwen3.8-max-0902",
+          "api_key_env": "OPENROUTER_API_KEY",
+          "priority": 1,
+          "usage_format": "openai",
+          "dialect": "openrouter",
+          "headers": {
+            "HTTP-Referer": "https://lebrel.ai",
+            "X-Title": "Lebrel"
+          },
+          "body": {
+            "provider": {
+              "order": [
+                "alibaba"
+              ],
+              "allow_fallbacks": false
+            }
+          },
+          "data_note": "OpenRouter's relay to Alibaba Cloud Model Studio, Qwen's own API, provider pinned, never another host; OpenRouter forwards the prompt without storing it; this endpoint always reasons (a client asking for none gets the lowest effort; reasoning_effort sets it)",
+          "reasoning_fixed": true
+        }
+      ],
+      "pricing": {
+        "input_microusd_per_million_tokens": 2400000,
+        "cached_input_microusd_per_million_tokens": 300000,
+        "output_microusd_per_million_tokens": 7200000,
+        "reservation_bps": 15000,
+        "fee_bps": 2000,
+        "version": "router-v2",
+        "effective_at": "2026-11-04T00:00:00.000Z"
+      },
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 131072,
+      "default_max_output_tokens": 32768
+    },
+    {
+      "model_id": "qwen/qwen3.8-flash",
+      "display_name": "Qwen3.8 Flash",
+      "base_model": "Qwen3.8-Flash",
+      "level": 2,
+      "family": "qwen3.8-flash",
+      "claimed_revision": "qwen/qwen3.8-flash",
+      "data_note": "Anonymised relay through OpenRouter, pinned to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): OpenRouter forwards the prompt without storing it; Alibaba sees it, not you, and keeps its own retention policy. Alibaba's list rate plus 20%.",
+      "upstreams": [
+        {
+          "name": "openrouter/alibaba",
+          "base_url": "https://openrouter.ai/api/v1",
+          "model": "qwen/qwen3.8-flash",
+          "api_key_env": "OPENROUTER_API_KEY",
+          "priority": 1,
+          "usage_format": "openai",
+          "dialect": "openrouter",
+          "headers": {
+            "HTTP-Referer": "https://lebrel.ai",
+            "X-Title": "Lebrel"
+          },
+          "body": {
+            "provider": {
+              "order": [
+                "alibaba"
+              ],
+              "allow_fallbacks": false
+            }
+          },
+          "data_note": "OpenRouter's relay to Alibaba Cloud Model Studio, Qwen's own API, provider pinned, never another host; OpenRouter forwards the prompt without storing it; reasoning follows Alibaba's default (clients send enable_thinking false to turn it off, as Alibaba documents)"
+        }
+      ],
+      "pricing": {
+        "input_microusd_per_million_tokens": 180000,
+        "cached_input_microusd_per_million_tokens": 19200,
+        "output_microusd_per_million_tokens": 564000,
+        "reservation_bps": 15000,
+        "fee_bps": 2000,
+        "version": "router-v2",
+        "effective_at": "2026-11-04T00:00:00.000Z"
+      },
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 131072,
+      "default_max_output_tokens": 32768
+    }
+  ]
+}
