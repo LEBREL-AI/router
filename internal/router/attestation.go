@@ -59,8 +59,8 @@ type AttestationDocument struct {
 	// Scheme names how report_data is derived, for verifiers.
 	Scheme string `json:"scheme"`
 	// PublicKey and SigningKeyID are the receipt-signing key the quote is bound to; KeySource says
-	// where the key came from: "vm-kms" (derived inside, by the VM's KMS for this app and compose)
-	// or "env" (handed in; never inside a VM in production).
+	// where the key came from: "vm-kms" (an app key derived inside, by the VM's KMS, with the compose
+	// hash in its path by convention) or "env" (handed in; never inside a VM in production).
 	PublicKey    string `json:"public_key"`
 	SigningKeyID string `json:"signing_key_id"`
 	KeySource    string `json:"key_source"`
@@ -153,13 +153,25 @@ func (s *Server) attestation(ctx context.Context, nonce []byte) (*AttestationDoc
 	}
 	var encryptionPublic []byte
 	encryptionKeyID := ""
-	if s.settings.Encryption != nil {
-		encryptionPublic, encryptionKeyID = s.settings.Encryption.Current()
-	}
-	reportData := AttestationReportData(s.settings.Signer.Public, encryptionPublic, nonce)
-	quote, err := s.settings.Attester.Quote(ctx, reportData)
-	if err != nil {
-		return nil, err
+	var reportData []byte
+	var quote dstack.Quote
+	var err error
+	for attempt := 0; ; attempt++ {
+		if s.settings.Encryption != nil {
+			encryptionPublic, encryptionKeyID = s.settings.Encryption.Current()
+		}
+		reportData = AttestationReportData(s.settings.Signer.Public, encryptionPublic, nonce)
+		if quote, err = s.settings.Attester.Quote(ctx, reportData); err != nil {
+			return nil, err
+		}
+		// The key may rotate while the machine quotes: the quote would name yesterday's key and be
+		// cached naming it, so the current key is read again and, once, quoted again.
+		if s.settings.Encryption == nil || attempt > 0 {
+			break
+		}
+		if _, nowID := s.settings.Encryption.Current(); nowID == encryptionKeyID {
+			break
+		}
 	}
 	s.attestations.mu.Lock()
 	cachedInfo := s.attestations.info

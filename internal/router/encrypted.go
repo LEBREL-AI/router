@@ -14,6 +14,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -34,16 +35,19 @@ const EncryptionMetadataPath = "/.well-known/lebrel-encryption"
 // encryptionMetadataLifetime bounds how long a published key document is valid; clients refetch.
 const encryptionMetadataLifetime = 5 * time.Minute
 
-// encryptedReplayEntries bounds the encapsulations remembered against replay, and
-// encryptedReplayPerAccount those of one account, so a key without credit cannot fill the table for
-// everyone. An entry is forgotten after encryptedReplayFor, longer than its key's life (today's key
-// serves until the end of tomorrow), and a request refused before credit was reserved is forgotten
-// at once. The table lives in memory with the keys: a restart empties both, so nothing captured
-// before it can be decrypted or replayed after.
+// An encrypted request carries the moment it was sent (SentAtField, inside the ciphertext); one
+// older or newer than encryptedClockSkew is refused, so an encapsulation needs remembering only for
+// encryptedReplayFor, minutes, and the table holds minutes of traffic rather than days.
+// encryptedReplayEntries bounds it and encryptedReplayPerAccount one account's share, far above any
+// customer's rate (it only keeps a runaway from filling the table for everyone); a request refused
+// before credit was reserved is forgotten at once. The table lives in memory with the keys: a
+// restart empties both, so nothing captured before it can be decrypted or replayed after.
 const (
-	encryptedReplayEntries    = 400_000
-	encryptedReplayPerAccount = 4_096
-	encryptedReplayFor        = 50 * time.Hour
+	encryptedClockSkew        = 5 * time.Minute
+	encryptedReplayFor        = 2*encryptedClockSkew + time.Minute
+	encryptedReplayEntries    = 1_000_000
+	encryptedReplayPerAccount = 65_536
+	encryptedSweepEvery       = time.Second
 )
 
 // EncryptedRequestMax bounds an encrypted request body: the edge forwards at most 8 MiB.
@@ -60,6 +64,12 @@ const ReceiptSaltField = "lebrel_receipt_salt"
 
 // ReceiptSaltScheme names the salting in the receipt.
 const ReceiptSaltScheme = "client-salt-v1"
+
+// SentAtField is the moment the client sent the request, unix seconds, inside the encrypted body
+// right after the salt (or first): `"lebrel_sent_at":1793831729,`. Required: a request older or
+// newer than encryptedClockSkew is refused, which is what lets the replay table forget an
+// encapsulation after minutes rather than days.
+const SentAtField = "lebrel_sent_at"
 
 // EpochOf names the daily key epoch of a moment: the encryption key is born per UTC day, and the
 // previous day's key is kept while a client may still hold its key document.
@@ -107,10 +117,11 @@ type Encryption struct {
 	current    *encryptionKey
 	previous   *encryptionKey
 	// onRotate runs after a rotation: the cached attestation names the key before it.
-	onRotate func()
-	replays  map[[32]byte]replayEntry
-	accounts map[string]int
-	inserts  int
+	onRotate  func()
+	replays   map[[32]byte]replayEntry
+	accounts  map[string]int
+	inserts   int
+	lastSweep time.Time
 }
 
 type replayEntry struct {
@@ -290,7 +301,11 @@ func (e *Encryption) remember(encapsulation []byte, account string, now time.Tim
 		return false, false
 	}
 	e.inserts++
-	if len(e.replays) >= encryptedReplayEntries || e.accounts[account] >= encryptedReplayPerAccount || e.inserts%4096 == 0 {
+	// Expired entries are swept now and then, and when a cap is reached at most once a second: a
+	// full table costs its holder a sweep per second, never one per request.
+	capped := len(e.replays) >= encryptedReplayEntries || e.accounts[account] >= encryptedReplayPerAccount
+	if (capped && now.Sub(e.lastSweep) >= encryptedSweepEvery) || e.inserts%4096 == 0 {
+		e.lastSweep = now
 		for key, entry := range e.replays {
 			if !now.Before(entry.expiry) {
 				e.drop(key, entry)
@@ -380,39 +395,61 @@ func receiptSalt(ctx context.Context) []byte {
 	return salt
 }
 
-// stripReceiptSalt cuts the client's salt field out of the plaintext, textually, so the body the
-// digest covers is exactly what the client wrote after it; a salt that is malformed or not the
-// first field is an error of the client's.
-func stripReceiptSalt(plaintext []byte) (body []byte, salt []byte, err error) {
-	prefix := []byte(`{"` + ReceiptSaltField + `":"`)
-	if !bytes.HasPrefix(plaintext, prefix) {
-		var fields map[string]json.RawMessage
-		if json.Unmarshal(plaintext, &fields) == nil {
-			if _, present := fields[ReceiptSaltField]; present {
-				return nil, nil, errors.New(ReceiptSaltField + " must be the first field of a compact JSON object")
-			}
+// stripClientFields cuts the client's fields out of the plaintext, textually, so the body the
+// digest covers is exactly what the client wrote after them: an optional salt first
+// (`{"lebrel_receipt_salt":"<hex>",`), then the moment the request was sent
+// (`"lebrel_sent_at":<unix seconds>,`), required. A field that is malformed, missing or anywhere
+// else is an error of the client's.
+func stripClientFields(plaintext []byte) (body []byte, salt []byte, sentAt int64, err error) {
+	rest := plaintext
+	if saltPrefix := []byte(`{"` + ReceiptSaltField + `":"`); bytes.HasPrefix(rest, saltPrefix) {
+		rest = rest[len(saltPrefix):]
+		end := bytes.IndexByte(rest, '"')
+		if end < 0 {
+			return nil, nil, 0, errors.New(ReceiptSaltField + " must be a hex string")
 		}
-		return plaintext, nil, nil
+		salt, err = hex.DecodeString(string(rest[:end]))
+		if err != nil || len(salt) < 16 || len(salt) > 32 {
+			return nil, nil, 0, errors.New(ReceiptSaltField + " must be hex of 16 to 32 bytes")
+		}
+		rest = rest[end+1:]
+		if !bytes.HasPrefix(rest, []byte(",")) {
+			return nil, nil, 0, errors.New(ReceiptSaltField + " must be followed by " + SentAtField)
+		}
+		rest = append([]byte("{"), rest[1:]...)
 	}
-	rest := plaintext[len(prefix):]
-	end := bytes.IndexByte(rest, '"')
-	if end < 0 {
-		return nil, nil, errors.New(ReceiptSaltField + " must be a hex string")
+	sentPrefix := []byte(`{"` + SentAtField + `":`)
+	if !bytes.HasPrefix(rest, sentPrefix) {
+		return nil, nil, 0, errors.New(SentAtField + " (unix seconds) must come first inside an encrypted request, after " + ReceiptSaltField + " if any")
 	}
-	salt, err = hex.DecodeString(string(rest[:end]))
-	if err != nil || len(salt) < 16 || len(salt) > 32 {
-		return nil, nil, errors.New(ReceiptSaltField + " must be hex of 16 to 32 bytes")
+	rest = rest[len(sentPrefix):]
+	digits := 0
+	for digits < len(rest) && rest[digits] >= '0' && rest[digits] <= '9' {
+		digits++
 	}
-	rest = rest[end+1:]
+	if digits == 0 || digits > 12 {
+		return nil, nil, 0, errors.New(SentAtField + " must be unix seconds")
+	}
+	sentAt, _ = strconv.ParseInt(string(rest[:digits]), 10, 64)
+	rest = rest[digits:]
 	switch {
 	case bytes.HasPrefix(rest, []byte(",")):
 		body = append([]byte("{"), rest[1:]...)
 	case bytes.HasPrefix(rest, []byte("}")) && len(bytes.TrimSpace(rest[1:])) == 0:
 		body = []byte("{}")
 	default:
-		return nil, nil, errors.New(ReceiptSaltField + " must be followed by the request's fields")
+		return nil, nil, 0, errors.New(SentAtField + " must be followed by the request's fields")
 	}
-	return body, salt, nil
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(body, &fields) == nil {
+		if _, present := fields[ReceiptSaltField]; present {
+			return nil, nil, 0, errors.New(ReceiptSaltField + " must be the first field of a compact JSON object")
+		}
+		if _, present := fields[SentAtField]; present {
+			return nil, nil, 0, errors.New(SentAtField + " must appear once, first")
+		}
+	}
+	return body, salt, sentAt, nil
 }
 
 // handleEncryptedCompletion decrypts an EHBP request and runs it through the ordinary completion
@@ -448,6 +485,22 @@ func (s *Server) handleEncryptedCompletion(w http.ResponseWriter, r *http.Reques
 		}
 		return
 	}
+	// The key's and the account's concurrency slots are taken before the body is read, as on the
+	// plaintext path: a key cannot hold more uploads or decryptions in flight than its slots.
+	releaseKey, err := s.settings.Limiter.Acquire(r.Context(), "key:"+principal.APIKeyID, principal.Concurrency)
+	if err != nil {
+		w.Header().Set("Retry-After", "1")
+		s.writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "too many concurrent requests for this key")
+		return
+	}
+	defer releaseKey()
+	releaseAccount, err := s.settings.Limiter.Acquire(r.Context(), "account:"+principal.AccountID, principal.AccountConcurrency)
+	if err != nil {
+		w.Header().Set("Retry-After", "1")
+		s.writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "too many concurrent requests for this account")
+		return
+	}
+	defer releaseAccount()
 	current, previous := encryption.keys()
 	key := current
 	if expected := r.Header.Get("X-Lebrel-Encryption-Key-Id"); expected != "" && expected != current.keyID {
@@ -494,6 +547,7 @@ func (s *Server) handleEncryptedCompletion(w http.ResponseWriter, r *http.Reques
 	fresh, full := encryption.remember(encapsulation, principal.AccountID, s.settings.Now())
 	ew, err := key.identity.SetupDerivedResponseEncryption(w, responseContext)
 	if err != nil {
+		encryption.forget(encapsulation)
 		s.writeError(w, http.StatusInternalServerError, "encryption_failed", "response encryption unavailable")
 		return
 	}
@@ -507,13 +561,19 @@ func (s *Server) handleEncryptedCompletion(w http.ResponseWriter, r *http.Reques
 		}
 		return
 	}
-	body, salt, err := stripReceiptSalt(plaintext)
+	body, salt, sentAt, err := stripClientFields(plaintext)
 	if err != nil {
+		encryption.forget(encapsulation)
 		s.writeError(ew, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	if age := s.settings.Now().Sub(time.Unix(sentAt, 0)); age > encryptedClockSkew || age < -encryptedClockSkew {
+		encryption.forget(encapsulation)
+		s.writeError(ew, http.StatusBadRequest, "request_expired", SentAtField+" is outside the accepted window (five minutes either way): check the clock and send the request again")
+		return
+	}
 	admitted := &admission{}
-	ctx := context.WithValue(context.WithValue(r.Context(), principalKey{}, principal), admissionKey{}, admitted)
+	ctx := context.WithValue(context.WithValue(context.WithValue(r.Context(), principalKey{}, principal), admissionKey{}, admitted), limitsKey{}, true)
 	if len(salt) > 0 {
 		ctx = context.WithValue(ctx, receiptSaltKey{}, salt)
 	}
@@ -531,10 +591,12 @@ func (s *Server) handleEncryptedCompletion(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-// principalKey carries a principal the encrypted path authenticated before decrypting; admissionKey
-// carries the record the completion handler marks once the request's credit is reserved.
+// principalKey carries a principal the encrypted path authenticated before decrypting; limitsKey
+// says the key's and the account's concurrency slots are already held; admissionKey carries the
+// record the completion handler marks once the request's credit is reserved.
 type (
 	principalKey struct{}
+	limitsKey    struct{}
 	admissionKey struct{}
 	admission    struct{ reserved bool }
 )

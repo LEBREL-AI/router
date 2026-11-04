@@ -69,6 +69,15 @@ more. The API key is checked before an encrypted body is read, an encapsulation 
 its account (4,096 live entries each, 50 hours, longer than a key's life) and forgotten again when
 the request is refused before credit is reserved.
 
+From 1.3.3 an encrypted request also carries the moment it was sent, inside the ciphertext
+(`"lebrel_sent_at":<unix seconds>,` right after the salt, or first; required): a request older or
+newer than five minutes is refused, so an encapsulation is remembered for eleven minutes rather than
+for its key's life, the table holds minutes of traffic (one million entries, 65,536 per account, far
+above any customer's rate), every refusal before credit is reserved forgets its entry, and the key's
+and the account's concurrency slots are taken before the encrypted body is read, as on the plaintext
+path. A route's attestation is quoted again, once, when the encryption key rotates while the
+machine quotes.
+
 Two compose files are kept: `deploy/dstack/docker-compose.yml` (the machine reached through the
 dstack gateway hostname; its TLS terminates at Phala's gateway, outside the quote) and
 `deploy/dstack/docker-compose.custom-domain.yml` (the same router with dstack-ingress beside it,

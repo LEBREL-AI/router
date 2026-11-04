@@ -93,8 +93,9 @@ func main() {
 	inner, _ := json.Marshal(map[string]any{"model": *model, "messages": []map[string]string{{"role": "user", "content": *prompt}}, "max_tokens": 64})
 	salt := make([]byte, 16)
 	_, _ = rand.Read(salt)
-	// The salt goes first: the router cuts it out and salts the receipt's digests with it.
-	body := append([]byte(`{"lebrel_receipt_salt":"`+hex.EncodeToString(salt)+`",`), inner[1:]...)
+	// The salt goes first, then the moment of sending: the router cuts both out, salts the
+	// receipt's digests with the salt and refuses a request outside a five-minute window.
+	body := append([]byte(`{"lebrel_receipt_salt":"`+hex.EncodeToString(salt)+`","lebrel_sent_at":`+strconv.FormatInt(time.Now().Unix(), 10)+`,`), inner[1:]...)
 	request, _ := http.NewRequest(http.MethodPost, *router+"/m/"+slug+"/v1/chat/completions", bytes.NewReader(body))
 	request.Header.Set("Authorization", "Bearer "+*key)
 	request.Header.Set("Content-Type", "application/json")

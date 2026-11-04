@@ -24,8 +24,9 @@ body anywhere, and its upstream keys and receipt-signing key live only inside th
 
 Inside the VM the router asks dstack's guest agent for two things. The receipt-signing seed is
 derived by the KMS for this app id with the measured compose hash in the derivation path
-(`GetKey`), so every instance of the same compose signs with the same key, a different compose
-signs with a different one, and no human ever holds it; inside a VM in production an explicit
+(`GetKey`): an app key, which every VM booted from a compose registered under this app could derive
+for the same path, so instances of one compose sign alike and no human ever holds it, while it is the
+attestation, not the key, that names the compose that served; inside a VM in production an explicit
 `RECEIPT_SIGNING_SEED` is refused, outside a VM it is the only source. And `GET /.well-known/attestation[?nonce=<hex, up to 32 bytes>]`
 serves the TDX quote whose report data is `SHA-512("lebrel-router-attestation-v1" || public_key ||
 nonce)`, with the event log and the app's identity (app id, compose hash, OS image hash): a

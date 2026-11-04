@@ -105,8 +105,9 @@ func run(logger *log.Logger) error {
 		}
 		if seedText == "" {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			// The compose hash goes into the derivation path: a receipt key names the exact
-			// measured compose that signed with it, not only the app.
+			// The compose hash goes into the derivation path, so instances of one compose sign
+			// alike; it is an app key all the same (any compose registered under the app could
+			// derive it), and it is the attestation that names the compose that served.
 			info, err := client.Info(ctx)
 			if err != nil {
 				cancel()

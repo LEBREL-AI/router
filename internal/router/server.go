@@ -583,20 +583,22 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 		}
 		return
 	}
-	releaseKey, err := s.settings.Limiter.Acquire(ctx, "key:"+principal.APIKeyID, principal.Concurrency)
-	if err != nil {
-		w.Header().Set("Retry-After", "1")
-		s.writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "too many concurrent requests for this key")
-		return
+	if held, _ := ctx.Value(limitsKey{}).(bool); !held {
+		releaseKey, err := s.settings.Limiter.Acquire(ctx, "key:"+principal.APIKeyID, principal.Concurrency)
+		if err != nil {
+			w.Header().Set("Retry-After", "1")
+			s.writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "too many concurrent requests for this key")
+			return
+		}
+		defer releaseKey()
+		releaseAccount, err := s.settings.Limiter.Acquire(ctx, "account:"+principal.AccountID, principal.AccountConcurrency)
+		if err != nil {
+			w.Header().Set("Retry-After", "1")
+			s.writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "too many concurrent requests for this account")
+			return
+		}
+		defer releaseAccount()
 	}
-	defer releaseKey()
-	releaseAccount, err := s.settings.Limiter.Acquire(ctx, "account:"+principal.AccountID, principal.AccountConcurrency)
-	if err != nil {
-		w.Header().Set("Retry-After", "1")
-		s.writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "too many concurrent requests for this account")
-		return
-	}
-	defer releaseAccount()
 
 	original, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.settings.MaxRequestBytes))
 	if err != nil {
