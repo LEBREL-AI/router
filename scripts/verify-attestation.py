@@ -7,10 +7,12 @@
 
 What it checks, in order:
   1. The document at /.well-known/attestation answers, with a fresh nonce of our choosing.
-  2. The TDX quote's report data equals SHA-512("lebrel-router-attestation-v2" || public_key ||
-     encryption_public_key || nonce): the quote was made for this receipt-signing key, for the key
-     clients encrypt requests to, and for our nonce, now (v1 documents, without an encryption key,
-     used the v1 domain and no encryption key).
+  2. The TDX quote's report data equals SHA-512("lebrel-router-attestation-v3" || len(public_key)
+     || public_key || len(encryption_public_key) || encryption_public_key || len(nonce) || nonce),
+     each length one byte: the quote was made for this receipt-signing key, for the key clients
+     encrypt requests to, and for our nonce, now. Older routers bound the same fields without
+     lengths (v2) or only the receipt key and the nonce (v1); those documents are still checked
+     under their own scheme and named as such.
   3. Every runtime event (RTMR3) in the event log is recomputed from its type, name and payload
      (digest = SHA-384(le32(type) || ":" || name || ":" || payload)) and the whole log replays into
      the RTMRs the quote carries (RTMR[i] = SHA-384(RTMR[i] || digest) from 48 zero bytes). Only
@@ -51,6 +53,14 @@ import urllib.request
 
 DOMAIN_V1 = b"lebrel-router-attestation-v1"
 DOMAIN_V2 = b"lebrel-router-attestation-v2"
+DOMAIN_V3 = b"lebrel-router-attestation-v3"
+
+
+def report_data_v3(public_key: bytes, encryption_key: bytes, nonce: bytes) -> bytes:
+    digest = hashlib.sha512(DOMAIN_V3)
+    for field in (public_key, encryption_key, nonce):
+        digest.update(bytes([len(field)]) + field)
+    return digest.digest()
 QUOTE_HEADER = 48
 TD_REPORT_OFFSETS = {
     "tee_tcb_svn": (0, 16), "mr_seam": (16, 48), "mr_signer_seam": (64, 48), "seam_attributes": (112, 8),
@@ -227,9 +237,12 @@ def main() -> int:
         report = td_report(quote)
         scheme = str(document.get("scheme", ""))
         encryption_key = bytes.fromhex(document.get("encryption_public_key") or "")
-        if "attestation-v2" in scheme:
+        if "attestation-v3" in scheme:
+            expected = report_data_v3(public_key, encryption_key, nonce)
+            what = "report_data binds the receipt key, the encryption key and our nonce, each behind its length"
+        elif "attestation-v2" in scheme:
             expected = hashlib.sha512(DOMAIN_V2 + public_key + encryption_key + nonce).digest()
-            what = "report_data binds the receipt key, the encryption key and our nonce"
+            what = "report_data binds the receipt key, the encryption key and our nonce (v2 document, no lengths)"
         else:
             expected = hashlib.sha512(DOMAIN_V1 + public_key + nonce).digest()
             what = "report_data binds the receipt key and our nonce (v1 document, no encryption key)"

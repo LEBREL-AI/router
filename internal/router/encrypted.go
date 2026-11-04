@@ -2,6 +2,7 @@ package router
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -31,24 +32,41 @@ const EncryptionMetadataPath = "/.well-known/lebrel-encryption"
 // encryptionMetadataLifetime bounds how long a published key document is valid; clients refetch.
 const encryptionMetadataLifetime = 5 * time.Minute
 
-// encryptedReplayEntries bounds the encapsulations remembered against replay.
-const encryptedReplayEntries = 200_000
+// encryptedReplayEntries bounds the encapsulations remembered against replay; each is forgotten
+// after encryptedReplayFor, and the key under which it was made rotates daily, so a captured
+// ciphertext is worthless once its key is gone.
+const (
+	encryptedReplayEntries = 200_000
+	encryptedReplayFor     = 36 * time.Hour
+)
 
-// Encryption is the router's HPKE identity and what goes with it.
-type Encryption struct {
+// EncryptedRequestMax bounds an encrypted request body: the edge forwards at most 8 MiB.
+const EncryptedRequestMax = 8 << 20
+
+// ReceiptSaltField is the optional field a client puts inside the encrypted body, as its first
+// field in compact form: `{"lebrel_receipt_salt":"<hex of 16 to 32 random bytes>",...}`. Only the
+// two ends know the salt. The router cuts the field out textually (the rest of the body is
+// forwarded byte for byte) and salts the receipt's digests with it: prompt_sha256 is SHA-256 of
+// salt || the body without the field, response_sha256 SHA-256 of salt || the answer's text, so a
+// receipt's hashes cannot be checked against guesses by anyone who merely read the receipt, while
+// the client, who knows both, can.
+const ReceiptSaltField = "lebrel_receipt_salt"
+
+// ReceiptSaltScheme names the salting in the receipt.
+const ReceiptSaltScheme = "client-salt-v1"
+
+// EpochOf names the daily key epoch of a moment: the encryption key is derived per compose and per
+// UTC day, and the previous day's key is kept while a client may still hold its key document.
+func EpochOf(now time.Time) string { return now.UTC().Format("2006-01-02") }
+
+type encryptionKey struct {
 	identity *identity.Identity
 	config   []byte
 	keyID    string
-	// instanceID is the 32-hex instance identifier the metadata names.
-	instanceID string
-	mu         sync.Mutex
-	replays    map[[32]byte]struct{}
+	epoch    string
 }
 
-// NewEncryption builds the router's HPKE identity from a 32-byte X25519 secret (inside a VM, the
-// KMS-derived key for this compose; nowhere else is it accepted in production) and the instance
-// id the metadata will name.
-func NewEncryption(secret []byte, instanceID string) (*Encryption, error) {
+func newEncryptionKey(secret []byte, epoch string) (*encryptionKey, error) {
 	if len(secret) != 32 {
 		return nil, errors.New("the encryption secret must be 32 bytes")
 	}
@@ -69,15 +87,118 @@ func NewEncryption(secret []byte, instanceID string) (*Encryption, error) {
 		return nil, err
 	}
 	digest := sha256.Sum256(config)
-	instance := sha256.Sum256([]byte("lebrel-router-instance:" + instanceID))
-	return &Encryption{identity: id, config: config, keyID: hex.EncodeToString(digest[:]), instanceID: hex.EncodeToString(instance[:16]), replays: map[[32]byte]struct{}{}}, nil
+	return &encryptionKey{identity: id, config: config, keyID: hex.EncodeToString(digest[:]), epoch: epoch}, nil
 }
 
-// PublicKey is the raw X25519 public key (32 bytes), what the attestation quote commits to.
-func (e *Encryption) PublicKey() []byte { return e.identity.MarshalPublicKey() }
+// Encryption is the router's HPKE identity, its daily rotation and what goes with it.
+type Encryption struct {
+	// derive hands the 32-byte secret of an epoch's key (the KMS, inside a VM); nil means the
+	// identity given at construction never rotates (tests, development).
+	derive func(epoch string) ([]byte, error)
+	// instanceID is the 32-hex instance identifier the metadata names.
+	instanceID string
+	mu         sync.Mutex
+	current    *encryptionKey
+	previous   *encryptionKey
+	replays    map[[32]byte]time.Time
+	inserts    int
+}
 
-// KeyID is SHA-256 of the RFC 9458 key configuration, the id clients pin per request.
-func (e *Encryption) KeyID() string { return e.keyID }
+// NewEncryption builds a router identity from a fixed 32-byte X25519 secret that never rotates.
+func NewEncryption(secret []byte, instanceID string) (*Encryption, error) {
+	key, err := newEncryptionKey(secret, "")
+	if err != nil {
+		return nil, err
+	}
+	return &Encryption{instanceID: instanceIdentifier(instanceID), current: key, replays: map[[32]byte]time.Time{}}, nil
+}
+
+// NewRotatingEncryption derives the key of the current epoch (and keeps the previous epoch's)
+// through derive, and rotates when Rotate is called with a new epoch.
+func NewRotatingEncryption(derive func(epoch string) ([]byte, error), instanceID string, now time.Time) (*Encryption, error) {
+	e := &Encryption{derive: derive, instanceID: instanceIdentifier(instanceID), replays: map[[32]byte]time.Time{}}
+	if err := e.Rotate(now); err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+func instanceIdentifier(instanceID string) string {
+	instance := sha256.Sum256([]byte("lebrel-router-instance:" + instanceID))
+	return hex.EncodeToString(instance[:16])
+}
+
+// Rotate makes the key of now's epoch current, keeping the one before it; a no-op within an epoch.
+func (e *Encryption) Rotate(now time.Time) error {
+	if e.derive == nil {
+		return nil
+	}
+	epoch := EpochOf(now)
+	e.mu.Lock()
+	current := e.current
+	e.mu.Unlock()
+	if current != nil && current.epoch == epoch {
+		return nil
+	}
+	secret, err := e.derive(epoch)
+	if err != nil {
+		return err
+	}
+	key, err := newEncryptionKey(secret, epoch)
+	if err != nil {
+		return err
+	}
+	e.mu.Lock()
+	e.previous, e.current = e.current, key
+	e.mu.Unlock()
+	return nil
+}
+
+// RotateDaily rotates at every UTC midnight until ctx ends; a derivation that fails is retried a
+// minute later, the old key serving meanwhile.
+func (e *Encryption) RotateDaily(ctx context.Context, now func() time.Time, report func(error)) {
+	go func() {
+		for {
+			t := now()
+			next := time.Date(t.UTC().Year(), t.UTC().Month(), t.UTC().Day()+1, 0, 0, 5, 0, time.UTC)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(next.Sub(t)):
+			}
+			for attempt := 0; attempt < 60; attempt++ {
+				if err := e.Rotate(now()); err == nil {
+					break
+				} else if report != nil {
+					report(err)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(time.Minute):
+					}
+				}
+			}
+		}
+	}()
+}
+
+func (e *Encryption) keys() (current, previous *encryptionKey) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.current, e.previous
+}
+
+// PublicKey is the current raw X25519 public key (32 bytes), what the attestation quote commits to.
+func (e *Encryption) PublicKey() []byte {
+	current, _ := e.keys()
+	return current.identity.MarshalPublicKey()
+}
+
+// KeyID is SHA-256 of the current RFC 9458 key configuration, the id clients pin per request.
+func (e *Encryption) KeyID() string {
+	current, _ := e.keys()
+	return current.keyID
+}
 
 // encryptionMetadata is the signed document a client verifies before encrypting: the same shape the
 // editions' runtime publishes, signed here by the receipt-signing key, which the attestation quote
@@ -99,11 +220,12 @@ type encryptionEnvelope struct {
 	Signature string `json:"signature"`
 }
 
-// SignedMetadata is the envelope for one route at time now.
+// SignedMetadata is the envelope for one route at time now, naming the current key.
 func (e *Encryption) SignedMetadata(signer *Signer, modelID string, now time.Time) ([]byte, error) {
+	current, _ := e.keys()
 	payload, err := json.Marshal(encryptionMetadata{
-		ExpiresAt: now.Add(encryptionMetadataLifetime).Unix(), HPKEConfig: base64.StdEncoding.EncodeToString(e.config), IssuedAt: now.Unix(),
-		KeyID: e.keyID, ModelID: modelID, ServerInstanceID: e.instanceID, SigningKeyID: signer.KeyID, Version: 1,
+		ExpiresAt: now.Add(encryptionMetadataLifetime).Unix(), HPKEConfig: base64.StdEncoding.EncodeToString(current.config), IssuedAt: now.Unix(),
+		KeyID: current.keyID, ModelID: modelID, ServerInstanceID: e.instanceID, SigningKeyID: signer.KeyID, Version: 1,
 	})
 	if err != nil {
 		return nil, err
@@ -111,18 +233,27 @@ func (e *Encryption) SignedMetadata(signer *Signer, modelID string, now time.Tim
 	return json.Marshal(encryptionEnvelope{Version: 1, Payload: base64.StdEncoding.EncodeToString(payload), Signature: base64.StdEncoding.EncodeToString(ed25519.Sign(signer.private, payload))})
 }
 
-// remember records an encapsulation; false when it was seen before (a replay) or the table is full.
-func (e *Encryption) remember(encapsulation []byte) (fresh bool, full bool) {
+// remember records an encapsulation; false when it was seen before (a replay) or the table is full
+// of live entries. Expired entries are swept as the table grows.
+func (e *Encryption) remember(encapsulation []byte, now time.Time) (fresh bool, full bool) {
 	digest := sha256.Sum256(encapsulation)
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if _, seen := e.replays[digest]; seen {
+	if expiry, seen := e.replays[digest]; seen && now.Before(expiry) {
 		return false, false
+	}
+	e.inserts++
+	if len(e.replays) >= encryptedReplayEntries || e.inserts%4096 == 0 {
+		for key, expiry := range e.replays {
+			if !now.Before(expiry) {
+				delete(e.replays, key)
+			}
+		}
 	}
 	if len(e.replays) >= encryptedReplayEntries {
 		return false, true
 	}
-	e.replays[digest] = struct{}{}
+	e.replays[digest] = now.Add(encryptedReplayFor)
 	return true, false
 }
 
@@ -170,33 +301,95 @@ func (s *Server) handleEncryptionMetadata(w http.ResponseWriter, r *http.Request
 	_, _ = w.Write(document)
 }
 
+type receiptSaltKey struct{}
+
+// receiptSalt is the client's salt for this request's receipt digests, if it sent one.
+func receiptSalt(ctx context.Context) []byte {
+	salt, _ := ctx.Value(receiptSaltKey{}).([]byte)
+	return salt
+}
+
+// stripReceiptSalt cuts the client's salt field out of the plaintext, textually, so the body the
+// digest covers is exactly what the client wrote after it; a salt that is malformed or not the
+// first field is an error of the client's.
+func stripReceiptSalt(plaintext []byte) (body []byte, salt []byte, err error) {
+	prefix := []byte(`{"` + ReceiptSaltField + `":"`)
+	if !bytes.HasPrefix(plaintext, prefix) {
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(plaintext, &fields) == nil {
+			if _, present := fields[ReceiptSaltField]; present {
+				return nil, nil, errors.New(ReceiptSaltField + " must be the first field of a compact JSON object")
+			}
+		}
+		return plaintext, nil, nil
+	}
+	rest := plaintext[len(prefix):]
+	end := bytes.IndexByte(rest, '"')
+	if end < 0 {
+		return nil, nil, errors.New(ReceiptSaltField + " must be a hex string")
+	}
+	salt, err = hex.DecodeString(string(rest[:end]))
+	if err != nil || len(salt) < 16 || len(salt) > 32 {
+		return nil, nil, errors.New(ReceiptSaltField + " must be hex of 16 to 32 bytes")
+	}
+	rest = rest[end+1:]
+	switch {
+	case bytes.HasPrefix(rest, []byte(",")):
+		body = append([]byte("{"), rest[1:]...)
+	case bytes.HasPrefix(rest, []byte("}")) && len(bytes.TrimSpace(rest[1:])) == 0:
+		body = []byte("{}")
+	default:
+		return nil, nil, errors.New(ReceiptSaltField + " must be followed by the request's fields")
+	}
+	return body, salt, nil
+}
+
 // handleEncryptedCompletion decrypts an EHBP request and runs it through the ordinary completion
 // path with an encrypting response writer: every byte of the answer, errors included, leaves
-// encrypted to the client's key for this request. The edge header is checked by the completion
-// handler as for any request; the API key travels in clear (it is not content).
+// encrypted to the client's key for this request. The edge is checked before anything is read, so
+// nobody outside it can make the machine decrypt or remember anything; the API key is checked by
+// the completion handler as for any request, and travels in clear (it is not content).
 func (s *Server) handleEncryptedCompletion(w http.ResponseWriter, r *http.Request, scoped *Route) {
 	encryption := s.settings.Encryption
 	if encryption == nil {
 		s.writeError(w, http.StatusBadRequest, "encryption_unavailable", "this instance does not accept encrypted requests")
 		return
 	}
+	if !s.validEdge(r) {
+		s.writeError(w, http.StatusUnauthorized, "edge_unauthorized", "missing edge authorization")
+		return
+	}
+	if r.Method != http.MethodPost {
+		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST only")
+		return
+	}
 	if len(r.Header.Values(protocol.EncapsulatedKeyHeader)) != 1 || len(r.Header.Get(protocol.EncapsulatedKeyHeader)) != 64 {
 		s.writeError(w, http.StatusBadRequest, "invalid_ciphertext", "one EHBP encapsulated key is required")
 		return
 	}
-	if expected := r.Header.Get("X-Lebrel-Encryption-Key-Id"); expected != "" && expected != encryption.keyID {
-		w.Header().Set("Content-Type", "application/problem+json")
-		w.WriteHeader(http.StatusUnprocessableEntity)
-		_ = json.NewEncoder(w).Encode(map[string]any{"type": protocol.KeyConfigProblemType, "title": "encryption key rotated", "status": http.StatusUnprocessableEntity, "detail": "fetch the key document again"})
-		return
+	current, previous := encryption.keys()
+	key := current
+	if expected := r.Header.Get("X-Lebrel-Encryption-Key-Id"); expected != "" && expected != current.keyID {
+		if previous != nil && expected == previous.keyID {
+			key = previous
+		} else {
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_ = json.NewEncoder(w).Encode(map[string]any{"type": protocol.KeyConfigProblemType, "title": "encryption key rotated", "status": http.StatusUnprocessableEntity, "detail": "fetch the key document again"})
+			return
+		}
 	}
-	ciphertext, err := io.ReadAll(io.LimitReader(r.Body, s.settings.MaxRequestBytes+1))
+	limit := s.settings.MaxRequestBytes
+	if limit <= 0 || limit > EncryptedRequestMax {
+		limit = EncryptedRequestMax
+	}
+	ciphertext, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	_ = r.Body.Close()
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid_ciphertext", "could not read the encrypted request")
 		return
 	}
-	if int64(len(ciphertext)) > s.settings.MaxRequestBytes {
+	if int64(len(ciphertext)) > limit {
 		s.writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body is too large")
 		return
 	}
@@ -205,39 +398,48 @@ func (s *Server) handleEncryptedCompletion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	r.Body = io.NopCloser(bytes.NewReader(ciphertext))
-	responseContext, err := encryption.identity.DecryptRequestWithContext(r)
+	responseContext, err := key.identity.DecryptRequestWithContext(r)
 	if err != nil || responseContext == nil {
 		s.writeError(w, http.StatusBadRequest, "invalid_ciphertext", "invalid encrypted request")
 		return
 	}
-	plaintext, err := io.ReadAll(io.LimitReader(r.Body, s.settings.MaxRequestBytes+1))
+	plaintext, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	_ = r.Body.Close()
-	if err != nil || int64(len(plaintext)) > s.settings.MaxRequestBytes {
+	if err != nil || int64(len(plaintext)) > limit {
 		s.writeError(w, http.StatusBadRequest, "invalid_ciphertext", "invalid encrypted request")
 		return
 	}
 	encapsulation, _ := hex.DecodeString(r.Header.Get(protocol.EncapsulatedKeyHeader))
-	fresh, full := encryption.remember(encapsulation)
-	ew, err := encryption.identity.SetupDerivedResponseEncryption(w, responseContext)
+	fresh, full := encryption.remember(encapsulation, s.settings.Now())
+	ew, err := key.identity.SetupDerivedResponseEncryption(w, responseContext)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "encryption_failed", "response encryption unavailable")
 		return
 	}
-	ew.Header().Set("X-Lebrel-Encryption-Key-Id", encryption.keyID)
+	ew.Header().Set("X-Lebrel-Encryption-Key-Id", key.keyID)
 	// From here on every answer is encrypted, errors included.
 	if !fresh {
 		if full {
-			s.writeError(ew, http.StatusServiceUnavailable, "key_capacity_reached", "the router must rotate its encryption key before accepting more requests")
+			s.writeError(ew, http.StatusServiceUnavailable, "key_capacity_reached", "the router is remembering too many recent requests; try again in a moment")
 		} else {
 			s.writeError(ew, http.StatusConflict, "replayed_request", "this encrypted request has already been submitted")
 		}
 		return
 	}
-	inner := r.Clone(r.Context())
+	body, salt, err := stripReceiptSalt(plaintext)
+	if err != nil {
+		s.writeError(ew, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	ctx := r.Context()
+	if len(salt) > 0 {
+		ctx = context.WithValue(ctx, receiptSaltKey{}, salt)
+	}
+	inner := r.Clone(ctx)
 	inner.Header.Del(protocol.EncapsulatedKeyHeader)
 	inner.Header.Del("X-Lebrel-Encryption-Key-Id")
 	inner.Header.Set("Content-Type", "application/json")
-	inner.ContentLength = int64(len(plaintext))
-	inner.Body = io.NopCloser(bytes.NewReader(plaintext))
+	inner.ContentLength = int64(len(body))
+	inner.Body = io.NopCloser(bytes.NewReader(body))
 	s.handleCompletion(ew, inner, scoped)
 }

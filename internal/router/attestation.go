@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -18,9 +17,10 @@ import (
 // confidential VM it runs in, bound to its receipt-signing key.
 const AttestationPath = "/.well-known/attestation"
 
-// attestationDomain separates this binding from any other use of the quote's report data. v2 binds
-// the receipt-signing key and the request-encryption key; v1 (no encryption key) bound the first.
-const attestationDomain = "lebrel-router-attestation-v2"
+// attestationDomain separates this binding from any other use of the quote's report data. v3 binds
+// the receipt-signing key, the request-encryption key and the nonce, each behind its length; v2
+// bound them without lengths, v1 only the first key.
+const attestationDomain = "lebrel-router-attestation-v3"
 
 // attestationNonceMax bounds the nonce a verifier may ask into the report data.
 const attestationNonceMax = 32
@@ -29,25 +29,27 @@ const attestationNonceMax = 32
 const attestationCacheFor = 5 * time.Minute
 
 // attestationInFlight bounds the quotes asked of the VM at once: the guest agent makes them one at
-// a time, so beyond this the answer is a 429, never a queue that drains the agent.
-const attestationInFlight = 2
-
-// attestationPerClient is how many fresh quotes (with a nonce) one client address may ask per
-// minute; without a nonce the cached document costs nothing. Behind a gateway or proxy every
-// request carries the gateway's address, so this is in practice a limit for all verifiers together:
-// generous enough for honest use, small enough that the agent's serial quoting is never drained.
-const attestationPerClient = 30
+// a time. Further askers wait in a short line (attestationWait) and are told 429 only when the line
+// is full or the wait runs out, so verifiers starting at once are served in turn rather than
+// refused; behind a gateway every request shares one address, so there is no per-client count.
+const (
+	attestationInFlight = 2
+	attestationWaiting  = 16
+	attestationWait     = 10 * time.Second
+)
 
 // AttestationReportData is what the quote's 64-byte report data commits to: the receipt-signing
 // public key, the request-encryption public key (empty where the instance accepts no encrypted
 // requests), and the verifier's nonce when one is given. report_data = SHA-512(domain ||
 // public_key || encryption_public_key || nonce), so a verifier recomputes it from the document.
 func AttestationReportData(publicKey []byte, encryptionPublicKey []byte, nonce []byte) []byte {
+	// Each field is preceded by its length (one byte): no two layouts share a digest.
 	h := sha512.New()
 	h.Write([]byte(attestationDomain))
-	h.Write(publicKey)
-	h.Write(encryptionPublicKey)
-	h.Write(nonce)
+	for _, field := range [][]byte{publicKey, encryptionPublicKey, nonce} {
+		h.Write([]byte{byte(len(field))})
+		h.Write(field)
+	}
 	return h.Sum(nil)
 }
 
@@ -86,55 +88,46 @@ type attestationCache struct {
 	document *AttestationDocument
 	expires  time.Time
 	// info is the app's identity, read once: it cannot change while the VM runs.
-	info    *dstack.Info
-	inUse   int
-	clients map[string]*attestationClient
+	info *dstack.Info
+	// slots holds the quotes in flight; waiting counts the askers in line behind them.
+	slots   chan struct{}
+	waiting int
+	// wait overrides attestationWait (tests).
+	wait time.Duration
 }
 
-type attestationClient struct {
-	count   int
-	resetAt time.Time
-}
-
-// admit reserves one of the quote slots and one of the client's fresh quotes for this minute;
-// it returns the code of the refusal when it cannot.
-func (c *attestationCache) admit(client string, fresh bool, now time.Time) (release func(), refused string) {
+// admit takes a quote slot, waiting in line for up to attestationWait; it returns the code of the
+// refusal when the line is full or the wait ran out.
+func (c *attestationCache) admit(ctx context.Context) (release func(), refused string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if fresh {
-		if c.clients == nil {
-			c.clients = map[string]*attestationClient{}
-		}
-		if len(c.clients) > 4096 {
-			for key, entry := range c.clients {
-				if now.After(entry.resetAt) {
-					delete(c.clients, key)
-				}
-			}
-		}
-		entry := c.clients[client]
-		if entry == nil || now.After(entry.resetAt) {
-			entry = &attestationClient{resetAt: now.Add(time.Minute)}
-			c.clients[client] = entry
-		}
-		if entry.count >= attestationPerClient {
-			return nil, "too_many_quotes"
-		}
-		// A request refused for a full machine is not one of the client's quotes.
-		if c.inUse >= attestationInFlight {
-			return nil, "attestation_busy"
-		}
-		entry.count++
+	if c.slots == nil {
+		c.slots = make(chan struct{}, attestationInFlight)
 	}
-	if c.inUse >= attestationInFlight {
+	if c.waiting >= attestationWaiting {
+		c.mu.Unlock()
 		return nil, "attestation_busy"
 	}
-	c.inUse++
-	return func() {
+	c.waiting++
+	slots, wait := c.slots, c.wait
+	if wait <= 0 {
+		wait = attestationWait
+	}
+	c.mu.Unlock()
+	defer func() {
 		c.mu.Lock()
-		c.inUse--
+		c.waiting--
 		c.mu.Unlock()
-	}, ""
+	}()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case slots <- struct{}{}:
+		return func() { <-slots }, ""
+	case <-timer.C:
+		return nil, "attestation_busy"
+	case <-ctx.Done():
+		return nil, "attestation_busy"
+	}
 }
 
 // attestation builds the document; without a nonce the last one is reused for a few minutes.
@@ -189,7 +182,7 @@ func (s *Server) attestation(ctx context.Context, nonce []byte) (*AttestationDoc
 		}
 	}
 	document := &AttestationDocument{
-		Kind: "lebrel-router-attestation", Scheme: "report_data = sha512(\"" + attestationDomain + "\" || public_key || encryption_public_key || nonce)",
+		Kind: "lebrel-router-attestation", Scheme: "report_data = sha512(\"" + attestationDomain + "\" || len(public_key) || public_key || len(encryption_public_key) || encryption_public_key || len(nonce) || nonce)",
 		PublicKey: hex.EncodeToString(s.settings.Signer.Public), SigningKeyID: s.settings.Signer.KeyID, KeySource: s.settings.KeySource,
 		EncryptionPublicKey: hex.EncodeToString(encryptionPublic), EncryptionKeyID: encryptionKeyID, InstanceID: s.settings.Signer.InstanceID,
 		Nonce: hex.EncodeToString(nonce), ReportData: hex.EncodeToString(reportData),
@@ -223,10 +216,6 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusNotFound, "attestation_unavailable", "this instance does not run in an attested VM")
 		return
 	}
-	client, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		client = r.RemoteAddr
-	}
 	// A fresh cached document costs the machine nothing: served before any limit applies.
 	if len(nonce) == 0 {
 		s.attestations.mu.Lock()
@@ -239,10 +228,10 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	release, refused := s.attestations.admit(client, len(nonce) > 0, s.settings.Now())
+	release, refused := s.attestations.admit(r.Context())
 	if refused != "" {
 		w.Header().Set("Retry-After", "5")
-		s.writeError(w, http.StatusTooManyRequests, refused, "the attestation is being asked faster than the machine can quote; try again in a few seconds")
+		s.writeError(w, http.StatusTooManyRequests, refused, "the machine is quoting for others; try again in a few seconds")
 		return
 	}
 	defer release()

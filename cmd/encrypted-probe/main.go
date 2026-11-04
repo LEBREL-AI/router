@@ -2,18 +2,22 @@
 // what the SDK does, as a command anyone can read.
 //
 //	encrypted-probe -router https://router-tee.lebrel.ai -model deepseek/deepseek-v4.1-flash \
-//	    -key $LEBREL_API_KEY [-edge-token <hex>] [-prompt "..."]
+//	    -key $LEBREL_API_KEY [-edge-token <hex>] [-prompt "..."] \
+//	    [-public-key <hex from RELEASES.md>] [-compose-hash <hex from RELEASES.md>]
 //
 // Steps: fetch /.well-known/attestation (the receipt key and the encryption key the quote binds;
-// verify the quote with scripts/verify-attestation.py), fetch the route's signed key document and
-// check its signature with the attested receipt key and its key id against the attested
-// encryption key, encrypt the request to that key, decrypt the answer with the per-request keys.
-// The API key travels in clear (it is not content); the prompt and the answer never do.
+// verify the quote with scripts/verify-attestation.py, and pin here the receipt key and the compose
+// hash that script or RELEASES.md gave you), fetch the route's signed key document and check its
+// signature with the attested receipt key and its key id against the attested encryption key,
+// encrypt the request to that key, decrypt the answer with the per-request keys. A salt of ours
+// goes first inside the encrypted body, so the receipt's digests are checkable only by the two
+// ends. The API key travels in clear (it is not content); the prompt and the answer never do.
 package main
 
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -23,6 +27,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +41,8 @@ func main() {
 	key := flag.String("key", os.Getenv("LEBREL_API_KEY"), "Lebrel API key")
 	edge := flag.String("edge-token", os.Getenv("LEBREL_EDGE_TOKEN"), "edge authorization (lebrel.ai's edge sets it; direct calls need it)")
 	prompt := flag.String("prompt", "Reply with the single word: encrypted", "prompt")
+	pinnedKey := flag.String("public-key", "", "receipt key (hex) the attestation must name: RELEASES.md's row")
+	pinnedCompose := flag.String("compose-hash", "", "compose hash (hex) the attestation must measure: RELEASES.md's row")
 	flag.Parse()
 	if *key == "" {
 		fmt.Fprintln(os.Stderr, "an API key is required (-key or LEBREL_API_KEY)")
@@ -50,7 +58,14 @@ func main() {
 	if len(receiptKey) != ed25519.PublicKeySize || encryptionKeyID == "" {
 		fail("the attestation names no receipt key or no encryption key: this instance does not accept encrypted requests")
 	}
-	fmt.Printf("attested receipt key %s…, encryption key id %s…, instance %s (verify the quote with scripts/verify-attestation.py)\n", str(attested["signing_key_id"])[:16], encryptionKeyID[:16], str(attested["instance_id"]))
+	info, _ := attested["info"].(map[string]any)
+	if *pinnedKey != "" && !strings.EqualFold(str(attested["public_key"]), *pinnedKey) {
+		fail("the attestation names receipt key " + str(attested["public_key"]) + ", not the pinned one")
+	}
+	if *pinnedCompose != "" && !strings.EqualFold(str(info["compose_hash"]), *pinnedCompose) {
+		fail("the attestation measures compose " + str(info["compose_hash"]) + ", not the pinned one")
+	}
+	fmt.Printf("attested receipt key %s…, encryption key id %s…, compose %s…, instance %s (verify the quote with scripts/verify-attestation.py)\n", str(attested["signing_key_id"])[:16], encryptionKeyID[:16], str(info["compose_hash"])[:16], str(attested["instance_id"]))
 
 	envelope, err := getJSON(client, *router+"/m/"+slug+"/.well-known/lebrel-encryption")
 	must(err, "key document")
@@ -75,7 +90,11 @@ func main() {
 	must(err, "key configuration")
 	fmt.Printf("key document signed by the attested key, encryption key %s… matches the quote\n", metadata.KeyID[:16])
 
-	body, _ := json.Marshal(map[string]any{"model": *model, "messages": []map[string]string{{"role": "user", "content": *prompt}}, "max_tokens": 16})
+	inner, _ := json.Marshal(map[string]any{"model": *model, "messages": []map[string]string{{"role": "user", "content": *prompt}}, "max_tokens": 16})
+	salt := make([]byte, 16)
+	_, _ = rand.Read(salt)
+	// The salt goes first: the router cuts it out and salts the receipt's digests with it.
+	body := append([]byte(`{"lebrel_receipt_salt":"`+hex.EncodeToString(salt)+`",`), inner[1:]...)
 	request, _ := http.NewRequest(http.MethodPost, *router+"/m/"+slug+"/v1/chat/completions", bytes.NewReader(body))
 	request.Header.Set("Authorization", "Bearer "+*key)
 	request.Header.Set("Content-Type", "application/json")
@@ -97,15 +116,105 @@ func main() {
 	must(err, "answer")
 	fmt.Printf("status %d, upstream %s, verification %s, request %s\n", response.StatusCode, response.Header.Get("X-Lebrel-Upstream"), response.Header.Get("X-Lebrel-Verification"), response.Header.Get("X-Request-Id"))
 	var parsed map[string]any
+	text := string(answer)
 	if json.Unmarshal(answer, &parsed) == nil {
 		if choices, ok := parsed["choices"].([]any); ok && len(choices) > 0 {
 			if message, ok := choices[0].(map[string]any)["message"].(map[string]any); ok {
-				fmt.Printf("answer (decrypted): %v\n", message["content"])
-				return
+				text = str(message["content"])
 			}
 		}
 	}
-	fmt.Printf("answer (decrypted): %s\n", answer)
+	fmt.Printf("answer (decrypted): %s\n", text)
+	checkReceipt(response.Header.Get("Proof-Of-Edition-Receipt"), receiptKey, salt, inner, text)
+}
+
+// checkReceipt verifies the route receipt the answer carries: signed by the attested receipt key,
+// its digests equal to SHA-256(salt || what we sent) and SHA-256(salt || what we received).
+func checkReceipt(encoded string, receiptKey ed25519.PublicKey, salt []byte, sent []byte, received string) {
+	if encoded == "" {
+		fail("the answer carries no receipt")
+	}
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	must(err, "receipt")
+	var document struct {
+		Payload   map[string]any `json:"payload"`
+		Signature string         `json:"signature"`
+	}
+	must(json.Unmarshal(raw, &document), "receipt")
+	canonical, err := canonicalJSON(document.Payload)
+	must(err, "receipt payload")
+	signature, _ := base64.StdEncoding.DecodeString(document.Signature)
+	if !ed25519.Verify(receiptKey, canonical, signature) {
+		fail("the receipt is not signed by the attested receipt key")
+	}
+	salted := func(body []byte) string {
+		h := sha256.New()
+		h.Write(salt)
+		h.Write(body)
+		return hex.EncodeToString(h.Sum(nil))
+	}
+	if str(document.Payload["hash_salt_scheme"]) != "client-salt-v1" || str(document.Payload["prompt_sha256"]) != salted(sent) || str(document.Payload["response_sha256"]) != salted([]byte(received)) {
+		fail("the receipt's digests are not SHA-256(salt || request) and SHA-256(salt || answer)")
+	}
+	fmt.Printf("receipt signed by the attested key; prompt and answer digests match under our salt (scheme %s)\n", str(document.Payload["hash_salt_scheme"]))
+}
+
+// canonicalJSON is the router's canonical form: keys sorted, no spaces, HTML unescaped, as
+// encoding/json writes a map; whole numbers stay integers.
+func canonicalJSON(value any) ([]byte, error) {
+	switch v := value.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var buffer bytes.Buffer
+		buffer.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				buffer.WriteByte(',')
+			}
+			name, _ := canonicalJSON(k)
+			buffer.Write(name)
+			buffer.WriteByte(':')
+			encoded, err := canonicalJSON(v[k])
+			if err != nil {
+				return nil, err
+			}
+			buffer.Write(encoded)
+		}
+		buffer.WriteByte('}')
+		return buffer.Bytes(), nil
+	case []any:
+		var buffer bytes.Buffer
+		buffer.WriteByte('[')
+		for i, item := range v {
+			if i > 0 {
+				buffer.WriteByte(',')
+			}
+			encoded, err := canonicalJSON(item)
+			if err != nil {
+				return nil, err
+			}
+			buffer.Write(encoded)
+		}
+		buffer.WriteByte(']')
+		return buffer.Bytes(), nil
+	case float64:
+		if v == float64(int64(v)) {
+			return []byte(strconv.FormatInt(int64(v), 10)), nil
+		}
+		return json.Marshal(v)
+	default:
+		var buffer bytes.Buffer
+		encoder := json.NewEncoder(&buffer)
+		encoder.SetEscapeHTML(false)
+		if err := encoder.Encode(v); err != nil {
+			return nil, err
+		}
+		return bytes.TrimRight(buffer.Bytes(), "\n"), nil
+	}
 }
 
 func getJSON(client *http.Client, url string) (map[string]any, error) {

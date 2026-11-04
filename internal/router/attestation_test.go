@@ -7,9 +7,11 @@ import (
 	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,13 +21,22 @@ import (
 )
 
 // A fake VM: hands back a quote that echoes the report data it was asked, and a fixed identity.
+// With hold set, every quote waits until hold is closed (a slow agent).
 type fakeAttester struct {
+	mu    sync.Mutex
 	asked [][]byte
 	fail  bool
+	hold  chan struct{}
 }
 
 func (f *fakeAttester) Quote(_ context.Context, reportData []byte) (dstack.Quote, error) {
+	f.mu.Lock()
 	f.asked = append(f.asked, append([]byte(nil), reportData...))
+	hold := f.hold
+	f.mu.Unlock()
+	if hold != nil {
+		<-hold
+	}
 	if f.fail {
 		return dstack.Quote{}, io.ErrUnexpectedEOF
 	}
@@ -85,9 +96,12 @@ func TestTheAttestationBindsTheReceiptKeyIntoTheQuotesReportData(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("status %d", response.StatusCode)
 	}
+	// v3: domain, then each field behind its one-byte length (no encryption key, no nonce here).
 	expected := sha512.New()
-	expected.Write([]byte("lebrel-router-attestation-v2"))
+	expected.Write([]byte("lebrel-router-attestation-v3"))
+	expected.Write([]byte{32})
 	expected.Write(signer.Public)
+	expected.Write([]byte{0, 0})
 	want := hex.EncodeToString(expected.Sum(nil))
 	if document.ReportData != want || document.PublicKey != hex.EncodeToString(signer.Public) || document.SigningKeyID != signer.KeyID {
 		t.Fatalf("binding wrong: %+v", document)
@@ -157,28 +171,13 @@ func TestTheReportDataIsDeterministicAndDomainSeparated(t *testing.T) {
 	if hex.EncodeToString(a) == hex.EncodeToString(plain[:]) {
 		t.Fatal("report data is a bare hash of the key: no domain separation")
 	}
-}
-
-// The VM quotes one at a time: a client asking fresh quotes faster than a dozen a minute is told
-// to slow down, and the cached document (no nonce) keeps answering meanwhile.
-func TestFreshQuotesPerClientAreLimitedAndTheCachedDocumentIsNot(t *testing.T) {
-	vm := &fakeAttester{}
-	ts, _ := attestedServer(t, vm)
-	nonce := "0102030405060708"
-	var last int
-	for i := 0; i < attestationPerClient+1; i++ {
-		response, _ := getAttestation(t, ts, "?nonce="+nonce)
-		last = response.StatusCode
+	// The fields are length-prefixed: moving bytes between them changes the digest.
+	other := bytes.Repeat([]byte{2}, 32)
+	if hex.EncodeToString(AttestationReportData(key, other, nil)) == hex.EncodeToString(AttestationReportData(append(append([]byte(nil), key...), other...), nil, nil)) {
+		t.Fatal("two layouts of the same bytes share a digest")
 	}
-	if last != http.StatusTooManyRequests {
-		t.Fatalf("the %dth fresh quote in a minute was admitted: %d", attestationPerClient+1, last)
-	}
-	if len(vm.asked) != attestationPerClient {
-		t.Fatalf("the VM was asked %d times, want %d", len(vm.asked), attestationPerClient)
-	}
-	response, _ := getAttestation(t, ts, "")
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("the cached document was refused: %d", response.StatusCode)
+	if hex.EncodeToString(AttestationReportData(key, nil, other)) == hex.EncodeToString(AttestationReportData(key, other, nil)) {
+		t.Fatal("the encryption key and the nonce are interchangeable")
 	}
 }
 
@@ -196,29 +195,116 @@ func TestAFailingVMsErrorTextStaysInside(t *testing.T) {
 	}
 }
 
-// A refusal for a full machine is not counted against the client, and a fresh cached document is
-// served even while the machine is busy quoting.
-func TestARefusalDoesNotCountAndTheCacheIsServedWhileBusy(t *testing.T) {
+// fetch asks for the attestation from any goroutine (t.Fatal belongs to the test's).
+func fetchAttestation(ts *httptest.Server, query string) (int, error) {
+	response, err := http.Get(ts.URL + AttestationPath + query)
+	if err != nil {
+		return 0, err
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+	return response.StatusCode, nil
+}
+
+// The VM quotes one at a time: verifiers that arrive together wait their turn in a short line and
+// are all served, while the cached document (no nonce) keeps answering meanwhile.
+func TestFreshQuotesWaitTheirTurnAndTheCachedDocumentIsServedMeanwhile(t *testing.T) {
+	vm := &fakeAttester{}
+	ts, _ := attestedServer(t, vm)
+	if response, _ := getAttestation(t, ts, ""); response.StatusCode != http.StatusOK {
+		t.Fatalf("first document: %d", response.StatusCode)
+	}
+	hold := make(chan struct{})
+	vm.mu.Lock()
+	vm.hold = hold
+	vm.mu.Unlock()
+	const askers = attestationInFlight + 3
+	results := make(chan int, askers)
+	for i := 0; i < askers; i++ {
+		go func(i int) {
+			status, err := fetchAttestation(ts, fmt.Sprintf("?nonce=%02x", i+1))
+			if err != nil {
+				status = -1
+			}
+			results <- status
+		}(i)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		vm.mu.Lock()
+		inFlight := len(vm.asked) - 1
+		vm.mu.Unlock()
+		if inFlight == attestationInFlight {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d quotes in flight after the wait, want %d", inFlight, attestationInFlight)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if cached, _ := getAttestation(t, ts, ""); cached.StatusCode != http.StatusOK {
+		t.Fatalf("the cached document was refused while the machine quotes: %d", cached.StatusCode)
+	}
+	select {
+	case status := <-results:
+		t.Fatalf("an asker in line was answered %d before its turn", status)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(hold)
+	for i := 0; i < askers; i++ {
+		if status := <-results; status != http.StatusOK {
+			t.Fatalf("an asker in line was refused: %d", status)
+		}
+	}
+	vm.mu.Lock()
+	quotes := len(vm.asked)
+	vm.mu.Unlock()
+	if quotes != askers+1 {
+		t.Fatalf("the VM was asked %d times, want %d", quotes, askers+1)
+	}
+}
+
+// When the line is full, or the wait for a slot runs out, a fresh quote is refused with a 429 and
+// a Retry-After; the cached document is still served.
+func TestAFullLineOrAWaitThatRunsOutIsToldAsBusy(t *testing.T) {
 	vm := &fakeAttester{}
 	ts, _ := attestedServer(t, vm)
 	getAttestation(t, ts, "")
 	cache := &ts.Config.Handler.(*Server).attestations
 	cache.mu.Lock()
-	cache.inUse = attestationInFlight
+	cache.waiting = attestationWaiting
 	cache.mu.Unlock()
 	response, _ := getAttestation(t, ts, "?nonce=0102")
-	if response.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("a full machine admitted a fresh quote: %d", response.StatusCode)
+	if response.StatusCode != http.StatusTooManyRequests || response.Header.Get("Retry-After") != "5" {
+		t.Fatalf("a full line admitted a fresh quote: %d %v", response.StatusCode, response.Header)
 	}
-	cached, _ := getAttestation(t, ts, "")
-	if cached.StatusCode != http.StatusOK {
+	cache.mu.Lock()
+	cache.waiting = 0
+	cache.wait = 30 * time.Millisecond
+	if cache.slots == nil {
+		cache.slots = make(chan struct{}, attestationInFlight)
+	}
+	for i := 0; i < attestationInFlight; i++ {
+		cache.slots <- struct{}{}
+	}
+	cache.mu.Unlock()
+	started := time.Now()
+	response, _ = getAttestation(t, ts, "?nonce=0304")
+	if response.StatusCode != http.StatusTooManyRequests || time.Since(started) < 30*time.Millisecond {
+		t.Fatalf("a wait that ran out was not told as busy: %d after %s", response.StatusCode, time.Since(started))
+	}
+	if cached, _ := getAttestation(t, ts, ""); cached.StatusCode != http.StatusOK {
 		t.Fatalf("the cached document was refused while busy: %d", cached.StatusCode)
 	}
 	cache.mu.Lock()
-	count := cache.clients["127.0.0.1"].count
-	cache.inUse = 0
+	for i := 0; i < attestationInFlight; i++ {
+		<-cache.slots
+	}
 	cache.mu.Unlock()
-	if count != 0 {
-		t.Fatalf("the refused request was counted: %d", count)
+	vm.mu.Lock()
+	quotes := len(vm.asked)
+	vm.mu.Unlock()
+	if quotes != 1 {
+		t.Fatalf("a refused request reached the VM: %d quotes", quotes)
 	}
 }
