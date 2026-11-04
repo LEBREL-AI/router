@@ -5,6 +5,7 @@ check that the running machine is this code:
 
 | Version | Git tag | Image digest | dstack compose hash | Receipt key id | Since |
 |---|---|---|---|---|---|
+| 1.3.0 | `v1.3.0` | `sha256:88f572f4830c4df1fbf29e9c36c4375760a803fcff9c3ba1499662a712a5e3e2` (linux/amd64, Go 1.26, BuildKit v0.27.1, OCI media types) | _(recorded at deployment)_ | _(recorded at deployment; from 1.3.0 a row also names the encryption key id the quote binds)_ | 2026-11-04 |
 | 1.2.0 (custom domain, instance A) | `v1.2.0` | `sha256:de4aaa36efa8750a85ce3a90331e0259bcf6c2bfd04e5232152452a147ac58a6` + dstack-ingress 2.2 (`deploy/dstack/docker-compose.custom-domain.yml`, router-tee.lebrel.ai) | `0b5563830f207a2f2ff03042505985d7ecd96935f2f7a1f074e84b493c8cba17` | `75b981a701b150c565d05500191dbe6a83dfa0c1bcabe8752234f41067a05204`, public key `161dc88748c3d05ee654bd56285b71115c1c5dfabc5ff9967f6ffbc21287588d` (derived inside, compose in the path) | 2026-11-04 |
 | 1.2.0 | `v1.2.0` | `sha256:de4aaa36efa8750a85ce3a90331e0259bcf6c2bfd04e5232152452a147ac58a6` (linux/amd64, BuildKit v0.27.1, OCI media types) | `a28254ec21ff869593b25cf2d749c15c82563be1d676af4087cea5e9603bf9bf` | `24850d5e65638769…` (derived inside, compose in the path) | 2026-11-04 |
 | 1.1.0 | `v1.1.0` | `sha256:31eb44606b599012143e85ea630e80b90095b080bc65442f8f6ba7e88e0dfd5d` (linux/amd64) | `3ba7b773f9c3b844ec4f4641c7384437a383051ed8328742c1595aac6a372c58` | `19bd924d…` (derived inside, app-wide path) | 2026-11-04 |
