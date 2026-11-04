@@ -89,9 +89,11 @@ type attestationCache struct {
 	expires  time.Time
 	// info is the app's identity, read once: it cannot change while the VM runs.
 	info *dstack.Info
-	// slots holds the quotes in flight; waiting counts the askers in line behind them.
+	// slots holds the quotes in flight; waiting counts the askers in line behind them. refresh
+	// serializes renewals of the shared document, which take no place in the line.
 	slots   chan struct{}
 	waiting int
+	refresh sync.Mutex
 	// wait overrides attestationWait (tests).
 	wait time.Duration
 }
@@ -207,8 +209,16 @@ func (s *Server) attestation(ctx context.Context, nonce []byte) (*AttestationDoc
 		Quote: hex.EncodeToString(quote.Quote), EventLog: eventLog, VMConfig: vmConfig, Info: info, IssuedAt: now.Unix(),
 	}
 	if len(nonce) == 0 {
+		// Not kept if the key rotated since the quote: the next asker quotes again.
 		s.attestations.mu.Lock()
-		s.attestations.document, s.attestations.expires = document, now.Add(attestationCacheFor)
+		stale := false
+		if s.settings.Encryption != nil {
+			_, nowID := s.settings.Encryption.Current()
+			stale = nowID != encryptionKeyID
+		}
+		if !stale {
+			s.attestations.document, s.attestations.expires = document, now.Add(attestationCacheFor)
+		}
 		s.attestations.mu.Unlock()
 	}
 	return document, nil
@@ -234,17 +244,23 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusNotFound, "attestation_unavailable", "this instance does not run in an attested VM")
 		return
 	}
-	// A fresh cached document costs the machine nothing: served before any limit applies.
+	// The shared document (no nonce) is served from the cache, or renewed outside the line, one
+	// renewal at a time: a crowd asking for fresh quotes never starves those who take the shared one.
 	if len(nonce) == 0 {
-		s.attestations.mu.Lock()
-		cached, expires := s.attestations.document, s.attestations.expires
-		s.attestations.mu.Unlock()
-		if cached != nil && s.settings.Now().Before(expires) {
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Cache-Control", "no-store")
-			_ = json.NewEncoder(w).Encode(cached)
+		s.attestations.refresh.Lock()
+		document, err := s.attestation(r.Context(), nil)
+		s.attestations.refresh.Unlock()
+		if err != nil {
+			if s.settings.Logger != nil {
+				s.settings.Logger.Printf("attestation: %v", err)
+			}
+			s.writeError(w, http.StatusServiceUnavailable, "attestation_unavailable", "the machine could not produce a quote right now")
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(w).Encode(document)
+		return
 	}
 	release, refused := s.attestations.admit(r.Context())
 	if refused != "" {
