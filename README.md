@@ -92,6 +92,35 @@ Pricing is per route in microUSD per million tokens and already includes the fee
 `lebrel.billing.v2` document, so the control plane's published release for the model must
 carry the same rates, `version`, `effective_at` (`…T00:00:00.000Z`), context and output limits.
 
+## Direct clients: the attested machine as the endpoint
+
+With `DIRECT_CLIENTS=true` the router serves ordinary API clients itself, without the platform's
+edge in front: an OpenAI client with the machine's name as `base_url` reaches it over a TLS
+connection that ends in this process, and the API key is checked by the control plane on every
+request as always. Limits stay by key and by account, as published; nothing is capped by address.
+Settings: `DIRECT_HOSTS` (the names clients call the machine by, required in production; a direct
+call under any other name is refused with 421, while the platform's edge, which carries the
+`X-Lebrel-Edge-Authorization` header, passes under any name); `EDGE_PROXY_SECRET` or
+`EDGE_PROXY_TOKEN` (the header's own value, for a machine that must never hold the platform's
+control secret: the attested ones); `CLIENT_ADDRESS`, where a client's address is known from, for
+the control plane's count of wrong keys (`X-Lebrel-Client-Actor`: IPv4 whole, IPv6 by its /64,
+twenty wrong keys a quarter hour per address): `connection` (TLS ends here and nothing proxies in
+front), `header` (the last entry of `CLIENT_IP_HEADER` when the connection comes from
+`CLIENT_IP_HEADER_FROM`, the ingress's addresses), or `none` (a TCP ingress or a provider's gateway
+hides it, as dstack's does: no address is told, and wrong keys are counted for nobody rather than
+for every client at once). A key the control plane refused is refused here for ten seconds without
+asking again; right keys are never remembered.
+
+Listeners: `LISTEN_ADDR` (`:8090`) serves plaintext for the platform's edge and a provider's
+gateway, which terminate TLS themselves (`off` for none); `LISTEN_TLS_ADDR` (`:8443`) serves TLS
+ending in this process when a certificate source is configured: `TLS_CERT_FILE` + `TLS_KEY_FILE`
+(re-read when the certificate file changes), or `TLS_ACME_HOSTS` with `TLS_ACME_CACHE` (and
+`TLS_ACME_EMAIL`): Let's Encrypt in-process by the TLS-ALPN-01 challenge, answered on the TLS
+listener itself, so the machine needs no DNS credential and the private key never exists outside
+this process. Inside a dstack VM the name's DNS points at the provider's gateway, which passes the
+TLS connection through by SNI; the cache lives on the machine's state volume. Browsers get CORS on
+the completion path, with the headers they ask for.
+
 ## Production: Alibaba Model Studio first, the labs behind
 
 Since 6 November 2026 six routes (the two DeepSeek, GLM-5.3, Kimi K3 and the two Qwen) go first

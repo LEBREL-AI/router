@@ -25,6 +25,9 @@ import (
 	"time"
 
 	"crypto/ed25519"
+
+	"golang.org/x/crypto/acme/autocert"
+
 	"lebrel-router/internal/alert"
 	"lebrel-router/internal/auth"
 	"lebrel-router/internal/controlplane"
@@ -292,29 +295,39 @@ func run(logger *log.Logger) error {
 	if err != nil {
 		return err
 	}
-	httpServer := &http.Server{Addr: env("LISTEN_ADDR", ":8090"), Handler: server, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second}
-	errs := make(chan error, 1)
-	certFile, keyFile := strings.TrimSpace(env("TLS_CERT_FILE", "")), strings.TrimSpace(env("TLS_KEY_FILE", ""))
-	if (certFile == "") != (keyFile == "") {
-		return errors.New("TLS_CERT_FILE and TLS_KEY_FILE go together")
+	// Listeners: LISTEN_ADDR serves plaintext (the platform's edge and a provider's gateway, which
+	// terminate TLS themselves; "off" for none); LISTEN_TLS_ADDR serves TLS ending in this process
+	// when a certificate source is configured: files (TLS_CERT_FILE/TLS_KEY_FILE, re-read when they
+	// change) or Let's Encrypt in-process (TLS_ACME_HOSTS, by the TLS-ALPN-01 challenge answered on
+	// the TLS listener itself: no DNS credential, and no private key outside this process).
+	tlsConfig, tlsSource, err := tlsSetup(strings.TrimSpace(env("TLS_CERT_FILE", "")), strings.TrimSpace(env("TLS_KEY_FILE", "")),
+		listed(env("TLS_ACME_HOSTS", ""), strings.ToLower), strings.TrimSpace(env("TLS_ACME_CACHE", "")), strings.TrimSpace(env("TLS_ACME_EMAIL", "")), logger)
+	if err != nil {
+		return err
 	}
-	if certFile != "" {
-		certs := &certificates{certFile: certFile, keyFile: keyFile, logger: logger}
-		if _, err := certs.get(nil); err != nil {
-			return fmt.Errorf("TLS_CERT_FILE/TLS_KEY_FILE: %w", err)
-		}
-		httpServer.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: certs.get}
+	var servers []*http.Server
+	if addr := env("LISTEN_ADDR", ":8090"); !strings.EqualFold(strings.TrimSpace(addr), "off") {
+		servers = append(servers, &http.Server{Addr: addr, Handler: server, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second})
 	}
-	go func() {
-		if certFile != "" {
-			// The TLS connection ends in this process: nothing between the client and the measured machine reads it.
-			logger.Printf("listening on %s with TLS routes=%d", httpServer.Addr, len(routes.Routes))
-			errs <- httpServer.ListenAndServeTLS("", "")
-			return
-		}
-		logger.Printf("listening on %s routes=%d", httpServer.Addr, len(routes.Routes))
-		errs <- httpServer.ListenAndServe()
-	}()
+	if tlsConfig != nil {
+		servers = append(servers, &http.Server{Addr: env("LISTEN_TLS_ADDR", ":8443"), Handler: server, TLSConfig: tlsConfig, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second})
+	}
+	if len(servers) == 0 {
+		return errors.New("nothing to listen on: LISTEN_ADDR is off and no TLS source is configured")
+	}
+	errs := make(chan error, len(servers))
+	for _, httpServer := range servers {
+		go func(httpServer *http.Server) {
+			if httpServer.TLSConfig != nil {
+				// The TLS connection ends in this process: nothing between the client and the measured machine reads it.
+				logger.Printf("listening on %s with TLS (%s) routes=%d", httpServer.Addr, tlsSource, len(routes.Routes))
+				errs <- httpServer.ListenAndServeTLS("", "")
+				return
+			}
+			logger.Printf("listening on %s routes=%d", httpServer.Addr, len(routes.Routes))
+			errs <- httpServer.ListenAndServe()
+		}(httpServer)
+	}
 	select {
 	case err := <-errs:
 		return err
@@ -339,7 +352,7 @@ func run(logger *log.Logger) error {
 		case <-waiting.Done():
 		}
 	}()
-	err = httpServer.Shutdown(waiting)
+	err = shutdownAll(waiting, servers)
 	// the budget ran out, or the second signal came
 	cutNow := errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 	stopWaiting()
@@ -349,7 +362,9 @@ func run(logger *log.Logger) error {
 		cutting, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		server.CutStreams(cutting)
 		cancel()
-		_ = httpServer.Close()
+		for _, httpServer := range servers {
+			_ = httpServer.Close()
+		}
 		closing, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		cut := server.CutStreams(closing)
 		cancel()
@@ -423,6 +438,76 @@ func prefixes(spec string) ([]netip.Prefix, error) {
 		result = append(result, prefix.Masked())
 	}
 	return result, nil
+}
+
+// shutdownAll stops every listener at once and waits for their answers in flight, until ctx ends;
+// the first error (ctx's, when the wait ran out) is returned.
+func shutdownAll(ctx context.Context, servers []*http.Server) error {
+	errs := make(chan error, len(servers))
+	for _, httpServer := range servers {
+		go func(httpServer *http.Server) { errs <- httpServer.Shutdown(ctx) }(httpServer)
+	}
+	var first error
+	for range servers {
+		if err := <-errs; err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+// tlsSetup is the TLS listener's configuration from one certificate source, or nil for none:
+// certificate files, or Let's Encrypt in-process for the names given. The source is described
+// for the log.
+func tlsSetup(certFile, keyFile string, acmeHosts []string, acmeCache, acmeEmail string, logger *log.Logger) (*tls.Config, string, error) {
+	if (certFile == "") != (keyFile == "") {
+		return nil, "", errors.New("TLS_CERT_FILE and TLS_KEY_FILE go together")
+	}
+	if certFile != "" && len(acmeHosts) > 0 {
+		return nil, "", errors.New("TLS_CERT_FILE and TLS_ACME_HOSTS exclude each other")
+	}
+	switch {
+	case certFile != "":
+		certs := &certificates{certFile: certFile, keyFile: keyFile, logger: logger}
+		if _, err := certs.get(nil); err != nil {
+			return nil, "", fmt.Errorf("TLS_CERT_FILE/TLS_KEY_FILE: %w", err)
+		}
+		return &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: certs.get}, "certificate files", nil
+	case len(acmeHosts) > 0:
+		config, err := acmeTLS(acmeHosts, acmeCache, acmeEmail)
+		if err != nil {
+			return nil, "", err
+		}
+		return config, "Let's Encrypt in-process for " + strings.Join(acmeHosts, ", "), nil
+	}
+	return nil, "", nil
+}
+
+// acmeTLS obtains and renews the machine's own certificates from Let's Encrypt inside the process,
+// by the TLS-ALPN-01 challenge answered on the TLS listener itself: no DNS credential, no
+// certificate file, and no private key outside this process. hosts are the names served (any other
+// name is refused at the handshake); the cache directory keeps the account key and the certificates
+// across restarts (Let's Encrypt limits how often a name may be issued); email is where Let's
+// Encrypt writes about expiry.
+func acmeTLS(hosts []string, cacheDir, email string) (*tls.Config, error) {
+	if len(hosts) == 0 {
+		return nil, errors.New("TLS_ACME_HOSTS is empty")
+	}
+	for _, host := range hosts {
+		if strings.ContainsAny(host, " /:@") || strings.HasPrefix(host, "*") {
+			return nil, fmt.Errorf("TLS_ACME_HOSTS: %q is not a host name Let's Encrypt can issue for by TLS-ALPN-01", host)
+		}
+	}
+	if cacheDir == "" {
+		return nil, errors.New("TLS_ACME_CACHE is required with TLS_ACME_HOSTS: the directory the certificates persist in")
+	}
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		return nil, fmt.Errorf("TLS_ACME_CACHE: %w", err)
+	}
+	manager := &autocert.Manager{Prompt: autocert.AcceptTOS, HostPolicy: autocert.HostWhitelist(hosts...), Cache: autocert.DirCache(cacheDir), Email: email}
+	config := manager.TLSConfig()
+	config.MinVersion = tls.VersionTLS12
+	return config, nil
 }
 
 // certificates serves TLS_CERT_FILE/TLS_KEY_FILE and reads them again when the certificate file
