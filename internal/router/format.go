@@ -3,6 +3,7 @@ package router
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+
+	"lebrel-router/internal/auth"
 )
 
 // The two request formats coding agents speak beside OpenAI chat completions: the Anthropic Messages
@@ -97,8 +100,19 @@ func (c *captureWriter) finish() {
 	c.writer.Close()
 }
 
+// namesThinking says whether a chat completion names a thinking switch, or an effort the lab understands.
+func namesThinking(chat map[string]any) bool {
+	for _, key := range []string{"thinking", "profile", "chat_template_kwargs", "reasoning_effort", "custom_params"} {
+		if _, present := chat[key]; present {
+			return true
+		}
+	}
+	return false
+}
+
 // handleFormatted serves a Messages or Responses request: translated to a chat completion, run through
-// the ordinary completion handler, translated back.
+// the ordinary completion handler, translated back. The key is checked before the body is read, as
+// the completion handler checks it, so an unauthenticated body costs nothing.
 func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped *Route, format formatKind, count bool) {
 	s.active.Add(1)
 	defer s.active.Add(-1)
@@ -109,6 +123,26 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 	}
 	if r.Method != http.MethodPost {
 		s.writeFormatError(w, format, http.StatusMethodNotAllowed, "method_not_allowed", "POST only")
+		return
+	}
+	// The key: Authorization as everywhere, or Anthropic's own x-api-key when Claude Code was given
+	// the key that way.
+	authorization := r.Header.Get("Authorization")
+	if authorization == "" {
+		if key := r.Header.Get("X-Api-Key"); key != "" && len(key) <= 4096 && !strings.ContainsAny(key, "\r\n") {
+			authorization = "Bearer " + key
+		}
+	}
+	ctx, stop := context.WithCancelCause(r.Context())
+	defer stop(nil)
+	defer context.AfterFunc(s.cutCtx, func() { stop(errShutdownCut) })()
+	principal, err := s.settings.Auth.Authenticate(s.authContext(ctx, r), authorization)
+	if err != nil {
+		if errors.Is(err, auth.ErrUnauthorized) {
+			s.writeFormatError(w, format, http.StatusUnauthorized, "invalid_api_key", "invalid API key")
+		} else {
+			s.writeFormatError(w, format, http.StatusServiceUnavailable, "authentication_unavailable", "authentication is temporarily unavailable")
+		}
 		return
 	}
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.settings.MaxRequestBytes))
@@ -127,10 +161,9 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 		s.writeFormatError(w, format, http.StatusNotFound, "model_not_found", "unknown model")
 		return
 	}
-	var maxOutput int64
-	if route.Kind != routeKindEdition {
-		maxOutput = route.MaxOutputTokens
-	}
+	// The model's published output limit caps what the tool asks: Claude Code asks for 32,000 tokens of
+	// any model it does not know, which the edition's edge would refuse on every turn.
+	maxOutput := route.MaxOutputTokens
 	if count {
 		estimate, err := anthropicCountTokensEstimate(request)
 		if err != nil {
@@ -157,7 +190,23 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 		return
 	}
 	chat["model"] = route.ModelID
+	if route.Kind == routeKindEdition {
+		// The edition thinks only when asked, and coding agents never ask: unless the request names a
+		// thinking switch, it is turned on, as the local proxy turned it on. The priority tier is asked
+		// for with the header a tool can add.
+		if !namesThinking(chat) {
+			chat["thinking"] = true
+		}
+		if r.Header.Get(editionTierHeader) == "priority" {
+			chat["service_tier"] = "priority"
+		}
+	}
 	stream := chat["stream"] == true
+	grace := cutWriteGrace
+	if !stream {
+		grace = cutBufferedWriteGrace
+	}
+	defer s.boundWritesOnCut(w, grace)()
 	var body bytes.Buffer
 	encoder := json.NewEncoder(&body)
 	encoder.SetEscapeHTML(false)
@@ -165,7 +214,8 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 		s.writeFormatError(w, format, http.StatusBadRequest, "invalid_request_error", "the request could not be encoded")
 		return
 	}
-	inner, err := http.NewRequestWithContext(r.Context(), http.MethodPost, completionPath, bytes.NewReader(body.Bytes()))
+	// The inner request carries the principal already checked, so the completion handler checks nothing again.
+	inner, err := http.NewRequestWithContext(context.WithValue(ctx, principalKey{}, principal), http.MethodPost, completionPath, bytes.NewReader(body.Bytes()))
 	if err != nil {
 		s.writeFormatError(w, format, http.StatusInternalServerError, "internal_error", "the request could not be built")
 		return
@@ -178,10 +228,9 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 	if stream {
 		inner.Header.Set("Accept", "text/event-stream")
 	}
-	for _, name := range []string{"Authorization", edgeAuthorizationHeader, "X-Lebrel-Service-Tier"} {
-		if value := r.Header.Get(name); value != "" {
-			inner.Header.Set(name, value)
-		}
+	inner.Header.Set("Authorization", authorization)
+	if value := r.Header.Get(edgeAuthorizationHeader); value != "" {
+		inner.Header.Set(edgeAuthorizationHeader, value)
 	}
 	if s.settings.ClientIPHeader != "" {
 		for _, value := range r.Header.Values(s.settings.ClientIPHeader) {
@@ -196,7 +245,7 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 	defer reader.Close()
 	select {
 	case <-capture.headers:
-	case <-r.Context().Done():
+	case <-ctx.Done():
 		return
 	}
 	if capture.status != http.StatusOK {
@@ -211,7 +260,7 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 		s.writeFormatError(w, format, capture.status, code, message)
 		return
 	}
-	for _, name := range []string{"X-Request-ID", upstreamHeader, verificationHeader, receiptHeader, contentRetentionHeader, editionRequestIDHeader} {
+	for _, name := range []string{"X-Request-ID", upstreamHeader, verificationHeader, receiptHeader, contentRetentionHeader, editionRequestIDHeader, "X-Lebrel-Encryption"} {
 		if value := capture.header.Get(name); value != "" {
 			w.Header().Set(name, value)
 		}
@@ -245,6 +294,7 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 		Start() []formatEvent
 		Push(map[string]any) []formatEvent
 		Finish() []formatEvent
+		Abort(string) []formatEvent
 	}
 	if format == formatAnthropic {
 		translator = newAnthropicStream(route.ModelID, requestID)
@@ -276,7 +326,7 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64<<10), formatScanLine)
 	var data []string
-	done := false
+	done, aborted := false, false
 	flush := func() bool {
 		if len(data) == 0 {
 			return true
@@ -291,6 +341,12 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil || chunk == nil {
 			return true
 		}
+		if _, failed := chunk["error"]; failed {
+			// The inner stream reports its own failure: the answer is over, and not complete.
+			aborted = true
+			write(translator.Abort("the answer did not complete"))
+			return false
+		}
 		return write(translator.Push(chunk))
 	}
 	for !done && scanner.Scan() {
@@ -304,10 +360,19 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 			data = append(data, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
 		}
 	}
-	if !done {
+	if !done && !aborted {
 		if !flush() {
 			return
 		}
+	}
+	if aborted {
+		return
+	}
+	if !done {
+		// The inner stream ended without its completion marker: cut, by the lab, the runtime or a
+		// shutdown. Said so, never passed off as a whole answer.
+		write(translator.Abort("the answer did not complete"))
+		return
 	}
 	write(translator.Finish())
 }

@@ -424,7 +424,7 @@ func newAnthropicStream(model, requestID string) *anthropicStream {
 }
 
 func (s *anthropicStream) Start() []formatEvent {
-	message := map[string]any{"id": anthropicMessageID(s.requestID), "type": "message", "role": "assistant", "model": s.model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil, "usage": map[string]any{"input_tokens": 0, "output_tokens": 0}}
+	message := map[string]any{"id": anthropicMessageID(s.requestID), "type": "message", "role": "assistant", "model": s.model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil, "usage": map[string]any{"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
 	return []formatEvent{{Name: "message_start", Data: map[string]any{"type": "message_start", "message": message}}}
 }
 
@@ -519,9 +519,16 @@ func (s *anthropicStream) Finish() []formatEvent {
 		stop = "end_turn"
 	}
 	events = append(events,
-		formatEvent{Name: "message_delta", Data: map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stop, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": s.usage["output_tokens"]}}},
+		// The prompt's count travels here too: it is what Claude Code's context meter reads.
+		formatEvent{Name: "message_delta", Data: map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stop, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": s.usage["output_tokens"], "input_tokens": s.usage["input_tokens"]}}},
 		formatEvent{Name: "message_stop", Data: map[string]any{"type": "message_stop"}})
 	return events
+}
+
+// Abort ends a stream that did not complete: the format's error event, so the tool never takes a
+// cut answer (a half-written tool call among it) for a whole one.
+func (s *anthropicStream) Abort(message string) []formatEvent {
+	return []formatEvent{{Name: "error", Data: map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": message}}}}
 }
 
 // anthropicCountTokensEstimate is a size-based estimate of the prompt (about four characters a

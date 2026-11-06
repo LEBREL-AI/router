@@ -520,6 +520,12 @@ func (s *responsesStream) Finish() []formatEvent {
 	return events
 }
 
+// Abort ends a stream that did not complete: the format's error event, in sequence, so the tool
+// never takes a cut answer for a whole one.
+func (s *responsesStream) Abort(message string) []formatEvent {
+	return []formatEvent{s.event("error", map[string]any{"code": "incomplete_stream", "message": message, "param": nil})}
+}
+
 var responsesErrorKinds = map[int]string{400: "invalid_request_error", 401: "authentication_error", 403: "permission_error", 404: "not_found_error", 411: "invalid_request_error", 413: "invalid_request_error", 415: "invalid_request_error", 429: "rate_limit_error", 500: "server_error", 502: "server_error", 503: "server_error", 504: "server_error"}
 
 func responsesErrorBody(status int, code, message string) map[string]any {

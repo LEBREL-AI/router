@@ -7,6 +7,8 @@
       "level": 3,
       "family": "deepseek-v4.1-flash",
       "kind": "edition",
+      "max_context_tokens": 1048544,
+      "max_output_tokens": 8192,
       "edition": {
         "origin": "https://api.lebrel.ai",
         "origin_env": "LEBREL_EDGE_ORIGIN",

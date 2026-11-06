@@ -246,21 +246,30 @@ func (s *Server) handleEditionCompletion(ctx context.Context, w http.ResponseWri
 		return
 	}
 	stream := payload["stream"] == true
-	// `service_tier` (the OpenAI parameter) asks for the priority tier; it travels beside the ciphertext
-	// as the edge reads it, never inside it.
+	grace := cutWriteGrace
+	if !stream {
+		grace = cutBufferedWriteGrace
+	}
+	defer s.boundWritesOnCut(w, grace)()
+	// The request reaches the runtime as the client sent it, so the receipt's prompt digest is the digest
+	// of the client's own bytes. Only `service_tier` (the OpenAI parameter asking for the priority tier)
+	// is taken out when present: it travels beside the ciphertext as the edge reads it, never inside it.
 	priority := false
-	if tier, ok := payload["service_tier"].(string); ok {
-		priority = tier == "priority"
+	body := bytes.TrimSpace(original)
+	if tier, present := payload["service_tier"]; present {
+		if value, ok := tier.(string); ok {
+			priority = value == "priority"
+		}
+		delete(payload, "service_tier")
+		var plaintext bytes.Buffer
+		encoder := json.NewEncoder(&plaintext)
+		encoder.SetEscapeHTML(false)
+		if err := encoder.Encode(payload); err != nil {
+			s.writeError(w, http.StatusBadRequest, "invalid_request_error", "the request could not be encoded")
+			return
+		}
+		body = bytes.TrimRight(plaintext.Bytes(), "\n")
 	}
-	delete(payload, "service_tier")
-	var plaintext bytes.Buffer
-	encoder := json.NewEncoder(&plaintext)
-	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(payload); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid_request_error", "the request could not be encoded")
-		return
-	}
-	body := bytes.TrimRight(plaintext.Bytes(), "\n")
 	if len(body)+20 > editionRequestMax {
 		s.writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body is too large")
 		return
@@ -347,7 +356,12 @@ func (s *Server) handleEditionCompletion(ctx context.Context, w http.ResponseWri
 				s.writeError(w, http.StatusBadGateway, "encryption_response_invalid", "the edition answered in plaintext")
 				return
 			}
-			if attempt == 0 && (code == "encryption_key_rotated" || code == "encryption_key_mismatch" || code == "encryption_required") {
+			// Once more, with the key fetched again, when the one the router encrypted to is no longer the
+			// runtime's: the edge says so in its own words, or the runtime refuses the ciphertext itself (a
+			// problem document, 422) after a restart gave it a new key.
+			rotated := code == "encryption_key_rotated" || code == "encryption_required" ||
+				response.StatusCode == http.StatusUnprocessableEntity || strings.HasPrefix(response.Header.Get("Content-Type"), "application/problem+json")
+			if attempt == 0 && rotated {
 				continue
 			}
 			if retry := response.Header.Get("Retry-After"); retry != "" {

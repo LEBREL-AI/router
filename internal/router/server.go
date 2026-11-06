@@ -332,7 +332,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.Set("Access-Control-Allow-Origin", "*")
 		h.Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 		h.Set("Access-Control-Allow-Headers", allowedRequestHeaders(r))
-		h.Set("Access-Control-Expose-Headers", "X-Request-ID, Proof-Of-Edition-Receipt, X-Lebrel-Upstream, X-Lebrel-Verification, Retry-After")
+		h.Set("Access-Control-Expose-Headers", "X-Request-ID, Proof-Of-Edition-Receipt, X-Lebrel-Upstream, X-Lebrel-Verification, X-Lebrel-Request-Id, X-Lebrel-Encryption, X-Lebrel-Content-Retention, Retry-After")
 		h.Set("Access-Control-Max-Age", "86400")
 		h.Add("Vary", "Access-Control-Request-Headers")
 		if r.Method == http.MethodOptions {
