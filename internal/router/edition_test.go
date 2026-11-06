@@ -165,7 +165,7 @@ func TestAnEditionIsServedThroughTheRouterEncryptedToItsRuntime(t *testing.T) {
 	if response.StatusCode != 200 || !strings.Contains(string(raw), `"hello world"`) {
 		t.Fatalf("edition answer: %d %s", response.StatusCode, raw)
 	}
-	if response.Header.Get(receiptHeader) == "" || response.Header.Get("X-Lebrel-Encryption") != "router-to-runtime" || !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(response.Header.Get(editionRequestIDHeader)) {
+	if response.Header.Get(receiptHeader) == "" || response.Header.Get("X-Lebrel-Encryption") != "router-to-runtime" || !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(response.Header.Get(editionRequestIDHeader)) || response.Header.Get("X-Request-ID") != response.Header.Get(editionRequestIDHeader) {
 		t.Fatalf("answer headers: %v", response.Header)
 	}
 	if nonce := response.Header.Get(protocol.ResponseNonceHeader); nonce != "" {
@@ -189,6 +189,13 @@ func TestAnEditionIsServedThroughTheRouterEncryptedToItsRuntime(t *testing.T) {
 	}
 	if seen := edge.requests(); string(seen[len(seen)-1].raw) != asSent {
 		t.Fatalf("the runtime decrypted %q, not the client's bytes", seen[len(seen)-1].raw)
+	}
+	// A tool that appends /v1 to a base URL that already carries it reaches the same path.
+	doubled, _ := http.NewRequest(http.MethodPost, h.server.URL+"/v1"+completionPath, strings.NewReader(`{"model":"lebrel/test-uncensored","messages":[{"role":"user","content":"hi"}],"max_tokens":8}`))
+	doubled.Header.Set("Content-Type", "application/json")
+	doubled.Header.Set("Authorization", "Bearer "+testKey)
+	if answer, err := http.DefaultClient.Do(doubled); err != nil || answer.StatusCode != 200 {
+		t.Fatalf("doubled /v1: %v %v", err, answer)
 	}
 	// Streamed: the decrypted events reach the client as they come.
 	response = h.post(t, `{"model":"lebrel/test-uncensored","messages":[{"role":"user","content":"hi there"}],"stream":true}`, testKey)
