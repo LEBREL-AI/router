@@ -1,0 +1,65 @@
+# The router inside a confidential VM (Intel TDX) run by dstack, serving API clients DIRECTLY:
+# the TLS connection ends in the router process, which obtains the names' certificates from
+# Let's Encrypt itself (TLS-ALPN-01, answered on its own TLS listener), so no DNS credential and
+# no private key ever exist outside the measured VM. dstack's gateway passes a connection for a
+# custom name through by SNI to port 443 of the VM (DNS: the name CNAME to the gateway, and
+# `_dstack-app-address.<name>` TXT = `<app_id>:443`); the gateway's own hostname on port 8080
+# reaches the plaintext listener with TLS ended at the gateway (verifiers, the platform's edge).
+# dstack measures this file, image digest included, into the attestation quote. Public
+# configuration is written here so that it is measured too; secrets never appear here: they are
+# passed as dstack encrypted environment variables, which the KMS releases only to this measured app.
+# Image digest: the release's (RELEASES.md); 1.3.7 replaces it before deployment.
+services:
+  router:
+    image: ghcr.io/lebrel-ai/router@sha256:d3725f05e6017caee09adeb431c2b2e3d70b010c92cfc99f8bb4c55bd26c8b54
+    restart: unless-stopped
+    ports:
+      - "8080:8090"
+      - "443:8443"
+    volumes:
+      # Settlement journal and the Let's Encrypt account and certificates, on the CVM's encrypted disk.
+      - router-state:/var/lib/lebrel-router
+      # The guest agent: the receipt-signing seed is derived by the KMS for this measurement and
+      # the quote is served at /.well-known/attestation bound to that key.
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    environment:
+      # Measured, public.
+      - ENVIRONMENT=production
+      - LISTEN_ADDR=:8090
+      - LISTEN_TLS_ADDR=:8443
+      - TLS_ACME_HOSTS=attested.lebrel.ai,router-tee.lebrel.ai
+      - TLS_ACME_CACHE=/var/lib/lebrel-router/acme
+      - DIRECT_CLIENTS=true
+      - DIRECT_HOSTS=attested.lebrel.ai
+      # dstack's gateway shows no client address: wrong keys are counted for nobody, never for everyone.
+      - CLIENT_ADDRESS=none
+      - ROUTES_FILE=/etc/lebrel-router/routes.json
+      - CONTROL_PLANE_URL=https://lebrel.ai
+      - BOARD_SOURCE=https://models.lebrel.ai/v1/watch
+      - BOARD_URL=https://models.lebrel.ai/watch
+      - BOARD_REFRESH_SECONDS=300
+      - BOARD_PUBLIC_KEY_HEX=536a6eaa6c97091b653519008b0ffc1d76e5e32067b36f3802c7574aebf498c4
+      - MAX_REQUEST_BYTES=33554432
+      - SETTLEMENT_CONCURRENCY=8
+      - SETTLEMENT_ALERT_SECONDS=5
+      - SHUTDOWN_SECONDS=600
+      # Encrypted at deploy time, released by the KMS to this measurement only. CONTROL_PLANE_SECRET
+      # is this machine's own credential (the platform's GATEWAY_MACHINE_CREDENTIALS), which opens the
+      # router's routes and nothing else; EDGE_PROXY_TOKEN is the edge header's value, so the
+      # platform's control secret never lives here.
+      - INSTANCE_ID=${INSTANCE_ID}
+      - CONTROL_PLANE_SECRET=${CONTROL_PLANE_SECRET}
+      - EDGE_PROXY_TOKEN=${EDGE_PROXY_TOKEN}
+      - HEALTH_TOKEN=${HEALTH_TOKEN}
+      - RECEIPT_PEERS=${RECEIPT_PEERS}
+      - TLS_ACME_EMAIL=${TLS_ACME_EMAIL}
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL}
+      - ALERT_TELEGRAM_CHAT_ID=${ALERT_TELEGRAM_CHAT_ID}
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+      - ALIBABA_MODEL_STUDIO_BASE_URL=${ALIBABA_MODEL_STUDIO_BASE_URL}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - ZAI_API_KEY=${ZAI_API_KEY}
+      - MOONSHOT_API_KEY=${MOONSHOT_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+volumes:
+  router-state:

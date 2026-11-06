@@ -10,7 +10,8 @@ COPY go.mod go.sum ./
 COPY vendor ./vendor
 COPY cmd ./cmd
 COPY internal ./internal
-# The one dependency (Tinfoil's EHBP, MIT) is vendored: the build touches no network.
+# The dependencies are vendored (Tinfoil's EHBP, MIT; Go's x/crypto for Let's Encrypt in-process, with
+# x/net and x/text, BSD): the build touches no network.
 ENV CGO_ENABLED=0 GOFLAGS="-trimpath -mod=vendor" GOOS=$TARGETOS GOARCH=$TARGETARCH GOTOOLCHAIN=local
 RUN go build -ldflags="-s -w -buildid=" -o /out/lebrel-router ./cmd/router && mkdir -p /out/state
 
@@ -23,6 +24,7 @@ COPY routes.production.json /etc/lebrel-router/routes.json
 COPY --from=build --chown=65532:65532 /out/state /var/lib/lebrel-router
 ENV ROUTES_FILE=/etc/lebrel-router/routes.json LISTEN_ADDR=:8090 SETTLEMENT_DIR=/var/lib/lebrel-router/settlements
 VOLUME ["/var/lib/lebrel-router"]
-EXPOSE 8090
+# 8090 plaintext (an edge or gateway that ends TLS itself); 8443 TLS ending in the process (LISTEN_TLS_ADDR).
+EXPOSE 8090 8443
 USER nonroot
 ENTRYPOINT ["/usr/local/bin/lebrel-router"]
