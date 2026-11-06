@@ -25,7 +25,6 @@ import (
 
 	"lebrel-router/internal/auth"
 	"lebrel-router/internal/dstack"
-	"lebrel-router/internal/flood"
 	"lebrel-router/internal/ledger"
 	"lebrel-router/internal/limit"
 	"lebrel-router/internal/meter"
@@ -99,12 +98,12 @@ type Settings struct {
 	BoardURL        string
 	EdgeProxySecret string
 	// DirectClients admits completions without the edge header: the machine terminates TLS itself and
-	// serves ordinary API clients; the key is checked here and a flood ceiling per client address
-	// stands before it. ClientIPHeader names the header an ingress in the same VM sets with the
-	// client's address (empty: the connection's own address). Flood is that ceiling (nil: none).
+	// serves ordinary API clients, and the key is checked here as always. No ceiling by address:
+	// limits are by key and by account, as published; the only thing counted per address is a wrong
+	// key, by the control plane, so guessing stays slow. ClientIPHeader names the header an ingress
+	// in the same VM sets with the client's address (empty: the connection's own address).
 	DirectClients   bool
 	ClientIPHeader  string
-	Flood           *flood.Limiter
 	MaxRequestBytes int64
 	ManifestWindow  time.Duration
 	HTTPClient      *http.Client
@@ -312,8 +311,8 @@ func (s *Server) validEdge(r *http.Request) bool {
 	return len(received) == len(s.edgeToken) && hmac.Equal([]byte(received), []byte(s.edgeToken))
 }
 
-// admit lets a completion through on the edge's word, or, for direct clients, on the flood ceiling of
-// the client's address; the key itself is checked by the handler. It writes the refusal itself.
+// admit lets a completion through on the edge's word or, for direct clients, as it is: the key is
+// checked by the handler, and limits are by key and account. It writes the refusal itself.
 func (s *Server) admit(w http.ResponseWriter, r *http.Request) bool {
 	if s.validEdge(r) {
 		return true
@@ -322,16 +321,11 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) bool {
 		s.writeError(w, http.StatusUnauthorized, "edge_unauthorized", "missing edge authorization")
 		return false
 	}
-	if !s.settings.Flood.Allow(s.clientIP(r)) {
-		w.Header().Set("Retry-After", "1")
-		s.writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "too many requests from this address")
-		return false
-	}
 	return true
 }
 
-// clientIP is the address a direct client's flood ceiling counts: the ingress header when one is
-// trusted, else the connection's own address.
+// clientIP is the address the control plane's wrong-key throttle counts for a direct client: the
+// ingress header when one is trusted, else the connection's own address.
 func (s *Server) clientIP(r *http.Request) string {
 	if s.settings.ClientIPHeader != "" {
 		if value := r.Header.Get(s.settings.ClientIPHeader); value != "" {

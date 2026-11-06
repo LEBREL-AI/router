@@ -26,7 +26,6 @@ import (
 	"lebrel-router/internal/auth"
 	"lebrel-router/internal/controlplane"
 	"lebrel-router/internal/dstack"
-	"lebrel-router/internal/flood"
 	"lebrel-router/internal/ledger"
 	"lebrel-router/internal/router"
 	"lebrel-router/internal/settle"
@@ -253,17 +252,11 @@ func run(logger *log.Logger) error {
 		}
 	}
 	// Direct clients: the machine terminates TLS itself (TLS_CERT_FILE/TLS_KEY_FILE, or an ingress in
-	// the same VM) and serves ordinary API clients without the platform's edge in front; a flood
-	// ceiling per client address stands before the key check.
+	// the same VM) and serves ordinary API clients without the platform's edge in front. Limits stay
+	// by key and by account; nothing is capped by address.
 	directClients := strings.EqualFold(strings.TrimSpace(env("DIRECT_CLIENTS", "false")), "true")
-	floodPerMinute, err := positive("DIRECT_FLOOD_PER_MINUTE", 600)
-	if err != nil {
-		return err
-	}
-	var floodLimiter *flood.Limiter
 	if directClients {
-		floodLimiter = flood.New(floodPerMinute, floodPerMinute/10+1)
-		logger.Printf("direct clients: on, flood ceiling %d requests a minute per address (client address from %q)", floodPerMinute, env("CLIENT_IP_HEADER", "connection"))
+		logger.Printf("direct clients: on (client address for the wrong-key throttle from %q)", env("CLIENT_IP_HEADER", "connection"))
 	}
 	server, err := router.New(router.Settings{
 		Routes: routes, Auth: authenticator, Ledger: ledgerImpl, Signer: signer, Settlements: settlements,
@@ -271,7 +264,7 @@ func run(logger *log.Logger) error {
 		HealthToken: strings.TrimSpace(env("HEALTH_TOKEN", "")),
 		Receipts:    router.NewReceiptStore(24*time.Hour, 100_000), Verification: verification,
 		BoardURL: env("BOARD_URL", ""), EdgeProxySecret: env("EDGE_PROXY_SECRET", ""), MaxRequestBytes: maxBytes, Logger: logger,
-		DirectClients: directClients, ClientIPHeader: strings.TrimSpace(env("CLIENT_IP_HEADER", "")), Flood: floodLimiter,
+		DirectClients: directClients, ClientIPHeader: strings.TrimSpace(env("CLIENT_IP_HEADER", "")),
 		Attester: attester, KeySource: keySource, Encryption: encryption,
 	})
 	if err != nil {
