@@ -18,6 +18,9 @@ func TestPrintBillingHashes(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, route := range config.Routes {
+		if route.Kind == routeKindEdition {
+			continue // billed by the edge, no contract of the router's own
+		}
 		hash, err := route.BillingContractHash()
 		if err != nil {
 			t.Fatal(err)

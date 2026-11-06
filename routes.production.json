@@ -1,6 +1,20 @@
 {
   "routes": [
     {
+      "model_id": "lebrel/deepseek-v4.1-flash-uncensored",
+      "display_name": "DeepSeek V4.1 Flash · Lebrel Uncensored",
+      "base_model": "DeepSeek V4.1 Flash",
+      "level": 3,
+      "family": "deepseek-v4.1-flash",
+      "kind": "edition",
+      "edition": {
+        "origin": "https://api.lebrel.ai",
+        "origin_env": "LEBREL_EDGE_ORIGIN",
+        "signing_key_b64": "beFZtSwt6FnlhIYbX636n7w3/gpaASIkRnIMx52XJwk="
+      },
+      "data_note": "Lebrel's own edition on its own GPUs. The request reaches this router over its own TLS and is encrypted here to the edition's runtime key, checked against the edition's published signing key; Lebrel's edge admits and bills it without reading it, and the answer comes back encrypted to this router. Lebrel keeps no content. Priced by the edition's published rates and the drop in force; every answer carries the edition's own receipt."
+    },
+    {
       "model_id": "deepseek/deepseek-v4.1-flash",
       "display_name": "DeepSeek V4.1 Flash 1017",
       "base_model": "DeepSeek V4.1 Flash",

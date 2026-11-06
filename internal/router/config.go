@@ -216,20 +216,24 @@ func (u Upstream) Timeout() time.Duration {
 	return time.Duration(u.TimeoutSeconds) * time.Second
 }
 
-// Route is one public model id and everything the router needs to serve it.
+// Route is one public model id and everything the router needs to serve it. Kind "" is a routed
+// model served by its upstreams and billed here; kind "edition" is a Lebrel edition served through
+// this router to plain API clients, encrypted here to its runtime and billed by the edge (edition.go).
 type Route struct {
-	ModelID                string        `json:"model_id"`
-	DisplayName            string        `json:"display_name,omitempty"`
-	BaseModel              string        `json:"base_model,omitempty"`
-	Level                  int           `json:"level"`
-	Family                 string        `json:"family"`
-	ClaimedRevision        string        `json:"claimed_revision,omitempty"`
-	Upstreams              []Upstream    `json:"upstreams"`
-	Pricing                PricingConfig `json:"pricing"`
-	MaxContextTokens       int64         `json:"max_context_tokens"`
-	MaxOutputTokens        int64         `json:"max_output_tokens"`
-	DefaultMaxOutputTokens int64         `json:"default_max_output_tokens"`
-	DataNote               string        `json:"data_note,omitempty"`
+	ModelID                string         `json:"model_id"`
+	DisplayName            string         `json:"display_name,omitempty"`
+	BaseModel              string         `json:"base_model,omitempty"`
+	Level                  int            `json:"level"`
+	Family                 string         `json:"family"`
+	ClaimedRevision        string         `json:"claimed_revision,omitempty"`
+	Kind                   string         `json:"kind,omitempty"`
+	Edition                *EditionConfig `json:"edition,omitempty"`
+	Upstreams              []Upstream     `json:"upstreams,omitempty"`
+	Pricing                PricingConfig  `json:"pricing"`
+	MaxContextTokens       int64          `json:"max_context_tokens"`
+	MaxOutputTokens        int64          `json:"max_output_tokens"`
+	DefaultMaxOutputTokens int64          `json:"default_max_output_tokens"`
+	DataNote               string         `json:"data_note,omitempty"`
 }
 
 type Config struct {
@@ -277,6 +281,13 @@ func (r *Route) validate() error {
 	}
 	if r.Level < 1 || r.Level > 3 {
 		return errors.New("level must be 1, 2 or 3")
+	}
+	switch r.Kind {
+	case "":
+	case routeKindEdition:
+		return r.validateEdition()
+	default:
+		return fmt.Errorf("unknown kind %q", r.Kind)
 	}
 	if len(r.Upstreams) == 0 {
 		return errors.New("at least one upstream is required")
@@ -359,6 +370,44 @@ func serviceDomain(host string) string {
 		return host
 	}
 	return strings.Join(labels[len(labels)-2:], ".")
+}
+
+// validateEdition checks an edition route: where its encrypted requests go and whose key signs the
+// runtime's encryption document; it has no upstreams and no pricing of its own (the edge bills it).
+func (r *Route) validateEdition() error {
+	if r.Edition == nil {
+		return errors.New("an edition route needs an edition block")
+	}
+	if len(r.Upstreams) > 0 {
+		return errors.New("an edition route has no upstreams")
+	}
+	parsed, err := url.Parse(r.Edition.Origin)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || strings.TrimRight(parsed.Path, "/") != "" {
+		return errors.New("edition.origin must be an origin (scheme and host only)")
+	}
+	if parsed.Scheme != "https" && !isLoopback(parsed.Hostname()) {
+		return errors.New("edition.origin must use https")
+	}
+	if r.Edition.OriginEnv != "" {
+		if strings.ContainsAny(r.Edition.OriginEnv, " =\r\n\t") {
+			return errors.New("edition.origin_env must be a variable name")
+		}
+		if endpoint := r.Edition.Endpoint(); endpoint != strings.TrimRight(r.Edition.Origin, "/") {
+			moved, err := url.Parse(endpoint)
+			if err != nil || moved.Host == "" || moved.User != nil || moved.RawQuery != "" || moved.Fragment != "" || strings.TrimRight(moved.Path, "/") != "" || (moved.Scheme != "https" && !(moved.Scheme == "http" && isLoopback(moved.Hostname()))) {
+				return fmt.Errorf("%s must hold an https origin (http only to this machine)", r.Edition.OriginEnv)
+			}
+		}
+	}
+	if _, err := r.Edition.SigningKey(); err != nil {
+		return fmt.Errorf("edition.%w", err)
+	}
+	return nil
+}
+
+// envValue is an environment variable's value, for the settings that name one.
+func envValue(name string) string {
+	return os.Getenv(name)
 }
 
 func isLoopback(host string) bool {
