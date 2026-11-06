@@ -24,6 +24,8 @@ func TestAlibabaDialectMapsEveryReasoningSwitchOntoEnableThinking(t *testing.T) 
 		{"openrouter reasoning off", map[string]any{"reasoning": map[string]any{"enabled": false}}, false, nil, true, false, ""},
 		{"alibaba's own switch wins", map[string]any{"enable_thinking": true, "thinking": map[string]any{"type": "disabled"}}, false, nil, true, true, ""},
 		{"effort alone goes through", map[string]any{"reasoning_effort": "low"}, false, nil, false, false, "low"},
+		{"openrouter's reasoning.effort is the same ask", map[string]any{"reasoning": map[string]any{"effort": "low"}}, false, nil, false, false, "low"},
+		{"reasoning_effort wins over reasoning.effort", map[string]any{"reasoning": map[string]any{"effort": "high", "enabled": true}, "reasoning_effort": "low"}, false, nil, true, true, "low"},
 		{"an effort the endpoint does not take is dropped, not refused", map[string]any{"reasoning_effort": "high"}, false, []string{"max"}, false, false, ""},
 		{"an effort the endpoint takes goes through with the switch", map[string]any{"reasoning_effort": "max", "enable_thinking": true}, false, []string{"max"}, true, true, "max"},
 		{"an effort that is not a word is dropped", map[string]any{"reasoning_effort": 3}, false, nil, false, false, ""},
@@ -67,15 +69,25 @@ func TestAnUpstreamMayTakeItsBaseURLFromTheEnvironment(t *testing.T) {
 	}
 }
 
-func TestAnEndpointFromTheEnvironmentMustBeHTTPSAndIsWhatTheManifestNames(t *testing.T) {
-	t.Setenv("TEST_BASE_URL", "http://ws-123.example.test/compatible-mode/v1")
+func TestAnEndpointFromTheEnvironmentStaysWithinTheServiceAndTheManifestNamesThePublicOne(t *testing.T) {
 	route := routeFor(Upstream{Name: "alibaba/model-studio", BaseURL: "https://fallback.example.test/v1", BaseURLEnv: "TEST_BASE_URL", Model: "m", Priority: 1})
-	if err := (Config{Routes: []Route{route}}).Validate(); err == nil || !strings.Contains(err.Error(), "TEST_BASE_URL") {
-		t.Fatalf("a plaintext endpoint from the environment must be refused, got %v", err)
+	for _, bad := range []string{
+		"http://ws-123.example.test/compatible-mode/v1",
+		"https://ws-123.other.test/compatible-mode/v1",
+		"https://user:secret@ws-123.example.test/compatible-mode/v1",
+		"https://ws-123.example.test/compatible-mode/v1?workspace=1",
+	} {
+		t.Setenv("TEST_BASE_URL", bad)
+		if err := (Config{Routes: []Route{route}}).Validate(); err == nil || !strings.Contains(err.Error(), "TEST_BASE_URL") {
+			t.Fatalf("%q must be refused, got %v", bad, err)
+		}
 	}
 	t.Setenv("TEST_BASE_URL", "https://ws-123.example.test/compatible-mode/v1")
 	if err := (Config{Routes: []Route{route}}).Validate(); err != nil {
 		t.Fatal(err)
+	}
+	if got := route.Upstreams[0].Endpoint(); got != "https://ws-123.example.test/compatible-mode/v1" {
+		t.Fatalf("requests go to the environment's endpoint, got %q", got)
 	}
 	signer, err := NewSigner(bytes.Repeat([]byte{7}, 32), "router-test")
 	if err != nil {
@@ -89,7 +101,7 @@ func TestAnEndpointFromTheEnvironmentMustBeHTTPSAndIsWhatTheManifestNames(t *tes
 	if len(upstreams) != 1 {
 		t.Fatalf("upstreams in the manifest: %v", document.Payload["upstreams"])
 	}
-	if got := upstreams[0].(map[string]any)["base_url"]; got != "https://ws-123.example.test/compatible-mode/v1" {
-		t.Fatalf("the manifest must name the endpoint the requests go to, got %v", got)
+	if got := upstreams[0].(map[string]any)["base_url"]; got != "https://fallback.example.test/v1" {
+		t.Fatalf("the public manifest names the service's public endpoint, never the account's form, got %v", got)
 	}
 }

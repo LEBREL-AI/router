@@ -98,17 +98,25 @@ type Settings struct {
 	PeerClient      *http.Client
 	BoardURL        string
 	EdgeProxySecret string
+	// EdgeProxyToken is the edge's header value itself (what DeriveEdgeProxyToken gives), for a
+	// machine that must verify the edge without holding the platform's control secret: the attested
+	// ones. One of the two, never both.
+	EdgeProxyToken string
 	// DirectClients admits completions without the edge header: the machine terminates TLS itself and
 	// serves ordinary API clients, and the key is checked here as always. No ceiling by address:
 	// limits are by key and by account, as published; the only thing counted per address is a wrong
 	// key, by the control plane, so guessing stays slow. DirectHosts are the names (lowercase, no
 	// port) direct clients may call the machine by; under any other name a direct call is refused as
 	// misdirected, so the service exists only at its published address (empty: any name).
-	// ClientIPHeader names the header an ingress sets with the client's address, honoured only when
-	// the connection comes from TrustedIngress (the ingress in the same VM) and read from its last
-	// entry, the one that ingress wrote; otherwise the connection's own address counts.
+	// ClientAddress says where a direct client's address comes from, for the control plane's count
+	// of wrong keys: "connection" (the router terminates TLS itself and nothing proxies in front),
+	// "header" (ClientIPHeader, honoured only when the connection comes from TrustedIngress and read
+	// from its last entry, the one that ingress wrote), or "none" (an ingress or a provider's gateway
+	// hides it, as dstack's TCP ingress behind Phala's gateway does: no address is told, and wrong
+	// keys are counted for nobody rather than for every client at once). "" is "none".
 	DirectClients  bool
 	DirectHosts    []string
+	ClientAddress  string
 	ClientIPHeader string
 	TrustedIngress []netip.Prefix
 	// Alert hands the operator an alert (the notifier's Notify); nil only logs.
@@ -194,7 +202,8 @@ func New(settings Settings) (*Server, error) {
 		// HTTP/1.1 needs a connection per stream, and the idle pool keeps them for the next request
 		// instead of opening (and leaving in TIME_WAIT) one per request.
 		settings.HTTPClient = &http.Client{Transport: &http.Transport{
-			Proxy: nil, ResponseHeaderTimeout: 90 * time.Second, TLSHandshakeTimeout: 15 * time.Second,
+			// each call is bounded by its upstream's timeout_seconds (callUpstreams); no cap of the transport's own
+			Proxy: nil, TLSHandshakeTimeout: 15 * time.Second,
 			MaxIdleConnsPerHost: 1024, IdleConnTimeout: 90 * time.Second, DisableCompression: true,
 		}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	}
@@ -214,6 +223,9 @@ func New(settings Settings) (*Server, error) {
 	if err := settings.Routes.Validate(); err != nil {
 		return nil, err
 	}
+	for i, host := range settings.DirectHosts {
+		settings.DirectHosts[i] = normaliseHost(host)
+	}
 	server := &Server{settings: settings, routes: map[string]*Route{}, slugs: map[string]*Route{}, hashes: map[string]string{}, alerts: map[string]alertState{}, manifests: map[string]cachedManifest{}}
 	server.cutCtx, server.cutAll = context.WithCancel(context.Background())
 	for i := range settings.Routes.Routes {
@@ -232,8 +244,33 @@ func New(settings Settings) (*Server, error) {
 			}
 		}
 	}
-	if settings.EdgeProxySecret != "" {
+	switch settings.ClientAddress {
+	case "", clientAddressNone, clientAddressConnection:
+		if settings.ClientIPHeader != "" || len(settings.TrustedIngress) > 0 {
+			return nil, errors.New("CLIENT_IP_HEADER and CLIENT_IP_HEADER_FROM only go with CLIENT_ADDRESS=header")
+		}
+	case clientAddressHeader:
+		if settings.ClientIPHeader == "" || len(settings.TrustedIngress) == 0 {
+			return nil, errors.New("CLIENT_ADDRESS=header needs CLIENT_IP_HEADER and CLIENT_IP_HEADER_FROM (the addresses of the ingress that sets it)")
+		}
+	default:
+		return nil, fmt.Errorf("CLIENT_ADDRESS must be none, connection or header, not %q", settings.ClientAddress)
+	}
+	switch {
+	case settings.EdgeProxySecret != "" && settings.EdgeProxyToken != "":
+		return nil, errors.New("EDGE_PROXY_SECRET and EDGE_PROXY_TOKEN exclude each other")
+	case settings.EdgeProxySecret != "":
 		server.edgeToken = DeriveEdgeProxyToken(settings.EdgeProxySecret)
+	case settings.EdgeProxyToken != "":
+		token := strings.TrimPrefix(strings.TrimSpace(settings.EdgeProxyToken), "v1=")
+		if len(token) != 64 || strings.Trim(token, "0123456789abcdef") != "" {
+			return nil, errors.New("EDGE_PROXY_TOKEN must be the 64 hex characters of the edge's header (after v1=)")
+		}
+		server.edgeToken = token
+	}
+	if settings.DirectClients && server.edgeToken == "" {
+		// without a token every call would pass as the edge's: no 421, no client address
+		return nil, errors.New("DIRECT_CLIENTS needs EDGE_PROXY_SECRET or EDGE_PROXY_TOKEN, which tell the platform's edge apart from a direct client")
 	}
 	if settings.Encryption != nil {
 		settings.Encryption.SetRotationHook(server.attestations.invalidate)
@@ -344,6 +381,13 @@ func allowedRequestHeaders(r *http.Request) string {
 	return asked
 }
 
+// Where a direct client's address comes from (Settings.ClientAddress).
+const (
+	clientAddressNone       = "none"
+	clientAddressConnection = "connection"
+	clientAddressHeader     = "header"
+)
+
 // admit lets a completion through on the edge's word or, for direct clients, as it is when it came
 // by one of the machine's published names: the key is checked by the handler, and limits are by key
 // and account. It writes the refusal itself.
@@ -363,15 +407,20 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+// normaliseHost is a host name as compared: without a port, brackets, a trailing dot or case.
+func normaliseHost(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return strings.ToLower(strings.TrimSuffix(strings.Trim(host, "[]"), "."))
+}
+
 // directHost says whether direct clients are served under the name the request came by.
 func (s *Server) directHost(host string) bool {
 	if len(s.settings.DirectHosts) == 0 {
 		return true
 	}
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	host = strings.ToLower(strings.TrimSuffix(strings.Trim(host, "[]"), "."))
+	host = normaliseHost(host)
 	for _, allowed := range s.settings.DirectHosts {
 		if host == allowed {
 			return true
@@ -380,26 +429,30 @@ func (s *Server) directHost(host string) bool {
 	return false
 }
 
-// clientIP is the address the control plane's wrong-key throttle counts for a direct client: the
-// connection's own address or, when the connection is a trusted ingress's, the last address that
-// ingress wrote in ClientIPHeader (a client may write the header too: its entries sit before).
+// clientIP is the address the control plane's wrong-key throttle counts for a direct client, as
+// Settings.ClientAddress says it is known: the connection's own, or the last address a trusted
+// ingress wrote in ClientIPHeader (a client may write the header too: its entries sit before). ""
+// when it is not known: then no address is told and the wrong key is counted for nobody.
 func (s *Server) clientIP(r *http.Request) string {
 	connection := r.RemoteAddr
 	if host, _, err := net.SplitHostPort(connection); err == nil {
 		connection = host
 	}
-	if s.settings.ClientIPHeader == "" || !s.fromTrustedIngress(connection) {
+	switch s.settings.ClientAddress {
+	case clientAddressConnection:
 		return connection
+	case clientAddressHeader:
+		if !s.fromTrustedIngress(connection) {
+			return ""
+		}
+		values := r.Header.Values(s.settings.ClientIPHeader)
+		if len(values) == 0 {
+			return ""
+		}
+		entries := strings.Split(values[len(values)-1], ",")
+		return strings.TrimSpace(entries[len(entries)-1])
 	}
-	values := r.Header.Values(s.settings.ClientIPHeader)
-	if len(values) == 0 {
-		return connection
-	}
-	entries := strings.Split(values[len(values)-1], ",")
-	if last := strings.TrimSpace(entries[len(entries)-1]); last != "" {
-		return last
-	}
-	return connection
+	return ""
 }
 
 func (s *Server) fromTrustedIngress(address string) bool {
@@ -830,7 +883,10 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 			return
 		}
 		s.settings.Logger.Printf("request=%s model=%s all upstreams failed: %v", requestID, route.ModelID, lastErr)
-		s.noteOutage(route, lastErr)
+		if ctx.Err() == nil {
+			// the customer is still there and gets a 502; a customer who hung up is no outage
+			s.noteOutage(route, lastErr)
+		}
 		s.writeError(w, http.StatusBadGateway, "upstream_unavailable", "no upstream could serve the request")
 		return
 	}
@@ -1002,10 +1058,27 @@ func contentTypeOr(response *http.Response, fallback string) string {
 	return fallback
 }
 
+// attemptsError is why no upstream served: each upstream tried with why it did not, and the last
+// error itself, which may name an endpoint (for the log; an alert gets the Summary).
+type attemptsError struct {
+	attempts []string
+	last     error
+}
+
+func (e *attemptsError) Error() string {
+	if e.last == nil {
+		return strings.Join(e.attempts, "; ")
+	}
+	return strings.Join(e.attempts, "; ") + ": " + e.last.Error()
+}
+
+func (e *attemptsError) Unwrap() error { return e.last }
+
+// Summary names the attempts by upstream and reason, never an endpoint.
+func (e *attemptsError) Summary() string { return strings.Join(e.attempts, " y ") }
+
 func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []byte, requestID, accept string) (*upstreamResult, error) {
-	var lastErr error
-	// the upstreams tried before the one that answers, each with why it did not
-	var skipped []string
+	failed := &attemptsError{}
 	for i := range route.Upstreams {
 		upstream := &route.Upstreams[i]
 		body, err := upstreamBody(normalized, upstream)
@@ -1014,8 +1087,18 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 		}
 		// The upstream has its own time to answer with headers; the body then streams under ctx, and
 		// the call's context ends with the answer (release) or here, when the next upstream is tried.
+		// The timer and the answer are serialised: a timer firing as the answer arrives must not cut
+		// a body that is about to stream, so an answer that still lost the race is given up.
 		callCtx, endCall := context.WithCancelCause(ctx)
-		silence := time.AfterFunc(upstream.Timeout(), func() { endCall(errUpstreamSilent) })
+		var callMu sync.Mutex
+		answered := false
+		silence := time.AfterFunc(upstream.Timeout(), func() {
+			callMu.Lock()
+			defer callMu.Unlock()
+			if !answered {
+				endCall(errUpstreamSilent)
+			}
+		})
 		request, err := http.NewRequestWithContext(callCtx, http.MethodPost, strings.TrimRight(upstream.Endpoint(), "/")+"/chat/completions", bytes.NewReader(body))
 		if err != nil {
 			silence.Stop()
@@ -1037,50 +1120,64 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 			request.Header.Set("Authorization", "Bearer "+key)
 		}
 		response, err := s.settings.HTTPClient.Do(request)
+		callMu.Lock()
+		answered = true
+		callMu.Unlock()
 		silence.Stop()
+		if err == nil && errors.Is(context.Cause(callCtx), errUpstreamSilent) {
+			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxErrorBodyBytes))
+			response.Body.Close()
+			err = errUpstreamSilent
+		}
 		if err != nil {
 			endCall(nil)
 			reason := "transport error"
-			if errors.Is(context.Cause(callCtx), errUpstreamSilent) {
+			if errors.Is(err, errUpstreamSilent) || errors.Is(context.Cause(callCtx), errUpstreamSilent) {
 				reason = fmt.Sprintf("no answer within %s", upstream.Timeout())
 			}
-			lastErr = fmt.Errorf("%s: %s: %w", upstream.Name, reason, err)
+			failed.attempts = append(failed.attempts, upstream.Name+" ("+reason+")")
+			failed.last = fmt.Errorf("%s: %s: %w", upstream.Name, reason, err)
 			s.settings.Logger.Printf("request=%s upstream=%s %s, trying next", requestID, upstream.Name, reason)
 			if ctx.Err() != nil {
-				return nil, lastErr
+				return nil, failed
 			}
-			skipped = append(skipped, upstream.Name+" ("+reason+")")
 			continue
 		}
 		if retryStatuses[response.StatusCode] && i < len(route.Upstreams)-1 {
-			lastErr = fmt.Errorf("%s: HTTP %d", upstream.Name, response.StatusCode)
+			failed.attempts = append(failed.attempts, fmt.Sprintf("%s (HTTP %d)", upstream.Name, response.StatusCode))
+			failed.last = fmt.Errorf("%s: HTTP %d", upstream.Name, response.StatusCode)
 			s.settings.Logger.Printf("request=%s upstream=%s status=%d, trying next", requestID, upstream.Name, response.StatusCode)
 			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxErrorBodyBytes))
 			response.Body.Close()
 			endCall(nil)
-			skipped = append(skipped, fmt.Sprintf("%s (HTTP %d)", upstream.Name, response.StatusCode))
 			continue
 		}
 		if credentialStatuses[response.StatusCode] {
 			// The last upstream refused Lebrel's own credential or credit: that is Lebrel's outage,
 			// never the customer's, so its words ("insufficient credits", "invalid key") are not
 			// relayed as if they were about the customer's account.
-			lastErr = fmt.Errorf("%s: HTTP %d", upstream.Name, response.StatusCode)
+			failed.attempts = append(failed.attempts, fmt.Sprintf("%s (HTTP %d, Lebrel's credential refused)", upstream.Name, response.StatusCode))
+			failed.last = fmt.Errorf("%s: HTTP %d", upstream.Name, response.StatusCode)
 			s.settings.Logger.Printf("request=%s upstream=%s status=%d refused Lebrel's credential, no upstream left", requestID, upstream.Name, response.StatusCode)
 			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxErrorBodyBytes))
 			response.Body.Close()
 			endCall(nil)
-			return nil, lastErr
+			return nil, failed
 		}
-		if len(skipped) > 0 {
-			s.noteFallback(route, upstream, skipped, requestID)
+		switch {
+		case retryStatuses[response.StatusCode]:
+			// the last upstream failed as well: its status is relayed, and that is an outage, not a fallback
+			attempts := append(append([]string{}, failed.attempts...), fmt.Sprintf("%s (HTTP %d)", upstream.Name, response.StatusCode))
+			s.noteOutage(route, &attemptsError{attempts: attempts})
+		case len(failed.attempts) > 0 && response.StatusCode >= 200 && response.StatusCode <= 299:
+			s.noteFallback(route, upstream, failed.attempts, requestID)
 		}
 		return &upstreamResult{upstream: upstream, response: response, release: func() { endCall(nil) }}, nil
 	}
-	if lastErr == nil {
-		lastErr = errors.New("no upstreams")
+	if failed.last == nil {
+		failed.last = errors.New("no upstreams")
 	}
-	return nil, lastErr
+	return nil, failed
 }
 
 // errUpstreamSilent ends a call whose upstream has not answered within its time.
@@ -1126,11 +1223,18 @@ func (s *Server) noteFallback(route *Route, upstream *Upstream, skipped []string
 	})
 }
 
-// noteOutage records a request no upstream could serve: the customer got a 502.
+// noteOutage records a request no upstream could serve (the customer got the last upstream's
+// failure, or a 502). The alert names the attempts by upstream name and reason, never an endpoint
+// (a transport error's text carries the URL, which stays in the log).
 func (s *Server) noteOutage(route *Route, cause error) {
+	what := "sin respuesta"
+	var failed *attemptsError
+	if errors.As(cause, &failed) && len(failed.attempts) > 0 {
+		what = failed.Summary()
+	}
 	s.alertThrottled("outage:"+route.ModelID, func(count int) string {
-		return fmt.Sprintf("%s: ningún proveedor pudo responder (%v). %d peticiones devueltas con 502 en esta ruta desde el último aviso (avisa como mucho cada 10 min). 👉 Revisa los proveedores de la ruta.",
-			route.Name(), cause, count)
+		return fmt.Sprintf("%s: ningún proveedor pudo responder (%s). %d peticiones sin respuesta en esta ruta desde el último aviso (avisa como mucho cada 10 min). 👉 Revisa los proveedores de la ruta.",
+			route.Name(), what, count)
 	})
 }
 
@@ -1222,9 +1326,15 @@ func translateAlibaba(payload map[string]any, reasoningFixed bool, efforts []str
 			enabled = &value
 		}
 	}
-	if reasoning, ok := payload["reasoning"].(map[string]any); ok && enabled == nil {
-		if value, ok := reasoning["enabled"].(bool); ok {
+	if reasoning, ok := payload["reasoning"].(map[string]any); ok {
+		if value, ok := reasoning["enabled"].(bool); ok && enabled == nil {
 			enabled = &value
+		}
+		// OpenRouter's `reasoning.effort` is the same ask as `reasoning_effort`, which wins when both are sent
+		if effort, ok := reasoning["effort"].(string); ok {
+			if _, named := payload["reasoning_effort"]; !named {
+				payload["reasoning_effort"] = effort
+			}
 		}
 	}
 	delete(payload, "thinking")

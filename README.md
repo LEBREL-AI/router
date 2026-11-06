@@ -92,20 +92,26 @@ Pricing is per route in microUSD per million tokens and already includes the fee
 `lebrel.billing.v2` document, so the control plane's published release for the model must
 carry the same rates, `version`, `effective_at` (`…T00:00:00.000Z`), context and output limits.
 
-## Production: DeepSeek first
+## Production: Alibaba Model Studio first, the labs behind
 
-Since 4 November 2026 the two DeepSeek routes and the two Qwen routes go through OpenRouter
-(`dialect: "openrouter"`, `base_url` `https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`), with
-the provider pinned in the forced body (`provider.order` = the lab, `allow_fallbacks: false`) so
-the request still ends at the lab's own API and never at another host; the DeepSeek routes keep
-DeepSeek's own API as the second upstream, taken when OpenRouter cannot answer (a transport
-error, a 5xx, or OpenRouter refusing Lebrel's credential or credit: 401, 402 and 403 fail over
-like a 503). The dialect maps the labs' own reasoning switches (`thinking: {"type": "disabled"}`,
-`enable_thinking: false`) onto OpenRouter's `reasoning: {"enabled": false}` unless the client sent
-`reasoning` itself, so a client keeps writing what the lab documents. The receipt names the
-upstream (`openrouter/deepseek`, `openrouter/alibaba`) and the provider OpenRouter reports.
+Since 6 November 2026 six routes (the two DeepSeek, GLM-5.3, Kimi K3 and the two Qwen) go first
+to Alibaba Cloud Model Studio's copy of each model (`dialect: "alibaba"`, `DASHSCOPE_API_KEY`;
+`base_url_env: ALIBABA_MODEL_STUDIO_BASE_URL` may move the endpoint to the workspace form of the
+same service, and the signed manifest keeps naming the public one). The previous upstreams stay
+behind as fallback: OpenRouter pinned to the lab for DeepSeek and Qwen (`dialect: "openrouter"`,
+`provider.order` = the lab, `allow_fallbacks: false`), then DeepSeek's own API; Z.ai's and
+Moonshot AI's own APIs for GLM-5.3 and Kimi K3. A fallback is taken on a transport error, a 5xx,
+or a refusal of Lebrel's credential or credit (401, 402 and 403 fail over like a 503); each
+upstream has `timeout_seconds` (default 90) to answer with headers. The receipt names the upstream
+that served. The Alibaba dialect maps every lab's reasoning switch (`thinking: {"type"}`,
+`reasoning: {"enabled"}`, `enable_thinking`) onto `enable_thinking`, forwards `reasoning_effort`
+(or OpenRouter's `reasoning.effort`) within the endpoint's `reasoning_efforts` list (Model Studio
+refuses any other value), and gives a host that always reasons (`reasoning_fixed`) its lowest
+listed effort to a client asking for none. GLM-5.3 Flash stays at Z.ai only. An answer served by
+a fallback, and a request no upstream could serve, alert the operator (`ALERT_WEBHOOK_URL`) at
+most every ten minutes per route, by upstream name and reason.
 Qwen: `qwen/qwen3.8-max` (Alibaba's `qwen3.8-max-0902` snapshot) and `qwen/qwen3.8-flash`, both
-1,000,000 context and 131,072 max output, Alibaba's list rate plus 20 %.
+1,000,000 context and 131,072 max output.
 
 
 `routes.production.json` serves DeepSeek's two live models as-is from the lab's own API:

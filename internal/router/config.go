@@ -289,8 +289,8 @@ func (r *Route) validate() error {
 		}
 		names[u.Name] = true
 		parsed, err := url.Parse(u.BaseURL)
-		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-			return fmt.Errorf("upstream %q: base_url must be an absolute URL", u.Name)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return fmt.Errorf("upstream %q: base_url must be an absolute URL without credentials, a query or a fragment", u.Name)
 		}
 		if parsed.Scheme != "https" && !isLoopback(parsed.Hostname()) {
 			return fmt.Errorf("upstream %q: base_url must use https", u.Name)
@@ -299,11 +299,16 @@ func (r *Route) validate() error {
 			if strings.ContainsAny(u.BaseURLEnv, " =\r\n\t") {
 				return fmt.Errorf("upstream %q: base_url_env must be a variable name", u.Name)
 			}
-			// the endpoint from the environment is checked the same way, at start and at every reload
+			// The environment may move the endpoint within the service's own domain (Alibaba's
+			// workspace form of the same API), never to another service; the public file keeps
+			// naming the service's public endpoint, which is what the signed manifest shows.
 			if endpoint := u.Endpoint(); endpoint != u.BaseURL {
-				parsed, err := url.Parse(endpoint)
-				if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
-					return fmt.Errorf("upstream %q: %s must hold an absolute https URL", u.Name, u.BaseURLEnv)
+				moved, err := url.Parse(endpoint)
+				if err != nil || moved.Scheme != "https" || moved.Host == "" || moved.User != nil || moved.RawQuery != "" || moved.Fragment != "" {
+					return fmt.Errorf("upstream %q: %s must hold an absolute https URL without credentials, a query or a fragment", u.Name, u.BaseURLEnv)
+				}
+				if serviceDomain(moved.Hostname()) != serviceDomain(parsed.Hostname()) {
+					return fmt.Errorf("upstream %q: %s must stay within %s", u.Name, u.BaseURLEnv, serviceDomain(parsed.Hostname()))
 				}
 			}
 		}
@@ -345,6 +350,15 @@ func (r *Route) validate() error {
 		return err
 	}
 	return r.MeterPricing().Validate()
+}
+
+// serviceDomain is the last two labels of a host: what an endpoint may move within.
+func serviceDomain(host string) string {
+	labels := strings.Split(strings.ToLower(strings.TrimSuffix(host, ".")), ".")
+	if len(labels) < 2 {
+		return host
+	}
+	return strings.Join(labels[len(labels)-2:], ".")
 }
 
 func isLoopback(host string) bool {

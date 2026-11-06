@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync"
+	"time"
 
 	"lebrel-router/internal/controlplane"
 )
@@ -130,12 +132,58 @@ func (a *HMACAuthenticator) Authenticate(ctx context.Context, authorization stri
 	return Principal{}, ErrUnauthorized
 }
 
+// refusedFor is how long a key hash the control plane refused is refused here without asking
+// again; refusedMax bounds what a flood of distinct wrong keys can take in memory.
+const (
+	refusedFor = 10 * time.Second
+	refusedMax = 8192
+)
+
 type RemoteAuthenticator struct {
 	client controlplane.JSONClient
+	now    func() time.Time
+	// refused remembers the key hashes the control plane refused, until refusedFor passes: a wrong
+	// key repeated at line rate (nothing slows it by address on a direct endpoint) costs the control
+	// plane one call per refusedFor, not one per request. A right key is never remembered, so a key
+	// created a moment ago works at once, and a revoked one is refused by the control plane on the
+	// next look.
+	mu      sync.Mutex
+	refused map[string]time.Time
 }
 
 func NewRemoteAuthenticator(client controlplane.JSONClient) *RemoteAuthenticator {
-	return &RemoteAuthenticator{client: client}
+	return &RemoteAuthenticator{client: client, now: time.Now, refused: map[string]time.Time{}}
+}
+
+func (a *RemoteAuthenticator) recentlyRefused(hash string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	until, ok := a.refused[hash]
+	if !ok {
+		return false
+	}
+	if a.now().After(until) {
+		delete(a.refused, hash)
+		return false
+	}
+	return true
+}
+
+func (a *RemoteAuthenticator) remember(hash string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := a.now()
+	if len(a.refused) >= refusedMax {
+		for key, until := range a.refused {
+			if now.After(until) {
+				delete(a.refused, key)
+			}
+		}
+		if len(a.refused) >= refusedMax {
+			return
+		}
+	}
+	a.refused[hash] = now.Add(refusedFor)
 }
 
 func (a *RemoteAuthenticator) Authenticate(ctx context.Context, authorization string) (Principal, error) {
@@ -144,9 +192,13 @@ func (a *RemoteAuthenticator) Authenticate(ctx context.Context, authorization st
 		return Principal{}, ErrUnauthorized
 	}
 	digest := sha256.Sum256([]byte(rawKey))
+	hash := hex.EncodeToString(digest[:])
+	if a.recentlyRefused(hash) {
+		return Principal{}, ErrUnauthorized
+	}
 	request := struct {
 		TokenHash string `json:"tokenHash"`
-	}{TokenHash: hex.EncodeToString(digest[:])}
+	}{TokenHash: hash}
 	var response struct {
 		AccountID          string `json:"accountId"`
 		APIKeyID           string `json:"apiKeyId"`
@@ -172,6 +224,7 @@ func (a *RemoteAuthenticator) Authenticate(ctx context.Context, authorization st
 			(httpError.StatusCode == http.StatusUnauthorized ||
 				httpError.StatusCode == http.StatusForbidden ||
 				httpError.StatusCode == http.StatusNotFound) {
+			a.remember(hash)
 			return Principal{}, ErrUnauthorized
 		}
 		return Principal{}, fmt.Errorf("%w: %v", ErrUnavailable, err)

@@ -256,36 +256,36 @@ func run(logger *log.Logger) error {
 	}
 	// Direct clients: the machine terminates TLS itself (TLS_CERT_FILE/TLS_KEY_FILE, or an ingress in
 	// the same VM) and serves ordinary API clients without the platform's edge in front, under the
-	// names DIRECT_HOSTS lists. Limits stay by key and by account; nothing is capped by address. The
-	// client's address (the control plane counts wrong keys by it) is the connection's, or the last
-	// entry of CLIENT_IP_HEADER when the connection comes from CLIENT_IP_HEADER_FROM (the ingress).
+	// names DIRECT_HOSTS lists. Limits stay by key and by account; nothing is capped by address.
+	// CLIENT_ADDRESS states where a client's address is known from, for the control plane's count of
+	// wrong keys: "connection" (TLS ends here, nothing proxies in front), "header" (the last entry of
+	// CLIENT_IP_HEADER when the connection comes from CLIENT_IP_HEADER_FROM, the ingress), or "none"
+	// (a TCP ingress or a provider's gateway hides it: no address is told, wrong keys are counted for
+	// nobody rather than for every client at once).
 	directClients := strings.EqualFold(strings.TrimSpace(env("DIRECT_CLIENTS", "false")), "true")
 	directHosts := listed(env("DIRECT_HOSTS", ""), strings.ToLower)
+	clientAddress := strings.ToLower(strings.TrimSpace(env("CLIENT_ADDRESS", "")))
 	clientIPHeader := strings.TrimSpace(env("CLIENT_IP_HEADER", ""))
 	trustedIngress, err := prefixes(env("CLIENT_IP_HEADER_FROM", ""))
 	if err != nil {
 		return err
 	}
-	if (clientIPHeader == "") != (len(trustedIngress) == 0) {
-		return errors.New("CLIENT_IP_HEADER and CLIENT_IP_HEADER_FROM (the addresses of the ingress that sets it) go together")
-	}
 	if directClients {
 		if production && len(directHosts) == 0 {
 			return errors.New("DIRECT_CLIENTS in production needs DIRECT_HOSTS: the names clients call this machine by")
 		}
-		from := "the connection"
-		if clientIPHeader != "" {
-			from = fmt.Sprintf("header %q when the connection comes from %v", clientIPHeader, trustedIngress)
+		if production && clientAddress == "" {
+			return errors.New("DIRECT_CLIENTS in production needs CLIENT_ADDRESS: none, connection or header (where a client's address is known from)")
 		}
-		logger.Printf("direct clients: on hosts=%v client address from %s", directHosts, from)
+		logger.Printf("direct clients: on hosts=%v client_address=%q header=%q from=%v", directHosts, clientAddress, clientIPHeader, trustedIngress)
 	}
 	server, err := router.New(router.Settings{
 		Routes: routes, Auth: authenticator, Ledger: ledgerImpl, Signer: signer, Settlements: settlements,
 		AcceptTimeout: time.Duration(acceptMillis) * time.Millisecond, AlertAge: alertAge, ReceiptPeers: peers,
 		HealthToken: strings.TrimSpace(env("HEALTH_TOKEN", "")),
 		Receipts:    router.NewReceiptStore(24*time.Hour, 100_000), Verification: verification,
-		BoardURL: env("BOARD_URL", ""), EdgeProxySecret: env("EDGE_PROXY_SECRET", ""), MaxRequestBytes: maxBytes, Logger: logger,
-		DirectClients: directClients, DirectHosts: directHosts, ClientIPHeader: clientIPHeader, TrustedIngress: trustedIngress,
+		BoardURL: env("BOARD_URL", ""), EdgeProxySecret: env("EDGE_PROXY_SECRET", ""), EdgeProxyToken: env("EDGE_PROXY_TOKEN", ""), MaxRequestBytes: maxBytes, Logger: logger,
+		DirectClients: directClients, DirectHosts: directHosts, ClientAddress: clientAddress, ClientIPHeader: clientIPHeader, TrustedIngress: trustedIngress,
 		Alert:    notifier.Notify,
 		Attester: attester, KeySource: keySource, Encryption: encryption,
 	})
@@ -415,6 +415,10 @@ func prefixes(spec string) ([]netip.Prefix, error) {
 				return nil, fmt.Errorf("CLIENT_IP_HEADER_FROM: %q is neither an address nor a CIDR", entry)
 			}
 			prefix = netip.PrefixFrom(addr, addr.BitLen())
+		}
+		if prefix.Addr().Is4In6() && prefix.Bits() >= 96 {
+			// the IPv4-mapped form of an IPv4 prefix, compared as the IPv4 prefix it is
+			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
 		}
 		result = append(result, prefix.Masked())
 	}
