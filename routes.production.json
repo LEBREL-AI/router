@@ -7,7 +7,7 @@
       "level": 2,
       "family": "deepseek-v4.1-flash",
       "claimed_revision": "deepseek-flash",
-      "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to DeepSeek's own API: with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; DeepSeek sees it, not you, and keeps its own retention policy (China). If OpenRouter cannot answer, the request goes to DeepSeek's API directly. DeepSeek's off-peak rate plus 20%; its peak-hour surcharge (weekdays 01-04 and 06-10 UTC, except Chinese public holidays) is passed through.",
+      "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to DeepSeek's own API: with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; DeepSeek sees it, not you, and keeps its own retention policy (China). If OpenRouter cannot answer, the request goes to DeepSeek's API directly. Priced by Lebrel's published rates, the same day and night; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
           "name": "openrouter/deepseek",
@@ -42,43 +42,13 @@
         }
       ],
       "pricing": {
-        "input_microusd_per_million_tokens": 180000,
-        "cached_input_microusd_per_million_tokens": 3600,
-        "output_microusd_per_million_tokens": 720000,
+        "input_microusd_per_million_tokens": 150000,
+        "cached_input_microusd_per_million_tokens": 6000,
+        "output_microusd_per_million_tokens": 600000,
         "reservation_bps": 15000,
         "fee_bps": 2000,
-        "version": "router-v2",
-        "effective_at": "2026-09-29T17:28:00.000Z",
-        "peak": {
-          "multiplier_percent": 200,
-          "weekdays": [
-            1,
-            2,
-            3,
-            4,
-            5
-          ],
-          "windows_utc": [
-            [
-              "01:00",
-              "04:00"
-            ],
-            [
-              "06:00",
-              "10:00"
-            ]
-          ],
-          "holidays_utc": [
-            "2026-09-25",
-            "2026-10-01",
-            "2026-10-02",
-            "2026-10-03",
-            "2026-10-04",
-            "2026-10-05",
-            "2026-10-06",
-            "2026-10-07"
-          ]
-        }
+        "version": "router-v3",
+        "effective_at": "2026-11-06T02:30:00.000Z"
       },
       "max_context_tokens": 1048576,
       "max_output_tokens": 393216,
@@ -91,7 +61,7 @@
       "level": 2,
       "family": "deepseek-v4-pro",
       "claimed_revision": "deepseek-v4-pro",
-      "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to DeepSeek's own API: with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; DeepSeek sees it, not you, and keeps its own retention policy (China). If OpenRouter cannot answer, the request goes to DeepSeek's API directly. DeepSeek's off-peak rate plus 20%; its peak-hour surcharge (weekdays 01-04 and 06-10 UTC, except Chinese public holidays) is passed through.",
+      "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to DeepSeek's own API: with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; DeepSeek sees it, not you, and keeps its own retention policy (China). If OpenRouter cannot answer, the request goes to DeepSeek's API directly. Priced by Lebrel's published rates; DeepSeek's peak-hour surcharge (weekdays 01-04 and 06-10 UTC, except Chinese public holidays) is passed through and named in the receipt; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
           "name": "openrouter/deepseek",
@@ -131,8 +101,8 @@
         "output_microusd_per_million_tokens": 2376000,
         "reservation_bps": 15000,
         "fee_bps": 2000,
-        "version": "router-v2",
-        "effective_at": "2026-09-29T17:28:00.000Z",
+        "version": "router-v3",
+        "effective_at": "2026-11-06T02:30:00.000Z",
         "peak": {
           "multiplier_percent": 200,
           "weekdays": [
@@ -175,7 +145,7 @@
       "level": 2,
       "family": "glm-5.3-flash",
       "claimed_revision": "glm-5.3-flash",
-      "data_note": "Relayed by Lebrel's router to Z.ai's own API: with the encrypted client only the router reads the request; Z.ai sees it, not you, and keeps its own retention policy. Z.ai's published rate plus 20%.",
+      "data_note": "Relayed by Lebrel's router to Z.ai's own API: with the encrypted client only the router reads the request; Z.ai sees it, not you, and keeps its own retention policy. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
           "name": "zai/api-flash",
@@ -188,13 +158,13 @@
         }
       ],
       "pricing": {
-        "input_microusd_per_million_tokens": 180000,
-        "cached_input_microusd_per_million_tokens": 36000,
-        "output_microusd_per_million_tokens": 600000,
+        "input_microusd_per_million_tokens": 170000,
+        "cached_input_microusd_per_million_tokens": 34000,
+        "output_microusd_per_million_tokens": 560000,
         "reservation_bps": 15000,
         "fee_bps": 2000,
-        "version": "router-v2",
-        "effective_at": "2026-09-29T17:28:00.000Z"
+        "version": "router-v3",
+        "effective_at": "2026-11-06T02:30:00.000Z"
       },
       "max_context_tokens": 1048576,
       "max_output_tokens": 131072,
@@ -207,7 +177,7 @@
       "level": 2,
       "family": "glm-5.3",
       "claimed_revision": "glm-5.3",
-      "data_note": "Relayed by Lebrel's router to Z.ai's own API: with the encrypted client only the router reads the request; Z.ai sees it, not you, and keeps its own retention policy. Z.ai's published rate plus 20%.",
+      "data_note": "Relayed by Lebrel's router to Z.ai's own API: with the encrypted client only the router reads the request; Z.ai sees it, not you, and keeps its own retention policy. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
           "name": "zai/api",
@@ -220,13 +190,13 @@
         }
       ],
       "pricing": {
-        "input_microusd_per_million_tokens": 1680000,
-        "cached_input_microusd_per_million_tokens": 312000,
-        "output_microusd_per_million_tokens": 5280000,
+        "input_microusd_per_million_tokens": 1260000,
+        "cached_input_microusd_per_million_tokens": 234000,
+        "output_microusd_per_million_tokens": 3960000,
         "reservation_bps": 15000,
         "fee_bps": 2000,
-        "version": "router-v2",
-        "effective_at": "2026-09-29T17:28:00.000Z"
+        "version": "router-v3",
+        "effective_at": "2026-11-06T02:30:00.000Z"
       },
       "max_context_tokens": 1048576,
       "max_output_tokens": 131072,
@@ -239,7 +209,7 @@
       "level": 2,
       "family": "kimi-k3",
       "claimed_revision": "kimi-k3",
-      "data_note": "Relayed by Lebrel's router to Moonshot AI's own API: with the encrypted client only the router reads the request; Moonshot AI sees it, not you, and keeps its own retention policy. Moonshot AI's published rate plus 20%.",
+      "data_note": "Relayed by Lebrel's router to Moonshot AI's own API: with the encrypted client only the router reads the request; Moonshot AI sees it, not you, and keeps its own retention policy. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
           "name": "moonshot/api",
@@ -252,13 +222,13 @@
         }
       ],
       "pricing": {
-        "input_microusd_per_million_tokens": 3600000,
-        "cached_input_microusd_per_million_tokens": 360000,
-        "output_microusd_per_million_tokens": 18000000,
+        "input_microusd_per_million_tokens": 3300000,
+        "cached_input_microusd_per_million_tokens": 330000,
+        "output_microusd_per_million_tokens": 16500000,
         "reservation_bps": 15000,
         "fee_bps": 2000,
-        "version": "router-v2",
-        "effective_at": "2026-09-29T17:28:00.000Z"
+        "version": "router-v3",
+        "effective_at": "2026-11-06T02:30:00.000Z"
       },
       "max_context_tokens": 1048576,
       "max_output_tokens": 131072,
@@ -271,7 +241,7 @@
       "level": 2,
       "family": "qwen3.8-max",
       "claimed_revision": "qwen/qwen3.8-max-0902",
-      "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; Alibaba sees it, not you, and keeps its own retention policy. Alibaba's list rate plus 20%. This endpoint always reasons: reasoning tokens are billed as output, and a client asking for no reasoning gets the lowest effort.",
+      "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; Alibaba sees it, not you, and keeps its own retention policy. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee. This endpoint always reasons: reasoning tokens are billed as output, and a client asking for no reasoning gets the lowest effort.",
       "upstreams": [
         {
           "name": "openrouter/alibaba",
@@ -298,13 +268,13 @@
         }
       ],
       "pricing": {
-        "input_microusd_per_million_tokens": 2400000,
-        "cached_input_microusd_per_million_tokens": 300000,
-        "output_microusd_per_million_tokens": 7200000,
+        "input_microusd_per_million_tokens": 2000000,
+        "cached_input_microusd_per_million_tokens": 250000,
+        "output_microusd_per_million_tokens": 6000000,
         "reservation_bps": 15000,
         "fee_bps": 2000,
-        "version": "router-v2",
-        "effective_at": "2026-11-04T00:00:00.000Z"
+        "version": "router-v3",
+        "effective_at": "2026-11-06T02:30:00.000Z"
       },
       "max_context_tokens": 1000000,
       "max_output_tokens": 131072,
@@ -317,7 +287,7 @@
       "level": 2,
       "family": "qwen3.8-flash",
       "claimed_revision": "qwen/qwen3.8-flash",
-      "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; Alibaba sees it, not you, and keeps its own retention policy. Alibaba's list rate plus 20%.",
+      "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; Alibaba sees it, not you, and keeps its own retention policy. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
           "name": "openrouter/alibaba",
@@ -343,13 +313,13 @@
         }
       ],
       "pricing": {
-        "input_microusd_per_million_tokens": 180000,
-        "cached_input_microusd_per_million_tokens": 19200,
-        "output_microusd_per_million_tokens": 564000,
+        "input_microusd_per_million_tokens": 150000,
+        "cached_input_microusd_per_million_tokens": 16000,
+        "output_microusd_per_million_tokens": 490000,
         "reservation_bps": 15000,
         "fee_bps": 2000,
-        "version": "router-v2",
-        "effective_at": "2026-11-04T00:00:00.000Z"
+        "version": "router-v3",
+        "effective_at": "2026-11-06T02:30:00.000Z"
       },
       "max_context_tokens": 1000000,
       "max_output_tokens": 131072,
