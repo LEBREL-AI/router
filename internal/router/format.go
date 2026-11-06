@@ -178,7 +178,13 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 	if format == formatAnthropic {
 		chat, err = anthropicToChat(request, maxOutput)
 	} else {
-		chat, err = responsesToChat(request, maxOutput)
+		// Without max_output_tokens, Codex gets the edition's limit as the proxy gave it; a routed model keeps
+		// the default any OpenAI client gets, never a hold at the route's maximum.
+		var fill int64
+		if route.Kind == routeKindEdition {
+			fill = maxOutput
+		}
+		chat, err = responsesToChat(request, maxOutput, fill)
 	}
 	if err != nil {
 		var invalid *formatError
@@ -246,6 +252,11 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 	select {
 	case <-capture.headers:
 	case <-ctx.Done():
+		if errors.Is(context.Cause(ctx), errShutdownCut) && r.Context().Err() == nil {
+			// A shutdown cut the answer before its first byte, with the client still there: told to retry.
+			w.Header().Set("Retry-After", "1")
+			s.writeFormatError(w, format, http.StatusServiceUnavailable, "router_restarting", "the router is restarting; retry")
+		}
 		return
 	}
 	if capture.status != http.StatusOK {
@@ -341,7 +352,7 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil || chunk == nil {
 			return true
 		}
-		if _, failed := chunk["error"]; failed {
+		if value, failed := chunk["error"]; failed && value != nil {
 			// The inner stream reports its own failure: the answer is over, and not complete.
 			aborted = true
 			write(translator.Abort("the answer did not complete"))
