@@ -120,7 +120,7 @@ func TestResponsesBecomeOneChatCompletionAndBack(t *testing.T) {
 			{"type":"message","role":"developer","content":"Note."}
 		],
 		"tools":[{"type":"function","name":"shell","parameters":{"type":"object"}},{"type":"web_search"}],"tool_choice":"auto","parallel_tool_calls":false}`)
-	chat, err := responsesToChat(request, 131072)
+	chat, err := responsesToChat(request, 131072, 131072)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestResponsesBecomeOneChatCompletionAndBack(t *testing.T) {
 	if chat["max_tokens"] != int64(131072) || len(chat["tools"].([]any)) != 1 || chat["tool_choice"] != "auto" || chat["parallel_tool_calls"] != false {
 		t.Fatalf("chat: %v", chat)
 	}
-	if _, err := responsesToChat(decodeJSON(t, `{"previous_response_id":"resp_1","input":"hi"}`), 0); err == nil {
+	if _, err := responsesToChat(decodeJSON(t, `{"previous_response_id":"resp_1","input":"hi"}`), 0, 0); err == nil {
 		t.Fatal("previous_response_id is refused")
 	}
 

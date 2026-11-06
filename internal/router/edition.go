@@ -338,6 +338,11 @@ func (s *Server) handleEditionCompletion(ctx context.Context, w http.ResponseWri
 		if err != nil {
 			endCall(nil)
 			if ctx.Err() != nil {
+				if errors.Is(context.Cause(ctx), errShutdownCut) && r.Context().Err() == nil {
+					// A shutdown cut the call before the edge answered, with the client still there: told to retry.
+					w.Header().Set("Retry-After", "1")
+					s.writeError(w, http.StatusServiceUnavailable, "router_restarting", "the router is restarting; retry")
+				}
 				return
 			}
 			s.settings.Logger.Printf("request=%s model=%s edition transport error", requestID, route.ModelID)
@@ -433,6 +438,24 @@ func plaintextEdgeError(raw []byte) (code, message string) {
 			message = strings.ReplaceAll(body.Error.Code, "_", " ")
 		}
 		return body.Error.Code, message
+	}
+	// The runtime's own refusal (vLLM: {"object":"error","message":…,"code":400}, or {"error":{"message":…,"type":…}}
+	// with a numeric code): its message kept, under a code that says where it came from.
+	var loose struct {
+		Message string `json:"message"`
+		Error   struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(raw, &loose) == nil {
+		text := loose.Error.Message
+		if text == "" {
+			text = loose.Message
+		}
+		if text != "" && len(text) <= 300 && !strings.ContainsAny(text, "\r\n") {
+			return "upstream_error", text
+		}
 	}
 	return "unencrypted_transport_error", "the edge refused the request"
 }

@@ -63,8 +63,9 @@ func responsesAppendAssistant(messages []map[string]any, text string, call map[s
 }
 
 // responsesToChat is the chat completion that expresses a Responses request; max_output_tokens is
-// capped at maxOutputTokens when that is above zero.
-func responsesToChat(request map[string]any, maxOutputTokens int64) (map[string]any, error) {
+// capped at maxOutputTokens when that is above zero, and set to fillOutputTokens when absent and
+// that is above zero.
+func responsesToChat(request map[string]any, maxOutputTokens, fillOutputTokens int64) (map[string]any, error) {
 	if previous, present := request["previous_response_id"]; present && previous != nil && previous != "" {
 		return nil, formatErrorf("previous_response_id is not supported: send the full conversation as input")
 	}
@@ -164,8 +165,8 @@ func responsesToChat(request map[string]any, maxOutputTokens int64) (map[string]
 			maxTokens = maxOutputTokens
 		}
 		chat["max_tokens"] = maxTokens
-	} else if maxOutputTokens > 0 {
-		chat["max_tokens"] = maxOutputTokens
+	} else if fillOutputTokens > 0 {
+		chat["max_tokens"] = fillOutputTokens
 	}
 	for _, name := range []string{"temperature", "top_p"} {
 		if value, present := request[name]; present && value != nil {
