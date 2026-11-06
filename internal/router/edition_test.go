@@ -27,15 +27,18 @@ type fakeEdge struct {
 	now        func() time.Time
 	mu         sync.Mutex
 	seen       []fakeEdgeRequest
-	// refuseOnce answers the next completion in plaintext with this status and body, then serves
-	refuseOnce   int
-	refuseBody   string
-	metadataHits int
+	// refuseOnce answers the next completion in plaintext with this status and body, then serves;
+	// refuseProblem makes it the runtime's own refusal (a problem document) rather than the edge's
+	refuseOnce    int
+	refuseBody    string
+	refuseProblem bool
+	metadataHits  int
 }
 
 type fakeEdgeRequest struct {
 	headers http.Header
 	body    map[string]any
+	raw     []byte
 }
 
 func newFakeEdge(t *testing.T, modelID string, now func() time.Time) *fakeEdge {
@@ -71,11 +74,14 @@ func newFakeEdge(t *testing.T, modelID string, now func() time.Time) *fakeEdge {
 			_, _ = w.Write([]byte(`{"payload":{"kind":"receipt","request_id":"` + id + `"},"signature":"c2ln"}`))
 		case r.URL.Path == completionPath:
 			e.mu.Lock()
-			refuse, body := e.refuseOnce, e.refuseBody
-			e.refuseOnce = 0
+			refuse, body, problem := e.refuseOnce, e.refuseBody, e.refuseProblem
+			e.refuseOnce, e.refuseProblem = 0, false
 			e.mu.Unlock()
 			if refuse != 0 {
 				w.Header().Set("Content-Type", "application/json")
+				if problem {
+					w.Header().Set("Content-Type", "application/problem+json")
+				}
 				w.WriteHeader(refuse)
 				_, _ = w.Write([]byte(body))
 				return
@@ -97,7 +103,7 @@ func newFakeEdge(t *testing.T, modelID string, now func() time.Time) *fakeEdge {
 			var payload map[string]any
 			_ = json.Unmarshal(plaintext, &payload)
 			e.mu.Lock()
-			e.seen = append(e.seen, fakeEdgeRequest{headers: r.Header.Clone(), body: payload})
+			e.seen = append(e.seen, fakeEdgeRequest{headers: r.Header.Clone(), body: payload, raw: plaintext})
 			e.mu.Unlock()
 			ew, err := current.identity.SetupDerivedResponseEncryption(w, responseContext)
 			if err != nil {
@@ -143,6 +149,7 @@ func (e *fakeEdge) requests() []fakeEdgeRequest {
 func editionRoute(edge *fakeEdge) Route {
 	return Route{
 		ModelID: "lebrel/test-uncensored", DisplayName: "Test · Lebrel Uncensored", BaseModel: "Test", Level: 3, Family: "test", Kind: routeKindEdition,
+		MaxContextTokens: 1_048_544, MaxOutputTokens: 8192,
 		Edition:  &EditionConfig{Origin: edge.server.URL, SigningKeyB64: base64.StdEncoding.EncodeToString(edge.signer.Public)},
 		DataNote: "Encrypted here to the edition's own GPUs.",
 	}
@@ -175,6 +182,14 @@ func TestAnEditionIsServedThroughTheRouterEncryptedToItsRuntime(t *testing.T) {
 	if sent.body["model"] != "lebrel/test-uncensored" || sent.body["service_tier"] != nil || sent.body["max_tokens"] != float64(64) {
 		t.Fatalf("the plaintext the runtime decrypts: %v", sent.body)
 	}
+	// Without a tier to take out, the runtime decrypts the client's own bytes: the receipt's prompt digest is theirs to check.
+	asSent := `{"model":"lebrel/test-uncensored","messages":[{"role":"user","content":"hi there"}],"max_tokens":64}`
+	if response := h.post(t, asSent, testKey); response.StatusCode != 200 {
+		t.Fatalf("plain edition answer: %d", response.StatusCode)
+	}
+	if seen := edge.requests(); string(seen[len(seen)-1].raw) != asSent {
+		t.Fatalf("the runtime decrypted %q, not the client's bytes", seen[len(seen)-1].raw)
+	}
 	// Streamed: the decrypted events reach the client as they come.
 	response = h.post(t, `{"model":"lebrel/test-uncensored","messages":[{"role":"user","content":"hi there"}],"stream":true}`, testKey)
 	raw, _ = io.ReadAll(response.Body)
@@ -199,6 +214,17 @@ func TestAnEditionIsServedThroughTheRouterEncryptedToItsRuntime(t *testing.T) {
 	raw, _ = io.ReadAll(response.Body)
 	if response.StatusCode != 200 || edge.metadataHits != hits+1 {
 		t.Fatalf("after a rotation: %d (metadata fetched %d more times) %s", response.StatusCode, edge.metadataHits-hits, raw)
+	}
+	// The runtime's own refusal of the ciphertext (its key changed with a restart; the edge relays its
+	// problem document as it is) is a rotation too: fetched again, once, and the request goes through.
+	hits = edge.metadataHits
+	edge.mu.Lock()
+	edge.refuseOnce, edge.refuseBody, edge.refuseProblem = 422, `{"type":"about:blank","title":"Encrypted request could not be authenticated","status":422}`, true
+	edge.mu.Unlock()
+	response = h.post(t, `{"model":"lebrel/test-uncensored","messages":[{"role":"user","content":"hi there"}]}`, testKey)
+	raw, _ = io.ReadAll(response.Body)
+	if response.StatusCode != 200 || edge.metadataHits != hits+1 {
+		t.Fatalf("after the runtime's refusal: %d (metadata fetched %d more times) %s", response.StatusCode, edge.metadataHits-hits, raw)
 	}
 	// A wrong key is refused by the router before anything is encrypted.
 	before := len(edge.requests())
@@ -240,6 +266,40 @@ func TestClaudeCodeReachesTheEditionWithoutAnyProxy(t *testing.T) {
 	seen := edge.requests()
 	if len(seen) != 1 || seen[0].body["messages"] == nil || seen[0].body["max_tokens"] != float64(64) {
 		t.Fatalf("the runtime decrypted a chat completion: %v", seen)
+	}
+	// Claude Code names no thinking switch: the edition's thinking is turned on for it, as the proxy did.
+	if seen[0].body["thinking"] != true {
+		t.Fatalf("the edition's thinking was not turned on: %v", seen[0].body)
+	}
+	// What Claude Code asks beyond the edition's output limit is capped to it (it asks 32,000 of any model
+	// it does not know); the key may come as Anthropic's own header; the priority tier as a header too.
+	request, _ = http.NewRequest(http.MethodPost, h.server.URL+anthropicMessagesPath, strings.NewReader(`{"model":"lebrel/test-uncensored","max_tokens":32000,"messages":[{"role":"user","content":"hi there"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("x-api-key", testKey)
+	request.Header.Set(editionTierHeader, "priority")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = io.ReadAll(response.Body)
+	if response.StatusCode != 200 {
+		t.Fatalf("messages with x-api-key: %d %s", response.StatusCode, raw)
+	}
+	seen = edge.requests()
+	last := seen[len(seen)-1]
+	if last.body["max_tokens"] != float64(8192) || last.headers.Get("Authorization") != "Bearer "+testKey || last.headers.Get(editionTierHeader) != "priority" || last.body["service_tier"] != nil {
+		t.Fatalf("capped, keyed and prioritised: %v %v", last.body, last.headers)
+	}
+	// A browser client can read the edition's own headers.
+	preflight, _ := http.NewRequest(http.MethodOptions, h.server.URL+anthropicMessagesPath, nil)
+	preflight.Header.Set("Origin", "https://app.example")
+	preflight.Header.Set("Access-Control-Request-Method", "POST")
+	response, err = http.DefaultClient.Do(preflight)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exposed := response.Header.Get("Access-Control-Expose-Headers"); !strings.Contains(exposed, editionRequestIDHeader) || !strings.Contains(exposed, "X-Lebrel-Encryption") {
+		t.Fatalf("exposed headers: %q", exposed)
 	}
 }
 

@@ -381,6 +381,11 @@ func (r *Route) validateEdition() error {
 	if len(r.Upstreams) > 0 {
 		return errors.New("an edition route has no upstreams")
 	}
+	// The edition's published limits: what a coding agent asks beyond max_output_tokens is capped to it,
+	// as the local proxy capped it, instead of refused by the edge on every turn.
+	if r.MaxContextTokens <= 0 || r.MaxOutputTokens <= 0 {
+		return errors.New("an edition route needs max_context_tokens and max_output_tokens, the edition's published limits")
+	}
 	parsed, err := url.Parse(r.Edition.Origin)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || strings.TrimRight(parsed.Path, "/") != "" {
 		return errors.New("edition.origin must be an origin (scheme and host only)")

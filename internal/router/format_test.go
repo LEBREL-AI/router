@@ -3,6 +3,7 @@ package router
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -276,6 +277,13 @@ func TestClaudeCodeAndCodexSpeakTheirFormatsToTheRouter(t *testing.T) {
 	if text != "hello world" || names[0] != "message_start" || names[len(names)-1] != "message_stop" {
 		t.Fatalf("events %v text %q", names, text)
 	}
+	// Claude Code's context meter reads the prompt's count from the streamed message: it is there, with
+	// the cache fields the message starts with.
+	startUsage := events[0].Data["message"].(map[string]any)["usage"].(map[string]any)
+	deltaUsage := events[len(events)-2].Data["usage"].(map[string]any)
+	if _, cached := startUsage["cache_read_input_tokens"]; !cached || deltaUsage["input_tokens"] != float64(12) || deltaUsage["output_tokens"] != float64(3) {
+		t.Fatalf("streamed usage: start %v delta %v", startUsage, deltaUsage)
+	}
 	// The token count is an estimate, answered without a lab call.
 	before := len(up.requests)
 	response = post(anthropicCountPath, `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi there"}]}`)
@@ -309,7 +317,8 @@ func TestClaudeCodeAndCodexSpeakTheirFormatsToTheRouter(t *testing.T) {
 	if response.StatusCode != 400 || decodeJSON(t, string(raw))["error"].(map[string]any)["type"] != "invalid_request_error" {
 		t.Fatalf("unsupported field: %d %s", response.StatusCode, raw)
 	}
-	request, _ := http.NewRequest(http.MethodPost, h.server.URL+anthropicMessagesPath, strings.NewReader(`{"model":"deepseek/deepseek-v4.1-flash","max_tokens":5,"messages":[{"role":"user","content":"x"}]}`))
+	// A wrong key is refused before the body is read: no body, however big or broken, is parsed for it.
+	request, _ := http.NewRequest(http.MethodPost, h.server.URL+anthropicMessagesPath, strings.NewReader(`this is not even JSON`))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer leb_live_wrong")
 	response, err := http.DefaultClient.Do(request)
@@ -319,5 +328,58 @@ func TestClaudeCodeAndCodexSpeakTheirFormatsToTheRouter(t *testing.T) {
 	raw, _ = io.ReadAll(response.Body)
 	if response.StatusCode != 401 || decodeJSON(t, string(raw))["error"].(map[string]any)["type"] != "authentication_error" {
 		t.Fatalf("wrong key: %d %s", response.StatusCode, raw)
+	}
+}
+
+// sseCutHandler is a lab that says one word and hangs up: no finish, no [DONE].
+func sseCutHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	flusher := w.(http.Flusher)
+	fmt.Fprint(w, "data: {\"id\":\"s\",\"model\":\"deepseek-flash\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"}}]}\n\n")
+	flusher.Flush()
+}
+
+func TestACutStreamEndsInAnErrorEventNeverAWholeAnswer(t *testing.T) {
+	up := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Accept") == "text/event-stream" {
+			sseCutHandler(w, r)
+			return
+		}
+		okJSON(`{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}`)(w, r)
+	})
+	h := newHarnessWith(t, routeFor(upstream("deepseek/api", up.server.URL, 1)), board, func(s *Settings) {
+		s.EdgeProxySecret = "edge-secret"
+		s.DirectClients = true
+	})
+	post := func(path, body string) []formatEvent {
+		t.Helper()
+		request, _ := http.NewRequest(http.MethodPost, h.server.URL+path, strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+testKey)
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response.StatusCode != 200 {
+			t.Fatalf("%s: %d", path, response.StatusCode)
+		}
+		return readSSE(t, response.Body)
+	}
+	events := post(anthropicMessagesPath, `{"model":"deepseek/deepseek-v4.1-flash","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi there"}]}`)
+	var names []string
+	for _, event := range events {
+		names = append(names, event.Name)
+	}
+	if names[len(names)-1] != "error" || strings.Contains(strings.Join(names, " "), "message_stop") || events[len(events)-1].Data["error"].(map[string]any)["type"] != "api_error" {
+		t.Fatalf("a cut Messages stream: %v", names)
+	}
+	events = post(responsesPath, `{"model":"deepseek/deepseek-v4.1-flash","input":"hi there","stream":true}`)
+	names = names[:0]
+	for _, event := range events {
+		names = append(names, event.Name)
+	}
+	last := events[len(events)-1]
+	if last.Name != "error" || strings.Contains(strings.Join(names, " "), "response.completed") || last.Data["code"] != "incomplete_stream" || last.Data["sequence_number"] == nil {
+		t.Fatalf("a cut Responses stream: %v %v", names, last.Data)
 	}
 }
