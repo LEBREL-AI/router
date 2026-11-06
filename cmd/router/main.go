@@ -26,6 +26,7 @@ import (
 	"lebrel-router/internal/auth"
 	"lebrel-router/internal/controlplane"
 	"lebrel-router/internal/dstack"
+	"lebrel-router/internal/flood"
 	"lebrel-router/internal/ledger"
 	"lebrel-router/internal/router"
 	"lebrel-router/internal/settle"
@@ -251,12 +252,26 @@ func run(logger *log.Logger) error {
 			peers = append(peers, peer)
 		}
 	}
+	// Direct clients: the machine terminates TLS itself (TLS_CERT_FILE/TLS_KEY_FILE, or an ingress in
+	// the same VM) and serves ordinary API clients without the platform's edge in front; a flood
+	// ceiling per client address stands before the key check.
+	directClients := strings.EqualFold(strings.TrimSpace(env("DIRECT_CLIENTS", "false")), "true")
+	floodPerMinute, err := positive("DIRECT_FLOOD_PER_MINUTE", 600)
+	if err != nil {
+		return err
+	}
+	var floodLimiter *flood.Limiter
+	if directClients {
+		floodLimiter = flood.New(floodPerMinute, floodPerMinute/10+1)
+		logger.Printf("direct clients: on, flood ceiling %d requests a minute per address (client address from %q)", floodPerMinute, env("CLIENT_IP_HEADER", "connection"))
+	}
 	server, err := router.New(router.Settings{
 		Routes: routes, Auth: authenticator, Ledger: ledgerImpl, Signer: signer, Settlements: settlements,
 		AcceptTimeout: time.Duration(acceptMillis) * time.Millisecond, AlertAge: alertAge, ReceiptPeers: peers,
 		HealthToken: strings.TrimSpace(env("HEALTH_TOKEN", "")),
 		Receipts:    router.NewReceiptStore(24*time.Hour, 100_000), Verification: verification,
 		BoardURL: env("BOARD_URL", ""), EdgeProxySecret: env("EDGE_PROXY_SECRET", ""), MaxRequestBytes: maxBytes, Logger: logger,
+		DirectClients: directClients, ClientIPHeader: strings.TrimSpace(env("CLIENT_IP_HEADER", "")), Flood: floodLimiter,
 		Attester: attester, KeySource: keySource, Encryption: encryption,
 	})
 	if err != nil {
@@ -264,7 +279,17 @@ func run(logger *log.Logger) error {
 	}
 	httpServer := &http.Server{Addr: env("LISTEN_ADDR", ":8090"), Handler: server, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second}
 	errs := make(chan error, 1)
+	certFile, keyFile := strings.TrimSpace(env("TLS_CERT_FILE", "")), strings.TrimSpace(env("TLS_KEY_FILE", ""))
+	if (certFile == "") != (keyFile == "") {
+		return errors.New("TLS_CERT_FILE and TLS_KEY_FILE go together")
+	}
 	go func() {
+		if certFile != "" {
+			// The TLS connection ends in this process: nothing between the client and the measured machine reads it.
+			logger.Printf("listening on %s with TLS routes=%d", httpServer.Addr, len(routes.Routes))
+			errs <- httpServer.ListenAndServeTLS(certFile, keyFile)
+			return
+		}
 		logger.Printf("listening on %s routes=%d", httpServer.Addr, len(routes.Routes))
 		errs <- httpServer.ListenAndServe()
 	}()

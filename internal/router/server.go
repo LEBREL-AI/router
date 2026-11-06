@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -24,6 +25,7 @@ import (
 
 	"lebrel-router/internal/auth"
 	"lebrel-router/internal/dstack"
+	"lebrel-router/internal/flood"
 	"lebrel-router/internal/ledger"
 	"lebrel-router/internal/limit"
 	"lebrel-router/internal/meter"
@@ -96,6 +98,13 @@ type Settings struct {
 	PeerClient      *http.Client
 	BoardURL        string
 	EdgeProxySecret string
+	// DirectClients admits completions without the edge header: the machine terminates TLS itself and
+	// serves ordinary API clients; the key is checked here and a flood ceiling per client address
+	// stands before it. ClientIPHeader names the header an ingress in the same VM sets with the
+	// client's address (empty: the connection's own address). Flood is that ceiling (nil: none).
+	DirectClients   bool
+	ClientIPHeader  string
+	Flood           *flood.Limiter
 	MaxRequestBytes int64
 	ManifestWindow  time.Duration
 	HTTPClient      *http.Client
@@ -249,6 +258,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if path == completionPath && s.settings.DirectClients {
+		// Browsers and tools call the machine directly: the same CORS the platform's edge offers.
+		h := w.Header()
+		h.Set("Access-Control-Allow-Origin", "*")
+		h.Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, X-Lebrel-Model, Ehbp-Encapsulated-Key")
+		h.Set("Access-Control-Expose-Headers", "X-Request-ID, Proof-Of-Edition-Receipt, X-Lebrel-Upstream, X-Lebrel-Verification, Retry-After")
+		h.Set("Access-Control-Max-Age", "86400")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
 	switch {
 	case path == completionPath && r.Header.Get("Ehbp-Encapsulated-Key") != "":
 		s.handleEncryptedCompletion(w, r, scoped)
@@ -288,6 +310,42 @@ func (s *Server) validEdge(r *http.Request) bool {
 	}
 	received := strings.TrimPrefix(r.Header.Get(edgeAuthorizationHeader), "v1=")
 	return len(received) == len(s.edgeToken) && hmac.Equal([]byte(received), []byte(s.edgeToken))
+}
+
+// admit lets a completion through on the edge's word, or, for direct clients, on the flood ceiling of
+// the client's address; the key itself is checked by the handler. It writes the refusal itself.
+func (s *Server) admit(w http.ResponseWriter, r *http.Request) bool {
+	if s.validEdge(r) {
+		return true
+	}
+	if !s.settings.DirectClients {
+		s.writeError(w, http.StatusUnauthorized, "edge_unauthorized", "missing edge authorization")
+		return false
+	}
+	if !s.settings.Flood.Allow(s.clientIP(r)) {
+		w.Header().Set("Retry-After", "1")
+		s.writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "too many requests from this address")
+		return false
+	}
+	return true
+}
+
+// clientIP is the address a direct client's flood ceiling counts: the ingress header when one is
+// trusted, else the connection's own address.
+func (s *Server) clientIP(r *http.Request) string {
+	if s.settings.ClientIPHeader != "" {
+		if value := r.Header.Get(s.settings.ClientIPHeader); value != "" {
+			first, _, _ := strings.Cut(value, ",")
+			if first = strings.TrimSpace(first); first != "" {
+				return first
+			}
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func newRequestID() string {
@@ -553,8 +611,7 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 	defer s.active.Add(-1)
 	requestID := newRequestID()
 	s.privacyHeaders(w, requestID)
-	if !s.validEdge(r) {
-		s.writeError(w, http.StatusUnauthorized, "edge_unauthorized", "missing edge authorization")
+	if !s.admit(w, r) {
 		return
 	}
 	if r.Method != http.MethodPost {
