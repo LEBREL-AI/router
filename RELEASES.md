@@ -5,6 +5,8 @@ check that the running machine is this code:
 
 | Version | Git tag | Image digest | dstack compose hash | Receipt key id | Since |
 |---|---|---|---|---|---|
+| 1.3.7 (attested endpoint, instance A) | `v1.3.7` | `sha256:ad3f533f0b7fd67b8df9cbf407a9cfb54c90f10c67fa8bd9a01c458bec52bd35` (`deploy/dstack/docker-compose.attested.yml`: TLS ends in the router, Let's Encrypt in-process, attested.lebrel.ai and router-tee.lebrel.ai; no dstack-ingress) | `15bd7be7b090da7b83859cfbe8f3277cf05cc67c1cf249486801159222939e54` | receipt key id `721568bba8eb1424b02aef6134572c6f928deec3f967e42dc49633a3ca39f159`, public key `5b10c282dba4d68171cc2c629a8e277654cf0f4819e944e6dc3cd46faaa175a5` | 6 Nov 2026 08:20 UTC |
+| 1.3.7 | `v1.3.7` | `sha256:ad3f533f0b7fd67b8df9cbf407a9cfb54c90f10c67fa8bd9a01c458bec52bd35` (linux/amd64, Go 1.26, BuildKit v0.27.1, OCI media types; two builds identical) | `2ba084cd6a4bb044e6a03a4d2a7902bb7ae7b88a52e4ff707fd9681a63b7b663` (gateway compose, replica B) | receipt key id `95f8e35094b2aea22ceb3ff27a123871ef7092b2bdcf216e54527eaf9b649a82`, public key `dca6c014ee3f32c82f4a1fec440e66effd130de5b65808a7e54ec980b018e3b3` | 6 Nov 2026 08:20 UTC |
 | 1.3.6 (custom domain, instance A) | `v1.3.6` | `sha256:d3725f05e6017caee09adeb431c2b2e3d70b010c92cfc99f8bb4c55bd26c8b54` + dstack-ingress 2.2 (`deploy/dstack/docker-compose.custom-domain.yml`, router-tee.lebrel.ai) | `aa4f6387441feb40048718db273a58ab4c0457d8832580fbaff0470d9f44d835` | receipt key id `5ea853292f89ef2fa181fbff6c978b979c855c9a5ecbe2201bfb4d0478847872`, public key `832c4891654af084f2366d7156bc2bb3141fc0270920dbfd160d4d317612bec2` (an app key derived inside the VM); the request-encryption key is born at random inside the VM per boot and per UTC day and named only by the attestation | 2026-11-06 |
 | 1.3.6 | `v1.3.6` | `sha256:d3725f05e6017caee09adeb431c2b2e3d70b010c92cfc99f8bb4c55bd26c8b54` (linux/amd64, Go 1.26, BuildKit v0.27.1, OCI media types; two builds identical) | `380bf44b9121927380ff25aa63ae0b787dfdce171de69e830ae4ccf4878205c5` (gateway compose, replica B) | receipt key id `1376e5c9a109529b7d8c9629ea315e989847849f73a7753597feac6860ca5fe3`, public key `147f868cadcf9e37f89dfe6d8f1e4680298a6c78963f0bc24f14cf511bbd7b16` (an app key derived inside the VM); encryption key random per boot and per day, see the attestation | 2026-11-06 |
 | 1.3.5 (custom domain, instance A) | `v1.3.5` | `sha256:b31316b3d211ded8cf320a87f8c02334f787cd0b9113560274e98eeb8800345a` + dstack-ingress 2.2 (`deploy/dstack/docker-compose.custom-domain.yml`, router-tee.lebrel.ai) | `675613867a396b1a453c8d6315b48b343fc57aa41ee4693a701075bb8a65b58a` | receipt key id `806321d5e59607ff6bb488b2bd5a52efe5d30cedafa6968bd55dfbe328fcc63f`, public key `658837f206f46d81e5a2b519cbae60c149916da933a1197523fe11f74bf4b8b6` (an app key derived inside the VM); the request-encryption key is born at random inside the VM per boot and per UTC day and named only by the attestation | 2026-11-05 |
@@ -76,6 +78,18 @@ says with `attested: true` when its signer runs inside an attested VM, and a dat
 more. The API key is checked before an encrypted body is read, an encapsulation is remembered under
 its account (4,096 live entries each, 50 hours, longer than a key's life) and forgotten again when
 the request is refused before credit is reserved.
+
+**Incident, 6 Nov 2026.** Phala Cloud reported that an exploit on its platform earlier that day may have
+leaked the root key of the app these two instances belong to. The receipt keys of the rows 1.1.0 to 1.3.6
+are therefore not to be trusted for anything signed after 6 Nov 2026 02:00 UTC; the control and edge
+secrets were rotated the same morning. The 1.3.7 rows above were deployed in place on the same app, so
+their keys are still derived under that app: the move to Phala's replacement KMS (new instances, new
+app id) follows and gets its own rows.
+
+`router-tee.lebrel.ai` carries a CAA record written by the retired dstack-ingress (Let's Encrypt, DNS-01,
+one ACME account), so the router in-process cannot obtain that name's certificate until the record is
+removed; the platform's edge reaches instance A as `attested.lebrel.ai` meanwhile, and that name is the
+one every client is told.
 
 From 1.3.3 an encrypted request also carries the moment it was sent, inside the ciphertext
 (`"lebrel_sent_at":<unix seconds>,` right after the salt, or first; required): a request older or
