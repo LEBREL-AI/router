@@ -95,6 +95,7 @@
           "dialect": "alibaba",
           "reasoning_efforts": [
             "low",
+            "medium",
             "high",
             "max"
           ],
@@ -228,9 +229,7 @@
           "dialect": "alibaba",
           "reasoning_efforts": [
             "low",
-            "medium",
             "high",
-            "xhigh",
             "max"
           ],
           "timeout_seconds": 90,
@@ -279,10 +278,12 @@
           "usage_format": "openai",
           "dialect": "alibaba",
           "reasoning_efforts": [
+            "low",
+            "high",
             "max"
           ],
           "timeout_seconds": 90,
-          "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy. Model Studio offers this model at its full reasoning effort only; a lower reasoning_effort applies when Moonshot AI serves."
+          "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
         },
         {
           "name": "moonshot/api",
@@ -314,7 +315,7 @@
       "level": 2,
       "family": "qwen3.8-max",
       "claimed_revision": "qwen/qwen3.8-max-0902",
-      "data_note": "Relayed by Lebrel's router, which keeps nothing, to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): Alibaba sees the request, not you, and keeps its own retention policy. If Model Studio cannot answer directly, the request reaches it through OpenRouter, which forwards it without storing it. The receipt names which served. This endpoint always reasons: reasoning tokens are billed as output, and a client asking for no reasoning gets the lowest effort. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
+      "data_note": "Relayed by Lebrel's router, which keeps nothing, to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): Alibaba sees the request, not you, and keeps its own retention policy. If Model Studio cannot answer directly, the request reaches it through OpenRouter, which forwards it without storing it. The receipt names which served. Reasoning tokens are billed as output. Served by Model Studio, reasoning follows your switch (enable_thinking: false turns it off); served through OpenRouter, this endpoint always reasons and a client asking for none gets the lowest effort. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
           "name": "alibaba/model-studio",
@@ -325,14 +326,15 @@
           "priority": 1,
           "usage_format": "openai",
           "dialect": "alibaba",
-          "reasoning_fixed": true,
           "reasoning_efforts": [
+            "none",
             "low",
             "medium",
+            "high",
             "xhigh"
           ],
           "timeout_seconds": 90,
-          "data_note": "Served by Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy. This endpoint always reasons (a client asking for none gets the lowest effort; reasoning_effort sets it)."
+          "data_note": "Served by Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy. Reasoning follows your switch (enable_thinking, as Alibaba documents) and reasoning_effort sets its depth."
         },
         {
           "name": "openrouter/alibaba",
@@ -393,6 +395,7 @@
             "none",
             "low",
             "medium",
+            "high",
             "xhigh"
           ],
           "timeout_seconds": 90,

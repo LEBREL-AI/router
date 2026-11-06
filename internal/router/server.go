@@ -1341,8 +1341,10 @@ func translateDialect(payload map[string]any, dialect string, reasoningFixed boo
 // OpenRouter's `reasoning: {"enabled"}` are mapped onto it, and the keys the host does not take
 // (`thinking`, `reasoning`) are dropped so the request is not refused. `reasoning_effort` goes
 // through: Model Studio takes it for DeepSeek, GLM, Kimi and Qwen, each with its own values and an
-// error for any other, so a value outside the endpoint's list (efforts, lowest first) is dropped and
-// the host's default effort applies rather than the request failing. A host that always reasons
+// error for any other (measured 6 Nov 2026), so a value outside the endpoint's list (efforts,
+// lowest first) is dropped and the host's default effort applies rather than the request failing.
+// With the switch off no effort travels: Qwen refuses any effort but "none" beside
+// `enable_thinking: false`, and the others ignore it. A host that always reasons
 // (`reasoning_fixed`) gets no switch; a client asking it for no reasoning gets the lowest effort
 // the endpoint takes, unless the client named one.
 func translateAlibaba(payload map[string]any, reasoningFixed bool, efforts []string) {
@@ -1382,6 +1384,9 @@ func translateAlibaba(payload map[string]any, reasoningFixed bool, efforts []str
 	}
 	if !reasoningFixed {
 		payload["enable_thinking"] = *enabled
+		if !*enabled {
+			delete(payload, "reasoning_effort")
+		}
 		return
 	}
 	if _, named := payload["reasoning_effort"]; !*enabled && !named && len(efforts) > 0 {
