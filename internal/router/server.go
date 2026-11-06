@@ -165,6 +165,8 @@ type Server struct {
 	// alerts throttles the operator's alerts per subject (a route's fallbacks, a route's outage)
 	alertMu sync.Mutex
 	alerts  map[string]alertState
+	// editions holds each edition route's verified encryption key (edition.go)
+	editions editionKeys
 }
 
 type cachedManifest struct {
@@ -241,6 +243,12 @@ func New(settings Settings) (*Server, error) {
 	server.cutCtx, server.cutAll = context.WithCancel(context.Background())
 	for i := range settings.Routes.Routes {
 		route := &settings.Routes.Routes[i]
+		if route.Kind == routeKindEdition {
+			// billed by the edge, no contract of the router's own
+			server.routes[route.ModelID] = route
+			server.slugs[route.Slug()] = route
+			continue
+		}
 		hash, err := route.BillingContractHash()
 		if err != nil {
 			return nil, fmt.Errorf("route %q: %w", route.ModelID, err)
@@ -317,7 +325,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if path == completionPath && s.settings.DirectClients {
+	_, _, formatted := formatPath(path)
+	if (path == completionPath || formatted) && s.settings.DirectClients {
 		// Browsers and tools call the machine directly: the same CORS the platform's edge offers.
 		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", "*")
@@ -330,6 +339,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+	}
+	if format, count, ok := formatPath(path); ok {
+		s.handleFormatted(w, r, scoped, format, count)
+		return
 	}
 	switch {
 	case path == completionPath && r.Header.Get("Ehbp-Encapsulated-Key") != "":
@@ -537,7 +550,9 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request, scoped *Rou
 		response["models"] = ids
 		hashes := make(map[string]string, len(ids))
 		for _, id := range ids {
-			hashes[id] = s.hashes[id]
+			if hash, billed := s.hashes[id]; billed {
+				hashes[id] = hash
+			}
 		}
 		response["billingContractHashes"] = hashes
 	}
@@ -601,10 +616,17 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request, scoped *
 	}
 	routes := []*Route{}
 	if scoped != nil {
+		if scoped.Kind == routeKindEdition {
+			// the edition's serving manifest is the runtime's, published at the edge
+			s.editionDocument(w, r, scoped, "/.well-known/proof-of-edition", "manifest_not_found")
+			return
+		}
 		routes = append(routes, scoped)
 	} else {
 		for _, route := range s.routes {
-			routes = append(routes, route)
+			if route.Kind != routeKindEdition {
+				routes = append(routes, route)
+			}
 		}
 		sort.Slice(routes, func(a, b int) bool { return routes[a].ModelID < routes[b].ModelID })
 	}
@@ -646,6 +668,11 @@ func (s *Server) handleReceipt(w http.ResponseWriter, r *http.Request, id string
 		document, ok = s.receiptFromPeers(r.Context(), id)
 	}
 	if !ok {
+		if edition := s.editionRoute(); edition != nil && !strings.HasPrefix(id, "req_") {
+			// an edition's receipt is the runtime's, filed at the edge under the id the router sent along
+			s.editionDocument(w, r, edition, "/v1/receipts/"+id, "receipt_not_found")
+			return
+		}
 		s.writeError(w, http.StatusNotFound, "receipt_not_found", "no receipt for that request id (receipts expire)")
 		return
 	}
@@ -734,6 +761,13 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request, scoped *Ro
 	}
 	data := make([]map[string]any, 0, len(routes))
 	for _, route := range routes {
+		if route.Kind == routeKindEdition {
+			data = append(data, map[string]any{
+				"id": route.ModelID, "object": "model", "owned_by": "lebrel",
+				"lebrel": map[string]any{"kind": routeKindEdition, "display_name": route.DisplayName, "base_model": route.BaseModel, "data_note": route.DataNote},
+			})
+			continue
+		}
 		upstreams := make([]map[string]any, 0, len(route.Upstreams))
 		for _, u := range route.Upstreams {
 			status := s.settings.Verification.ForRoute(u.Name, route.ModelID)
@@ -825,6 +859,11 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 	route, ok := s.routes[peek.Model]
 	if !ok || (scoped != nil && scoped != route) {
 		s.writeError(w, http.StatusNotFound, "model_not_found", "unknown model")
+		return
+	}
+	if route.Kind == routeKindEdition {
+		// an edition: encrypted here to its runtime and sent to the edge, which bills it
+		s.handleEditionCompletion(ctx, w, r, route, original, requestID)
 		return
 	}
 	normalized, info, err := meter.InspectAndRequireUsage(completionPath, original, route.DefaultMaxOutputTokens, route.MaxOutputTokens)
