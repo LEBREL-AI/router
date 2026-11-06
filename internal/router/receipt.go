@@ -107,7 +107,8 @@ func ManifestIdentity(payload map[string]any) (string, error) {
 func (s *Signer) RouteManifest(route Route, boardURL string, now time.Time, window time.Duration, attested bool) (SignedDocument, string, error) {
 	upstreams := make([]any, 0, len(route.Upstreams))
 	for _, u := range route.Upstreams {
-		upstreams = append(upstreams, map[string]any{"name": u.Name, "base_url": u.BaseURL, "model": u.Model, "data_note": u.DataNote})
+		// the endpoint the requests go to, which may come from the environment, never the placeholder
+		upstreams = append(upstreams, map[string]any{"name": u.Name, "base_url": u.Endpoint(), "model": u.Model, "data_note": u.DataNote})
 	}
 	hash, err := route.BillingContractHash()
 	if err != nil {

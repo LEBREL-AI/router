@@ -6,17 +6,20 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -252,11 +255,29 @@ func run(logger *log.Logger) error {
 		}
 	}
 	// Direct clients: the machine terminates TLS itself (TLS_CERT_FILE/TLS_KEY_FILE, or an ingress in
-	// the same VM) and serves ordinary API clients without the platform's edge in front. Limits stay
-	// by key and by account; nothing is capped by address.
+	// the same VM) and serves ordinary API clients without the platform's edge in front, under the
+	// names DIRECT_HOSTS lists. Limits stay by key and by account; nothing is capped by address. The
+	// client's address (the control plane counts wrong keys by it) is the connection's, or the last
+	// entry of CLIENT_IP_HEADER when the connection comes from CLIENT_IP_HEADER_FROM (the ingress).
 	directClients := strings.EqualFold(strings.TrimSpace(env("DIRECT_CLIENTS", "false")), "true")
+	directHosts := listed(env("DIRECT_HOSTS", ""), strings.ToLower)
+	clientIPHeader := strings.TrimSpace(env("CLIENT_IP_HEADER", ""))
+	trustedIngress, err := prefixes(env("CLIENT_IP_HEADER_FROM", ""))
+	if err != nil {
+		return err
+	}
+	if (clientIPHeader == "") != (len(trustedIngress) == 0) {
+		return errors.New("CLIENT_IP_HEADER and CLIENT_IP_HEADER_FROM (the addresses of the ingress that sets it) go together")
+	}
 	if directClients {
-		logger.Printf("direct clients: on (client address for the wrong-key throttle from %q)", env("CLIENT_IP_HEADER", "connection"))
+		if production && len(directHosts) == 0 {
+			return errors.New("DIRECT_CLIENTS in production needs DIRECT_HOSTS: the names clients call this machine by")
+		}
+		from := "the connection"
+		if clientIPHeader != "" {
+			from = fmt.Sprintf("header %q when the connection comes from %v", clientIPHeader, trustedIngress)
+		}
+		logger.Printf("direct clients: on hosts=%v client address from %s", directHosts, from)
 	}
 	server, err := router.New(router.Settings{
 		Routes: routes, Auth: authenticator, Ledger: ledgerImpl, Signer: signer, Settlements: settlements,
@@ -264,7 +285,8 @@ func run(logger *log.Logger) error {
 		HealthToken: strings.TrimSpace(env("HEALTH_TOKEN", "")),
 		Receipts:    router.NewReceiptStore(24*time.Hour, 100_000), Verification: verification,
 		BoardURL: env("BOARD_URL", ""), EdgeProxySecret: env("EDGE_PROXY_SECRET", ""), MaxRequestBytes: maxBytes, Logger: logger,
-		DirectClients: directClients, ClientIPHeader: strings.TrimSpace(env("CLIENT_IP_HEADER", "")),
+		DirectClients: directClients, DirectHosts: directHosts, ClientIPHeader: clientIPHeader, TrustedIngress: trustedIngress,
+		Alert:    notifier.Notify,
 		Attester: attester, KeySource: keySource, Encryption: encryption,
 	})
 	if err != nil {
@@ -276,11 +298,18 @@ func run(logger *log.Logger) error {
 	if (certFile == "") != (keyFile == "") {
 		return errors.New("TLS_CERT_FILE and TLS_KEY_FILE go together")
 	}
+	if certFile != "" {
+		certs := &certificates{certFile: certFile, keyFile: keyFile, logger: logger}
+		if _, err := certs.get(nil); err != nil {
+			return fmt.Errorf("TLS_CERT_FILE/TLS_KEY_FILE: %w", err)
+		}
+		httpServer.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: certs.get}
+	}
 	go func() {
 		if certFile != "" {
 			// The TLS connection ends in this process: nothing between the client and the measured machine reads it.
 			logger.Printf("listening on %s with TLS routes=%d", httpServer.Addr, len(routes.Routes))
-			errs <- httpServer.ListenAndServeTLS(certFile, keyFile)
+			errs <- httpServer.ListenAndServeTLS("", "")
 			return
 		}
 		logger.Printf("listening on %s routes=%d", httpServer.Addr, len(routes.Routes))
@@ -362,6 +391,74 @@ func cutText(reservations []string, waited time.Duration, early bool) string {
 	}
 	return fmt.Sprintf("al apagar quedaban %d respuestas en curso %s: las corté y cada una se cobra por lo que ya se había enviado (estimado), nunca por el máximo reservado. Reservas: %s%s.",
 		len(reservations), when, strings.Join(listed, ", "), more)
+}
+
+// listed splits a comma-separated setting into its entries, trimmed and normalised, empties dropped.
+func listed(spec string, normalise func(string) string) []string {
+	var entries []string
+	for _, entry := range strings.Split(spec, ",") {
+		if entry = normalise(strings.TrimSpace(entry)); entry != "" {
+			entries = append(entries, entry)
+		}
+	}
+	return entries
+}
+
+// prefixes reads a comma-separated list of addresses or CIDRs; a bare address is its own prefix.
+func prefixes(spec string) ([]netip.Prefix, error) {
+	var result []netip.Prefix
+	for _, entry := range listed(spec, func(s string) string { return s }) {
+		prefix, err := netip.ParsePrefix(entry)
+		if err != nil {
+			addr, err := netip.ParseAddr(entry)
+			if err != nil {
+				return nil, fmt.Errorf("CLIENT_IP_HEADER_FROM: %q is neither an address nor a CIDR", entry)
+			}
+			prefix = netip.PrefixFrom(addr, addr.BitLen())
+		}
+		result = append(result, prefix.Masked())
+	}
+	return result, nil
+}
+
+// certificates serves TLS_CERT_FILE/TLS_KEY_FILE and reads them again when the certificate file
+// changes (a renewal), looking at most once a minute, so a renewed certificate needs no restart.
+// A pair that fails to load after a change is logged and the previous one kept.
+type certificates struct {
+	certFile, keyFile string
+	logger            *log.Logger
+	mu                sync.Mutex
+	loaded            *tls.Certificate
+	modTime           time.Time
+	checked           time.Time
+}
+
+func (c *certificates) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	if c.loaded == nil || now.Sub(c.checked) >= time.Minute {
+		c.checked = now
+		info, err := os.Stat(c.certFile)
+		if err != nil && c.loaded == nil {
+			return nil, err
+		}
+		if err == nil && (c.loaded == nil || !info.ModTime().Equal(c.modTime)) {
+			pair, err := tls.LoadX509KeyPair(c.certFile, c.keyFile)
+			switch {
+			case err != nil && c.loaded == nil:
+				return nil, err
+			case err != nil:
+				c.logger.Printf("tls: the changed certificate could not be loaded, keeping the previous one: %v", err)
+			default:
+				if c.loaded != nil {
+					c.logger.Printf("tls: certificate reloaded from %s", c.certFile)
+				}
+				c.loaded, c.modTime = &pair, info.ModTime()
+			}
+		}
+	}
+	return c.loaded, nil
 }
 
 // positive reads a whole number setting above zero, or its default when unset.
