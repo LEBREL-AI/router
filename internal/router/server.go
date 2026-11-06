@@ -313,6 +313,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		scoped = route
 		path = "/" + tail
 	}
+	// A tool that adds /v1 to a base URL that already ends in it: the doubled prefix is one.
+	if strings.HasPrefix(path, "/v1/v1/") {
+		path = strings.TrimPrefix(path, "/v1")
+	}
 	if publicDocumentPath(path) {
 		// Manifests, receipts and the listing are public documents: browsers verify them at lebrel.ai/verify.
 		h := w.Header()

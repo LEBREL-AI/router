@@ -387,7 +387,9 @@ func (s *Server) handleEditionCompletion(ctx context.Context, w http.ResponseWri
 				w.Header().Set(name, value)
 			}
 		}
+		// One id for the answer and its receipt, whichever header a client reads.
 		w.Header().Set(editionRequestIDHeader, editionRequestID)
+		w.Header().Set("X-Request-ID", editionRequestID)
 		w.Header().Set("Content-Type", contentTypeOr(response, accept))
 		w.Header().Set("X-Lebrel-Encryption", "router-to-runtime")
 		w.WriteHeader(response.StatusCode)
