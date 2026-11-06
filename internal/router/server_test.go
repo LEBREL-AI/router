@@ -963,7 +963,7 @@ func TestDirectClientsAreAdmittedWithoutTheEdgeAndNeverCappedByAddress(t *testin
 	h := newHarnessWith(t, routeFor(upstream("deepseek/api", up.server.URL, 1)), board, func(s *Settings) {
 		s.EdgeProxySecret = "edge-secret"
 		s.DirectClients = true
-		s.DirectHosts = []string{"attested.lebrel.ai"}
+		s.DirectHosts = []string{"ATTESTED.lebrel.ai:443"} // normalised like the request's name
 		s.ClientAddress = "header"
 		s.ClientIPHeader = "X-Real-IP"
 		s.TrustedIngress = []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}
@@ -1156,6 +1156,66 @@ func TestALastUpstreamThatFailsIsAnOutageNotAFallback(t *testing.T) {
 	defer mu.Unlock()
 	if len(alerts) != 1 || !strings.Contains(alerts[0], "ningún proveedor") || !strings.Contains(alerts[0], "alibaba/model-studio (HTTP 503) y deepseek/api (HTTP 502)") {
 		t.Fatalf("an outage naming both attempts, never a fallback, got %q", alerts)
+	}
+}
+
+func TestWhereTLSEndsInTheRouterDirectClientsComeOverTLSOnly(t *testing.T) {
+	up := newFakeUpstream(t, okJSON(`{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15,"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":8}`))
+	body := `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi there"}],"temperature":0}`
+	h := newHarnessWith(t, routeFor(upstream("deepseek/api", up.server.URL, 1)), board, func(s *Settings) {
+		s.EdgeProxySecret = "edge-secret"
+		s.DirectClients = true
+		s.DirectHosts = []string{"attested.lebrel.ai"}
+		s.DirectOnlyTLS = true
+	})
+	secure := httptest.NewUnstartedServer(h.server.Config.Handler)
+	secure.StartTLS()
+	t.Cleanup(secure.Close)
+	call := func(base string, client *http.Client) *http.Response {
+		t.Helper()
+		request, _ := http.NewRequest(http.MethodPost, base+"/v1/chat/completions", strings.NewReader(body))
+		request.Host = "attested.lebrel.ai"
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+testKey)
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	if response := call(h.server.URL, http.DefaultClient); response.StatusCode != http.StatusMisdirectedRequest {
+		t.Fatalf("the published name over plaintext must be misdirected, got %d", response.StatusCode)
+	}
+	response := call(secure.URL, secure.Client())
+	raw, _ := io.ReadAll(response.Body)
+	if response.StatusCode != 200 {
+		t.Fatalf("over the TLS listener: %d %s", response.StatusCode, raw)
+	}
+}
+
+func TestCustomersLeavingUnansweredAfterALongWaitAlertTheOperator(t *testing.T) {
+	slow := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() })
+	var mu sync.Mutex
+	var alerts []string
+	h := newHarnessWith(t, routeFor(upstream("alibaba/model-studio", slow.server.URL, 1)), board, func(s *Settings) {
+		s.Alert = func(text string) { mu.Lock(); alerts = append(alerts, text); mu.Unlock() }
+		s.AbandonAfter = 100 * time.Millisecond
+	})
+	body := `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi there"}],"temperature":0}`
+	for i := 0; i < 2; i++ {
+		request, _ := http.NewRequest(http.MethodPost, h.server.URL+"/v1/chat/completions", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+testKey)
+		impatient := &http.Client{Timeout: 400 * time.Millisecond}
+		if _, err := impatient.Do(request); err == nil {
+			t.Fatal("the customer must have given up")
+		}
+	}
+	time.Sleep(500 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(alerts) != 1 || !strings.Contains(alerts[0], "se fueron sin respuesta") {
+		t.Fatalf("one alert for customers leaving unanswered, got %q", alerts)
 	}
 }
 

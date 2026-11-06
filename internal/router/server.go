@@ -44,6 +44,7 @@ const (
 	defaultManifestWindow   = time.Hour
 	defaultAcceptTimeout    = 3 * time.Second
 	defaultAlertAge         = 5 * time.Second
+	defaultAbandonAfter     = 10 * time.Second
 	peerReceiptTimeout      = 2 * time.Second
 	userAgent               = "lebrel-router/0.1"
 	receiptHeader           = "Proof-Of-Edition-Receipt"
@@ -114,13 +115,20 @@ type Settings struct {
 	// from its last entry, the one that ingress wrote), or "none" (an ingress or a provider's gateway
 	// hides it, as dstack's TCP ingress behind Phala's gateway does: no address is told, and wrong
 	// keys are counted for nobody rather than for every client at once). "" is "none".
-	DirectClients  bool
-	DirectHosts    []string
+	DirectClients bool
+	DirectHosts   []string
+	// DirectOnlyTLS refuses a direct client that did not come over this process's own TLS listener
+	// (a plaintext call under a published name, through a gateway that ended TLS elsewhere): where
+	// TLS ends here, that is the guarantee a direct client is given.
+	DirectOnlyTLS  bool
 	ClientAddress  string
 	ClientIPHeader string
 	TrustedIngress []netip.Prefix
-	// Alert hands the operator an alert (the notifier's Notify); nil only logs.
+	// Alert hands the operator an alert (the notifier's Notify); nil only logs. AbandonAfter is how
+	// long a customer must have waited for the first upstream's answer before their leaving counts
+	// as a route in trouble (default 10 s): many of those are an outage no upstream error shows.
 	Alert           func(string)
+	AbandonAfter    time.Duration
 	MaxRequestBytes int64
 	ManifestWindow  time.Duration
 	HTTPClient      *http.Client
@@ -192,6 +200,9 @@ func New(settings Settings) (*Server, error) {
 	}
 	if settings.AlertAge <= 0 {
 		settings.AlertAge = defaultAlertAge
+	}
+	if settings.AbandonAfter <= 0 {
+		settings.AbandonAfter = defaultAbandonAfter
 	}
 	if settings.PeerClient == nil {
 		settings.PeerClient = &http.Client{Timeout: peerReceiptTimeout, Transport: &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 8, IdleConnTimeout: 90 * time.Second},
@@ -404,7 +415,17 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) bool {
 		s.writeError(w, http.StatusMisdirectedRequest, "misdirected_request", "this name does not serve API clients directly")
 		return false
 	}
+	if s.settings.DirectOnlyTLS && r.TLS == nil {
+		// the published name on a plaintext connection (a gateway ended TLS elsewhere): not the connection promised
+		s.writeError(w, http.StatusMisdirectedRequest, "misdirected_request", "API clients are served over this machine's own TLS listener")
+		return false
+	}
 	return true
+}
+
+// DirectOnlyTLS sets whether direct clients are served over this process's TLS listener only.
+func (s *Server) DirectOnlyTLS(only bool) {
+	s.settings.DirectOnlyTLS = only
 }
 
 // normaliseHost is a host name as compared: without a port, brackets, a trailing dot or case.
@@ -871,6 +892,7 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 	}
 	defer settle(0, model.Usage{}, model.SettlementUpstreamRejected)
 
+	waitingSince := time.Now()
 	result, lastErr := s.callUpstreams(ctx, route, normalized, requestID, r.Header.Get("Accept"))
 	if result == nil {
 		settle(0, model.Usage{}, model.SettlementUpstreamRejected)
@@ -886,6 +908,10 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 		if ctx.Err() == nil {
 			// the customer is still there and gets a 502; a customer who hung up is no outage
 			s.noteOutage(route, lastErr)
+		} else if time.Since(waitingSince) >= s.settings.AbandonAfter {
+			// the customer left after a long wait with no upstream answering: many of those are an
+			// outage the outage alert never sees (every customer leaves before the upstream's time)
+			s.noteAbandoned(route)
 		}
 		s.writeError(w, http.StatusBadGateway, "upstream_unavailable", "no upstream could serve the request")
 		return
@@ -1220,6 +1246,14 @@ func (s *Server) noteFallback(route *Route, upstream *Upstream, skipped []string
 	s.alertThrottled("fallback:"+route.ModelID, func(count int) string {
 		return fmt.Sprintf("%s: falló %s y respondió el respaldo %s. %d respuestas por respaldo en esta ruta desde el último aviso (avisa como mucho cada 10 min): cuesta más que el camino principal. 👉 Mira el proveedor principal si sigue.",
 			route.Name(), strings.Join(skipped, " y "), upstream.Name, count)
+	})
+}
+
+// noteAbandoned records a customer who left after waiting AbandonAfter with no upstream answering.
+func (s *Server) noteAbandoned(route *Route) {
+	s.alertThrottled("abandoned:"+route.ModelID, func(count int) string {
+		return fmt.Sprintf("%s: %d clientes se fueron sin respuesta tras esperar más de %s sin que ningún proveedor contestara, desde el último aviso (avisa como mucho cada 10 min). 👉 Mira los proveedores de la ruta.",
+			route.Name(), count, s.settings.AbandonAfter.Round(time.Second))
 	})
 }
 

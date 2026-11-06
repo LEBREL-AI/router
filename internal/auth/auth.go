@@ -149,6 +149,7 @@ type RemoteAuthenticator struct {
 	// next look.
 	mu      sync.Mutex
 	refused map[string]time.Time
+	swept   time.Time
 }
 
 func NewRemoteAuthenticator(client controlplane.JSONClient) *RemoteAuthenticator {
@@ -174,9 +175,14 @@ func (a *RemoteAuthenticator) remember(hash string) {
 	defer a.mu.Unlock()
 	now := a.now()
 	if len(a.refused) >= refusedMax {
-		for key, until := range a.refused {
-			if now.After(until) {
-				delete(a.refused, key)
+		// full: the expired entries go, at most once a second (a flood of distinct wrong keys would
+		// otherwise walk the whole map under the lock on every refusal), else this one is not kept
+		if now.Sub(a.swept) >= time.Second {
+			a.swept = now
+			for key, until := range a.refused {
+				if now.After(until) {
+					delete(a.refused, key)
+				}
 			}
 		}
 		if len(a.refused) >= refusedMax {
