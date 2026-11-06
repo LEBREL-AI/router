@@ -137,8 +137,9 @@ upstream has `timeout_seconds` (default 90) to answer with headers. The receipt 
 that served. The Alibaba dialect maps every lab's reasoning switch (`thinking: {"type"}`,
 `reasoning: {"enabled"}`, `enable_thinking`) onto `enable_thinking`, forwards `reasoning_effort`
 (or OpenRouter's `reasoning.effort`) within the endpoint's `reasoning_efforts` list (Model Studio
-refuses any other value), and gives a host that always reasons (`reasoning_fixed`) its lowest
-listed effort to a client asking for none. GLM-5.3 Flash stays at Z.ai only. An answer served by
+refuses any other value; the lists are what Model Studio took on 6 November 2026), drops the
+effort when the switch is off (Qwen refuses the pair), and gives a host that always reasons
+(`reasoning_fixed`) its lowest listed effort to a client asking for none. GLM-5.3 Flash stays at Z.ai only. An answer served by
 a fallback, and a request no upstream could serve, alert the operator (`ALERT_WEBHOOK_URL`) at
 most every ten minutes per route, by upstream name and reason.
 Qwen: `qwen/qwen3.8-max` (Alibaba's `qwen3.8-max-0902` snapshot) and `qwen/qwen3.8-flash`, both

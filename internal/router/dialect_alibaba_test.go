@@ -29,6 +29,8 @@ func TestAlibabaDialectMapsEveryReasoningSwitchOntoEnableThinking(t *testing.T) 
 		{"an effort the endpoint does not take is dropped, not refused", map[string]any{"reasoning_effort": "high"}, false, []string{"max"}, false, false, ""},
 		{"an effort the endpoint takes goes through with the switch", map[string]any{"reasoning_effort": "max", "enable_thinking": true}, false, []string{"max"}, true, true, "max"},
 		{"an effort that is not a word is dropped", map[string]any{"reasoning_effort": 3}, false, nil, false, false, ""},
+		{"no effort travels with the switch off", map[string]any{"enable_thinking": false, "reasoning_effort": "low"}, false, []string{"low", "high"}, true, false, ""},
+		{"an effort travels with the switch on", map[string]any{"enable_thinking": true, "reasoning_effort": "high"}, false, []string{"low", "high"}, true, true, "high"},
 		{"a host that always reasons gets no switch", disabled, true, nil, false, false, ""},
 		{"a host that always reasons gives its lowest effort to a client asking for none", disabled, true, []string{"low", "high", "max"}, false, false, "low"},
 		{"unless the client named the effort", map[string]any{"thinking": map[string]any{"type": "disabled"}, "reasoning_effort": "high"}, true, []string{"low", "high", "max"}, false, false, "high"},
