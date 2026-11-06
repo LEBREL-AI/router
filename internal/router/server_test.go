@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"lebrel-router/internal/auth"
-	"lebrel-router/internal/flood"
 	"lebrel-router/internal/ledger"
 	"lebrel-router/internal/meter"
 	"lebrel-router/internal/model"
@@ -920,7 +919,7 @@ func TestAnAnsweredRequestIsDeliveredAndSettledThroughAControlPlaneOutage(t *tes
 	}
 }
 
-func TestDirectClientsAreAdmittedWithoutTheEdgeAndFloodLimitedPerAddress(t *testing.T) {
+func TestDirectClientsAreAdmittedWithoutTheEdgeAndNeverCappedByAddress(t *testing.T) {
 	up := newFakeUpstream(t, okJSON(`{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15,"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":8}`))
 	body := `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi there"}],"temperature":0}`
 	// The edge alone, as deployed behind lebrel.ai: a direct call is refused before anything is read.
@@ -928,13 +927,12 @@ func TestDirectClientsAreAdmittedWithoutTheEdgeAndFloodLimitedPerAddress(t *test
 	if response := closed.post(t, body, testKey); response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("without direct clients a call without the edge header must be 401, got %d", response.StatusCode)
 	}
-	// The attested endpoint: direct clients admitted, two requests a minute per address for the test.
+	// The attested endpoint: direct clients admitted; many calls from one address are just calls (limits are by key).
 	h := newHarnessWith(t, routeFor(upstream("deepseek/api", up.server.URL, 1)), board, func(s *Settings) {
 		s.EdgeProxySecret = "edge-secret"
 		s.DirectClients = true
-		s.Flood = flood.New(2, 2)
 	})
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 12; i++ {
 		response := h.post(t, body, testKey)
 		raw, _ := io.ReadAll(response.Body)
 		if response.StatusCode != 200 {
@@ -944,11 +942,7 @@ func TestDirectClientsAreAdmittedWithoutTheEdgeAndFloodLimitedPerAddress(t *test
 			t.Fatal("direct completions carry CORS for browsers")
 		}
 	}
-	third := h.post(t, body, testKey)
-	if third.StatusCode != http.StatusTooManyRequests || third.Header.Get("Retry-After") == "" {
-		t.Fatalf("the third request at once from the same address must wait: %d", third.StatusCode)
-	}
-	// The platform's edge is never counted against the ceiling.
+	// The platform's edge keeps working through the same server.
 	request, _ := http.NewRequest(http.MethodPost, h.server.URL+"/v1/chat/completions", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+testKey)
@@ -958,7 +952,7 @@ func TestDirectClientsAreAdmittedWithoutTheEdgeAndFloodLimitedPerAddress(t *test
 		t.Fatal(err)
 	}
 	if viaEdge.StatusCode != 200 {
-		t.Fatalf("the edge's own call is admitted regardless: %d", viaEdge.StatusCode)
+		t.Fatalf("the edge's own call: %d", viaEdge.StatusCode)
 	}
 	// A browser's preflight.
 	preflight, _ := http.NewRequest(http.MethodOptions, h.server.URL+"/v1/chat/completions", nil)
@@ -969,9 +963,8 @@ func TestDirectClientsAreAdmittedWithoutTheEdgeAndFloodLimitedPerAddress(t *test
 	if response.StatusCode != http.StatusNoContent || response.Header.Get("Access-Control-Allow-Headers") == "" {
 		t.Fatalf("preflight: %d", response.StatusCode)
 	}
-	// A wrong key is refused by the key check, after the ceiling admitted the address.
-	fresh := newHarnessWith(t, routeFor(upstream("deepseek/api", up.server.URL, 1)), board, func(s *Settings) { s.DirectClients = true; s.Flood = flood.New(60, 10) })
-	if response := fresh.post(t, body, "leb_live_wrong"); response.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("a wrong key is still a wrong key: %d", response.StatusCode)
+	// A wrong key is still a wrong key.
+	if response := h.post(t, body, "leb_live_wrong"); response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("a wrong key is refused: %d", response.StatusCode)
 	}
 }
