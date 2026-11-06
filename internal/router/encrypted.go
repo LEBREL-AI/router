@@ -508,8 +508,7 @@ func (s *Server) handleEncryptedCompletion(w http.ResponseWriter, r *http.Reques
 		s.writeError(w, http.StatusBadRequest, "encryption_unavailable", "this instance does not accept encrypted requests")
 		return
 	}
-	if !s.validEdge(r) {
-		s.writeError(w, http.StatusUnauthorized, "edge_unauthorized", "missing edge authorization")
+	if !s.admit(w, r) {
 		return
 	}
 	if r.Method != http.MethodPost {
