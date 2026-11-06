@@ -59,7 +59,7 @@
           "api_key_env": "DEEPSEEK_API_KEY",
           "priority": 3,
           "usage_format": "deepseek",
-          "data_note": "DeepSeek's own API, reached directly when OpenRouter cannot answer; forwarded as-is (reasoning on by default, effort high)"
+          "data_note": "DeepSeek's own API, reached directly when neither Model Studio nor OpenRouter can answer; forwarded as-is (reasoning on by default, effort high)"
         }
       ],
       "pricing": {
@@ -130,7 +130,7 @@
           "api_key_env": "DEEPSEEK_API_KEY",
           "priority": 3,
           "usage_format": "deepseek",
-          "data_note": "DeepSeek's own API, reached directly when OpenRouter cannot answer; forwarded as-is (reasoning on by default, effort high)"
+          "data_note": "DeepSeek's own API, reached directly when neither Model Studio nor OpenRouter can answer; forwarded as-is (reasoning on by default, effort high)"
         }
       ],
       "pricing": {
@@ -215,7 +215,7 @@
       "level": 2,
       "family": "glm-5.3",
       "claimed_revision": "glm-5.3",
-      "data_note": "Relayed by Lebrel's router, which keeps nothing, to Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the request, not you, and keeps its own retention policy. If Model Studio cannot answer, the request goes to Z.ai's own API, which keeps its own retention policy. The receipt names which served. This model always reasons: reasoning tokens are billed as output. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
+      "data_note": "Relayed by Lebrel's router, which keeps nothing, to Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the request, not you, and keeps its own retention policy. If Model Studio cannot answer, the request goes to Z.ai's own API, which keeps its own retention policy. The receipt names which served. This model always reasons: reasoning tokens are billed as output, and a client asking for no reasoning gets the lowest effort. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
           "name": "alibaba/model-studio",
@@ -282,7 +282,7 @@
             "max"
           ],
           "timeout_seconds": 90,
-          "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
+          "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy. Model Studio offers this model at its full reasoning effort only; a lower reasoning_effort applies when Moonshot AI serves."
         },
         {
           "name": "moonshot/api",
