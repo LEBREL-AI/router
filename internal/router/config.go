@@ -165,8 +165,11 @@ func PricingTier(percent int64) string {
 // (DeepSeek's `thinking`, Alibaba's `enable_thinking`) onto OpenRouter's `reasoning`,
 // so a client of the route keeps writing what the lab documents.
 type Upstream struct {
-	Name        string            `json:"name"`
-	BaseURL     string            `json:"base_url"`
+	Name    string `json:"name"`
+	BaseURL string `json:"base_url"`
+	// BaseURLEnv names an environment variable holding the base URL instead, for an endpoint whose
+	// address carries an account detail (Alibaba's Model Studio puts the workspace id in the host).
+	BaseURLEnv  string            `json:"base_url_env,omitempty"`
 	Model       string            `json:"model"`
 	APIKeyEnv   string            `json:"api_key_env"`
 	Priority    int               `json:"priority"`
@@ -181,6 +184,16 @@ type Upstream struct {
 	ReasoningFixed bool   `json:"reasoning_fixed,omitempty"`
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 	DataNote       string `json:"data_note,omitempty"`
+}
+
+// Endpoint is the base URL the requests go to: the environment's when BaseURLEnv names one, else BaseURL.
+func (u Upstream) Endpoint() string {
+	if u.BaseURLEnv != "" {
+		if value := strings.TrimSpace(os.Getenv(u.BaseURLEnv)); value != "" {
+			return value
+		}
+	}
+	return u.BaseURL
 }
 
 func (u Upstream) APIKey() string {
@@ -285,7 +298,7 @@ func (r *Route) validate() error {
 			return fmt.Errorf("upstream %q: unknown usage_format %q", u.Name, u.UsageFormat)
 		}
 		switch u.Dialect {
-		case "", "openai", "openrouter":
+		case "", "openai", "openrouter", "alibaba":
 		default:
 			return fmt.Errorf("upstream %q: unknown dialect %q", u.Name, u.Dialect)
 		}

@@ -929,7 +929,7 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 		if err != nil {
 			return nil, err
 		}
-		request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(upstream.BaseURL, "/")+"/chat/completions", bytes.NewReader(body))
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(upstream.Endpoint(), "/")+"/chat/completions", bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
@@ -1010,6 +1010,10 @@ func upstreamBody(normalized []byte, upstream *Upstream) ([]byte, error) {
 // lab-native keys are dropped: the relay would ignore them and reason by its own default. Any other
 // dialect leaves the payload as it is.
 func translateDialect(payload map[string]any, dialect string, reasoningFixed bool) {
+	if dialect == "alibaba" {
+		translateAlibaba(payload, reasoningFixed)
+		return
+	}
 	if dialect != "openrouter" {
 		return
 	}
@@ -1038,6 +1042,40 @@ func translateDialect(payload map[string]any, dialect string, reasoningFixed boo
 			return
 		}
 		payload["reasoning"] = map[string]any{"enabled": *enabled}
+	}
+}
+
+// translateAlibaba speaks Model Studio's OpenAI-compatible mode: reasoning is `enable_thinking: bool`
+// (Alibaba's own switch, which Qwen clients already send); DeepSeek's `thinking: {"type"}` and
+// OpenRouter's `reasoning: {"enabled"}` are mapped onto it, and the keys the host does not take
+// (`thinking`, `reasoning`, `reasoning_effort`) are dropped so the request is not refused. A host
+// that always reasons (`reasoning_fixed`) gets no switch at all.
+func translateAlibaba(payload map[string]any, reasoningFixed bool) {
+	var enabled *bool
+	if value, ok := payload["enable_thinking"].(bool); ok {
+		enabled = &value
+	}
+	if thinking, ok := payload["thinking"].(map[string]any); ok && enabled == nil {
+		switch thinking["type"] {
+		case "disabled":
+			value := false
+			enabled = &value
+		case "enabled":
+			value := true
+			enabled = &value
+		}
+	}
+	if reasoning, ok := payload["reasoning"].(map[string]any); ok && enabled == nil {
+		if value, ok := reasoning["enabled"].(bool); ok {
+			enabled = &value
+		}
+	}
+	delete(payload, "thinking")
+	delete(payload, "reasoning")
+	delete(payload, "reasoning_effort")
+	delete(payload, "enable_thinking")
+	if enabled != nil && !reasoningFixed {
+		payload["enable_thinking"] = *enabled
 	}
 }
 

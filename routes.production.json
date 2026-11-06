@@ -10,11 +10,23 @@
       "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to DeepSeek's own API: with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; DeepSeek sees it, not you, and keeps its own retention policy (China). If OpenRouter cannot answer, the request goes to DeepSeek's API directly. Priced by Lebrel's published rates, the same day and night; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
+          "name": "alibaba/model-studio",
+          "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+          "base_url_env": "ALIBABA_MODEL_STUDIO_BASE_URL",
+          "model": "deepseek-v4.1-flash-1017",
+          "api_key_env": "DASHSCOPE_API_KEY",
+          "priority": 1,
+          "usage_format": "openai",
+          "dialect": "alibaba",
+          "timeout_seconds": 90,
+          "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
+        },
+        {
           "name": "openrouter/deepseek",
           "base_url": "https://openrouter.ai/api/v1",
           "model": "deepseek/deepseek-v4.1-flash-1017",
           "api_key_env": "OPENROUTER_API_KEY",
-          "priority": 1,
+          "priority": 2,
           "usage_format": "openai",
           "dialect": "openrouter",
           "headers": {
@@ -36,7 +48,7 @@
           "base_url": "https://api.deepseek.com/v1",
           "model": "deepseek-flash",
           "api_key_env": "DEEPSEEK_API_KEY",
-          "priority": 2,
+          "priority": 3,
           "usage_format": "deepseek",
           "data_note": "DeepSeek's own API, reached directly when OpenRouter cannot answer; forwarded as-is (reasoning on by default, effort high)"
         }
@@ -64,11 +76,23 @@
       "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to DeepSeek's own API: with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; DeepSeek sees it, not you, and keeps its own retention policy (China). If OpenRouter cannot answer, the request goes to DeepSeek's API directly. Priced by Lebrel's published rates; DeepSeek's peak-hour surcharge (weekdays 01-04 and 06-10 UTC, except Chinese public holidays) is passed through and named in the receipt; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
+          "name": "alibaba/model-studio",
+          "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+          "base_url_env": "ALIBABA_MODEL_STUDIO_BASE_URL",
+          "model": "deepseek-v4-pro-0813",
+          "api_key_env": "DASHSCOPE_API_KEY",
+          "priority": 1,
+          "usage_format": "openai",
+          "dialect": "alibaba",
+          "timeout_seconds": 90,
+          "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
+        },
+        {
           "name": "openrouter/deepseek",
           "base_url": "https://openrouter.ai/api/v1",
           "model": "deepseek/deepseek-v4-pro-0813",
           "api_key_env": "OPENROUTER_API_KEY",
-          "priority": 1,
+          "priority": 2,
           "usage_format": "openai",
           "dialect": "openrouter",
           "headers": {
@@ -90,7 +114,7 @@
           "base_url": "https://api.deepseek.com/v1",
           "model": "deepseek-v4-pro",
           "api_key_env": "DEEPSEEK_API_KEY",
-          "priority": 2,
+          "priority": 3,
           "usage_format": "deepseek",
           "data_note": "DeepSeek's own API, reached directly when OpenRouter cannot answer; forwarded as-is (reasoning on by default, effort high)"
         }
@@ -180,11 +204,24 @@
       "data_note": "Relayed by Lebrel's router to Z.ai's own API: with the encrypted client only the router reads the request; Z.ai sees it, not you, and keeps its own retention policy. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
+          "name": "alibaba/model-studio",
+          "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+          "base_url_env": "ALIBABA_MODEL_STUDIO_BASE_URL",
+          "model": "glm-5.3",
+          "api_key_env": "DASHSCOPE_API_KEY",
+          "priority": 1,
+          "usage_format": "openai",
+          "dialect": "alibaba",
+          "timeout_seconds": 90,
+          "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy. This endpoint always reasons: reasoning tokens are billed as output.",
+          "reasoning_fixed": true
+        },
+        {
           "name": "zai/api",
           "base_url": "https://api.z.ai/api/paas/v4",
           "model": "glm-5.3",
           "api_key_env": "ZAI_API_KEY",
-          "priority": 1,
+          "priority": 2,
           "usage_format": "openai",
           "data_note": "Z.ai's own API, forwarded as-is (reasoning always on, effort max by default; clients lower it with reasoning_effort)"
         }
@@ -212,11 +249,23 @@
       "data_note": "Relayed by Lebrel's router to Moonshot AI's own API: with the encrypted client only the router reads the request; Moonshot AI sees it, not you, and keeps its own retention policy. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
+          "name": "alibaba/model-studio",
+          "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+          "base_url_env": "ALIBABA_MODEL_STUDIO_BASE_URL",
+          "model": "kimi-k3",
+          "api_key_env": "DASHSCOPE_API_KEY",
+          "priority": 1,
+          "usage_format": "openai",
+          "dialect": "alibaba",
+          "timeout_seconds": 90,
+          "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
+        },
+        {
           "name": "moonshot/api",
           "base_url": "https://api.moonshot.ai/v1",
           "model": "kimi-k3",
           "api_key_env": "MOONSHOT_API_KEY",
-          "priority": 1,
+          "priority": 2,
           "usage_format": "openai",
           "data_note": "Moonshot AI's own API, forwarded as-is (reasoning always on, effort max by default; clients lower it with reasoning_effort)"
         }
@@ -244,11 +293,23 @@
       "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; Alibaba sees it, not you, and keeps its own retention policy. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee. This endpoint always reasons: reasoning tokens are billed as output, and a client asking for no reasoning gets the lowest effort.",
       "upstreams": [
         {
+          "name": "alibaba/model-studio",
+          "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+          "base_url_env": "ALIBABA_MODEL_STUDIO_BASE_URL",
+          "model": "qwen3.8-max",
+          "api_key_env": "DASHSCOPE_API_KEY",
+          "priority": 1,
+          "usage_format": "openai",
+          "dialect": "alibaba",
+          "timeout_seconds": 90,
+          "data_note": "Served by Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
+        },
+        {
           "name": "openrouter/alibaba",
           "base_url": "https://openrouter.ai/api/v1",
           "model": "qwen/qwen3.8-max-0902",
           "api_key_env": "OPENROUTER_API_KEY",
-          "priority": 1,
+          "priority": 2,
           "usage_format": "openai",
           "dialect": "openrouter",
           "headers": {
@@ -290,11 +351,23 @@
       "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; Alibaba sees it, not you, and keeps its own retention policy. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
+          "name": "alibaba/model-studio",
+          "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+          "base_url_env": "ALIBABA_MODEL_STUDIO_BASE_URL",
+          "model": "qwen3.8-flash",
+          "api_key_env": "DASHSCOPE_API_KEY",
+          "priority": 1,
+          "usage_format": "openai",
+          "dialect": "alibaba",
+          "timeout_seconds": 90,
+          "data_note": "Served by Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
+        },
+        {
           "name": "openrouter/alibaba",
           "base_url": "https://openrouter.ai/api/v1",
           "model": "qwen/qwen3.8-flash",
           "api_key_env": "OPENROUTER_API_KEY",
-          "priority": 1,
+          "priority": 2,
           "usage_format": "openai",
           "dialect": "openrouter",
           "headers": {
