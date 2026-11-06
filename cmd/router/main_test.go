@@ -4,10 +4,28 @@ import (
 	"crypto/tls"
 	"io"
 	"log"
+	"net/netip"
 	"slices"
 	"strings"
 	"testing"
 )
+
+func TestTrustedIngressPrefixesReadAddressesAndCIDRsAndUnmapIPv4(t *testing.T) {
+	got, err := prefixes("127.0.0.1, 10.0.0.0/8,::ffff:192.168.0.0/112, 2001:db8::/32")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32"), netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("192.168.0.0/16"), netip.MustParsePrefix("2001:db8::/32")}
+	if !slices.Equal(got, want) {
+		t.Fatalf("prefixes: got %v, want %v", got, want)
+	}
+	if _, err := prefixes("nonsense"); err == nil {
+		t.Fatal("a word is neither an address nor a CIDR")
+	}
+	if got, err := prefixes(" , "); err != nil || len(got) != 0 {
+		t.Fatalf("an empty list: %v %v", got, err)
+	}
+}
 
 func TestTheTLSListenerTakesOneCertificateSource(t *testing.T) {
 	quiet := log.New(io.Discard, "", 0)

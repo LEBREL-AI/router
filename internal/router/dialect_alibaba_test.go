@@ -69,7 +69,7 @@ func TestAnUpstreamMayTakeItsBaseURLFromTheEnvironment(t *testing.T) {
 	}
 }
 
-func TestAnEndpointFromTheEnvironmentStaysWithinTheServiceAndTheManifestNamesThePublicOne(t *testing.T) {
+func TestAnEndpointFromTheEnvironmentStaysWithinTheServiceAndTheManifestNamesIt(t *testing.T) {
 	route := routeFor(Upstream{Name: "alibaba/model-studio", BaseURL: "https://fallback.example.test/v1", BaseURLEnv: "TEST_BASE_URL", Model: "m", Priority: 1})
 	for _, bad := range []string{
 		"http://ws-123.example.test/compatible-mode/v1",
@@ -101,7 +101,7 @@ func TestAnEndpointFromTheEnvironmentStaysWithinTheServiceAndTheManifestNamesThe
 	if len(upstreams) != 1 {
 		t.Fatalf("upstreams in the manifest: %v", document.Payload["upstreams"])
 	}
-	if got := upstreams[0].(map[string]any)["base_url"]; got != "https://fallback.example.test/v1" {
-		t.Fatalf("the public manifest names the service's public endpoint, never the account's form, got %v", got)
+	if got := upstreams[0].(map[string]any)["base_url"]; got != "https://ws-123.example.test/compatible-mode/v1" {
+		t.Fatalf("the signed manifest names where requests go, got %v", got)
 	}
 }

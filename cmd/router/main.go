@@ -299,18 +299,24 @@ func run(logger *log.Logger) error {
 	// terminate TLS themselves; "off" for none); LISTEN_TLS_ADDR serves TLS ending in this process
 	// when a certificate source is configured: files (TLS_CERT_FILE/TLS_KEY_FILE, re-read when they
 	// change) or Let's Encrypt in-process (TLS_ACME_HOSTS, by the TLS-ALPN-01 challenge answered on
-	// the TLS listener itself: no DNS credential, and no private key outside this process).
+	// the TLS listener itself: no DNS credential, and the keys only in TLS_ACME_CACHE on this machine).
 	tlsConfig, tlsSource, err := tlsSetup(strings.TrimSpace(env("TLS_CERT_FILE", "")), strings.TrimSpace(env("TLS_KEY_FILE", "")),
 		listed(env("TLS_ACME_HOSTS", ""), strings.ToLower), strings.TrimSpace(env("TLS_ACME_CACHE", "")), strings.TrimSpace(env("TLS_ACME_EMAIL", "")), logger)
 	if err != nil {
 		return err
 	}
+	if tlsConfig == nil && strings.TrimSpace(env("LISTEN_TLS_ADDR", "")) != "" {
+		return errors.New("LISTEN_TLS_ADDR is set but no TLS source is configured (TLS_CERT_FILE and TLS_KEY_FILE, or TLS_ACME_HOSTS)")
+	}
+	// Where TLS ends in this process, a direct client is served over that listener only: a plaintext
+	// call under the published name (through a gateway that ended TLS elsewhere) is misdirected.
+	server.DirectOnlyTLS(tlsConfig != nil)
 	var servers []*http.Server
 	if addr := env("LISTEN_ADDR", ":8090"); !strings.EqualFold(strings.TrimSpace(addr), "off") {
-		servers = append(servers, &http.Server{Addr: addr, Handler: server, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second})
+		servers = append(servers, &http.Server{Addr: addr, Handler: server, ErrorLog: logger, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second})
 	}
 	if tlsConfig != nil {
-		servers = append(servers, &http.Server{Addr: env("LISTEN_TLS_ADDR", ":8443"), Handler: server, TLSConfig: tlsConfig, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second})
+		servers = append(servers, &http.Server{Addr: env("LISTEN_TLS_ADDR", ":8443"), Handler: server, TLSConfig: tlsConfig, ErrorLog: logger, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second})
 	}
 	if len(servers) == 0 {
 		return errors.New("nothing to listen on: LISTEN_ADDR is off and no TLS source is configured")
@@ -484,11 +490,11 @@ func tlsSetup(certFile, keyFile string, acmeHosts []string, acmeCache, acmeEmail
 }
 
 // acmeTLS obtains and renews the machine's own certificates from Let's Encrypt inside the process,
-// by the TLS-ALPN-01 challenge answered on the TLS listener itself: no DNS credential, no
-// certificate file, and no private key outside this process. hosts are the names served (any other
-// name is refused at the handshake); the cache directory keeps the account key and the certificates
-// across restarts (Let's Encrypt limits how often a name may be issued); email is where Let's
-// Encrypt writes about expiry.
+// by the TLS-ALPN-01 challenge answered on the TLS listener itself: no DNS credential and no
+// certificate handed in. hosts are the names served (any other name is refused at the handshake,
+// before any order); the cache directory keeps the account key and the certificates with their
+// private keys across restarts (on the VM's encrypted disk; Let's Encrypt limits how often a name
+// may be issued); email is where Let's Encrypt writes about expiry.
 func acmeTLS(hosts []string, cacheDir, email string) (*tls.Config, error) {
 	if len(hosts) == 0 {
 		return nil, errors.New("TLS_ACME_HOSTS is empty")

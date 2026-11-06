@@ -116,10 +116,12 @@ gateway, which terminate TLS themselves (`off` for none); `LISTEN_TLS_ADDR` (`:8
 ending in this process when a certificate source is configured: `TLS_CERT_FILE` + `TLS_KEY_FILE`
 (re-read when the certificate file changes), or `TLS_ACME_HOSTS` with `TLS_ACME_CACHE` (and
 `TLS_ACME_EMAIL`): Let's Encrypt in-process by the TLS-ALPN-01 challenge, answered on the TLS
-listener itself, so the machine needs no DNS credential and the private key never exists outside
-this process. Inside a dstack VM the name's DNS points at the provider's gateway, which passes the
-TLS connection through by SNI; the cache lives on the machine's state volume. Browsers get CORS on
-the completion path, with the headers they ask for.
+listener itself, so the machine needs no DNS credential and the certificates' private keys and the
+account key live only in that cache, on the machine's own (encrypted) disk. Where TLS ends in the
+process, direct clients are served over that listener only: a plaintext call under the published
+name is misdirected (421). Inside a dstack VM the name's DNS points at the provider's gateway,
+which passes the TLS connection through by SNI; the cache lives on the machine's state volume.
+Browsers get CORS on the completion path, with the headers they ask for.
 
 ## Production: Alibaba Model Studio first, the labs behind
 

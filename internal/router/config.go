@@ -300,8 +300,8 @@ func (r *Route) validate() error {
 				return fmt.Errorf("upstream %q: base_url_env must be a variable name", u.Name)
 			}
 			// The environment may move the endpoint within the service's own domain (Alibaba's
-			// workspace form of the same API), never to another service; the public file keeps
-			// naming the service's public endpoint, which is what the signed manifest shows.
+			// workspace form of the same API), never to another service. The value belongs in the
+			// measured compose, not in a secret: the signed manifest names it as where requests go.
 			if endpoint := u.Endpoint(); endpoint != u.BaseURL {
 				moved, err := url.Parse(endpoint)
 				if err != nil || moved.Scheme != "https" || moved.Host == "" || moved.User != nil || moved.RawQuery != "" || moved.Fragment != "" {

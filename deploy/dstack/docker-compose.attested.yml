@@ -1,17 +1,22 @@
 # The router inside a confidential VM (Intel TDX) run by dstack, serving API clients DIRECTLY:
 # the TLS connection ends in the router process, which obtains the names' certificates from
-# Let's Encrypt itself (TLS-ALPN-01, answered on its own TLS listener), so no DNS credential and
-# no private key ever exist outside the measured VM. dstack's gateway passes a connection for a
-# custom name through by SNI to port 443 of the VM (DNS: the name CNAME to the gateway, and
-# `_dstack-app-address.<name>` TXT = `<app_id>:443`); the gateway's own hostname on port 8080
-# reaches the plaintext listener with TLS ended at the gateway (verifiers, the platform's edge).
+# Let's Encrypt itself (TLS-ALPN-01, answered on its own TLS listener), so no DNS credential is
+# needed and the private keys (the certificates', the ACME account's) exist only on the VM's
+# encrypted disk, under the measured process. dstack's gateway passes a connection for a custom
+# name through by SNI to port 443 of the VM (DNS: the name CNAME to the gateway, and
+# `_dstack-app-address.<name>` TXT = `<app_id>:443` with one instance per app, or
+# `<instance_id>:443` so Let's Encrypt's validation reaches the instance that asked); the
+# gateway's own hostname on port 8080 reaches the plaintext listener with TLS ended at the gateway
+# (verifiers, the platform's edge); direct clients are served over the TLS listener only.
 # dstack measures this file, image digest included, into the attestation quote. Public
-# configuration is written here so that it is measured too; secrets never appear here: they are
-# passed as dstack encrypted environment variables, which the KMS releases only to this measured app.
-# Image digest: the release's (RELEASES.md); 1.3.7 replaces it before deployment.
+# configuration is written here so that it is measured too: the upstreams' endpoints among it,
+# so a verifier reads where requests go. Secrets never appear here: they are passed as dstack
+# encrypted environment variables, which the KMS releases only to this measured app.
+# Image digest: 1.3.7's once built (RELEASES.md); until then an impossible one, so that this file
+# cannot start an older image that knows none of these settings.
 services:
   router:
-    image: ghcr.io/lebrel-ai/router@sha256:d3725f05e6017caee09adeb431c2b2e3d70b010c92cfc99f8bb4c55bd26c8b54
+    image: ghcr.io/lebrel-ai/router@sha256:0000000000000000000000000000000000000000000000000000000000000000
     restart: unless-stopped
     ports:
       - "8080:8090"
@@ -33,6 +38,9 @@ services:
       - DIRECT_HOSTS=attested.lebrel.ai
       # dstack's gateway shows no client address: wrong keys are counted for nobody, never for everyone.
       - CLIENT_ADDRESS=none
+      # Alibaba Model Studio's endpoint for the six routes it serves first: public and measured, so the
+      # signed manifests name where requests go (the workspace form of the same service may replace it).
+      - ALIBABA_MODEL_STUDIO_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
       - ROUTES_FILE=/etc/lebrel-router/routes.json
       - CONTROL_PLANE_URL=https://lebrel.ai
       - BOARD_SOURCE=https://models.lebrel.ai/v1/watch
@@ -56,7 +64,6 @@ services:
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL}
       - ALERT_TELEGRAM_CHAT_ID=${ALERT_TELEGRAM_CHAT_ID}
       - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
-      - ALIBABA_MODEL_STUDIO_BASE_URL=${ALIBABA_MODEL_STUDIO_BASE_URL}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - ZAI_API_KEY=${ZAI_API_KEY}
       - MOONSHOT_API_KEY=${MOONSHOT_API_KEY}
