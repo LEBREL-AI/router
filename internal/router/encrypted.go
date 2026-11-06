@@ -519,7 +519,7 @@ func (s *Server) handleEncryptedCompletion(w http.ResponseWriter, r *http.Reques
 		s.writeError(w, http.StatusBadRequest, "invalid_ciphertext", "one EHBP encapsulated key is required")
 		return
 	}
-	principal, err := s.settings.Auth.Authenticate(r.Context(), r.Header.Get("Authorization"))
+	principal, err := s.settings.Auth.Authenticate(s.authContext(r.Context(), r), r.Header.Get("Authorization"))
 	if err != nil {
 		if errors.Is(err, auth.ErrUnauthorized) {
 			s.writeError(w, http.StatusUnauthorized, "invalid_api_key", "invalid API key")

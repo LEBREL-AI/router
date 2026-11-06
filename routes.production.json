@@ -7,7 +7,7 @@
       "level": 2,
       "family": "deepseek-v4.1-flash",
       "claimed_revision": "deepseek-flash",
-      "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to DeepSeek's own API: with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; DeepSeek sees it, not you, and keeps its own retention policy (China). If OpenRouter cannot answer, the request goes to DeepSeek's API directly. Priced by Lebrel's published rates, the same day and night; a fifth of the price is Lebrel's route fee.",
+      "data_note": "Relayed by Lebrel's router, which keeps nothing, to Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the request, not you, and keeps its own retention policy. If Model Studio cannot answer, the request goes to DeepSeek's own API, through OpenRouter (which forwards it without storing it) or directly; DeepSeek keeps its own retention policy (China). The receipt names which served. Priced by Lebrel's published rates, the same day and night, whoever serves; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
           "name": "alibaba/model-studio",
@@ -18,6 +18,15 @@
           "priority": 1,
           "usage_format": "openai",
           "dialect": "alibaba",
+          "reasoning_efforts": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra",
+            "max"
+          ],
           "timeout_seconds": 90,
           "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
         },
@@ -73,7 +82,7 @@
       "level": 2,
       "family": "deepseek-v4-pro",
       "claimed_revision": "deepseek-v4-pro",
-      "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to DeepSeek's own API: with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; DeepSeek sees it, not you, and keeps its own retention policy (China). If OpenRouter cannot answer, the request goes to DeepSeek's API directly. Priced by Lebrel's published rates; DeepSeek's peak-hour surcharge (weekdays 01-04 and 06-10 UTC, except Chinese public holidays) is passed through and named in the receipt; a fifth of the price is Lebrel's route fee.",
+      "data_note": "Relayed by Lebrel's router, which keeps nothing, to Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the request, not you, and keeps its own retention policy. If Model Studio cannot answer, the request goes to DeepSeek's own API, through OpenRouter (which forwards it without storing it) or directly; DeepSeek keeps its own retention policy (China). The receipt names which served. Priced by Lebrel's published rates, whoever serves; Lebrel's rates for this model carry a peak-hour schedule (weekdays 01-04 and 06-10 UTC, except Chinese public holidays), named in the receipt; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
           "name": "alibaba/model-studio",
@@ -84,6 +93,11 @@
           "priority": 1,
           "usage_format": "openai",
           "dialect": "alibaba",
+          "reasoning_efforts": [
+            "low",
+            "high",
+            "max"
+          ],
           "timeout_seconds": 90,
           "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
         },
@@ -201,7 +215,7 @@
       "level": 2,
       "family": "glm-5.3",
       "claimed_revision": "glm-5.3",
-      "data_note": "Relayed by Lebrel's router to Z.ai's own API: with the encrypted client only the router reads the request; Z.ai sees it, not you, and keeps its own retention policy. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
+      "data_note": "Relayed by Lebrel's router, which keeps nothing, to Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the request, not you, and keeps its own retention policy. If Model Studio cannot answer, the request goes to Z.ai's own API, which keeps its own retention policy. The receipt names which served. This model always reasons: reasoning tokens are billed as output. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
           "name": "alibaba/model-studio",
@@ -212,6 +226,13 @@
           "priority": 1,
           "usage_format": "openai",
           "dialect": "alibaba",
+          "reasoning_efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
           "timeout_seconds": 90,
           "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy. This endpoint always reasons: reasoning tokens are billed as output.",
           "reasoning_fixed": true
@@ -246,7 +267,7 @@
       "level": 2,
       "family": "kimi-k3",
       "claimed_revision": "kimi-k3",
-      "data_note": "Relayed by Lebrel's router to Moonshot AI's own API: with the encrypted client only the router reads the request; Moonshot AI sees it, not you, and keeps its own retention policy. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
+      "data_note": "Relayed by Lebrel's router, which keeps nothing, to Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the request, not you, and keeps its own retention policy. If Model Studio cannot answer, the request goes to Moonshot AI's own API, which keeps its own retention policy. The receipt names which served. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
           "name": "alibaba/model-studio",
@@ -257,6 +278,9 @@
           "priority": 1,
           "usage_format": "openai",
           "dialect": "alibaba",
+          "reasoning_efforts": [
+            "max"
+          ],
           "timeout_seconds": 90,
           "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
         },
@@ -290,7 +314,7 @@
       "level": 2,
       "family": "qwen3.8-max",
       "claimed_revision": "qwen/qwen3.8-max-0902",
-      "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; Alibaba sees it, not you, and keeps its own retention policy. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee. This endpoint always reasons: reasoning tokens are billed as output, and a client asking for no reasoning gets the lowest effort.",
+      "data_note": "Relayed by Lebrel's router, which keeps nothing, to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): Alibaba sees the request, not you, and keeps its own retention policy. If Model Studio cannot answer directly, the request reaches it through OpenRouter, which forwards it without storing it. The receipt names which served. This endpoint always reasons: reasoning tokens are billed as output, and a client asking for no reasoning gets the lowest effort. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
           "name": "alibaba/model-studio",
@@ -301,8 +325,14 @@
           "priority": 1,
           "usage_format": "openai",
           "dialect": "alibaba",
+          "reasoning_fixed": true,
+          "reasoning_efforts": [
+            "low",
+            "medium",
+            "xhigh"
+          ],
           "timeout_seconds": 90,
-          "data_note": "Served by Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
+          "data_note": "Served by Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy. This endpoint always reasons (a client asking for none gets the lowest effort; reasoning_effort sets it)."
         },
         {
           "name": "openrouter/alibaba",
@@ -348,7 +378,7 @@
       "level": 2,
       "family": "qwen3.8-flash",
       "claimed_revision": "qwen/qwen3.8-flash",
-      "data_note": "Relayed by Lebrel's router through OpenRouter, pinned to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): with the encrypted client only the router reads the request; OpenRouter forwards it without storing it; Alibaba sees it, not you, and keeps its own retention policy. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
+      "data_note": "Relayed by Lebrel's router, which keeps nothing, to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): Alibaba sees the request, not you, and keeps its own retention policy. If Model Studio cannot answer directly, the request reaches it through OpenRouter, which forwards it without storing it. The receipt names which served. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
           "name": "alibaba/model-studio",
@@ -359,6 +389,12 @@
           "priority": 1,
           "usage_format": "openai",
           "dialect": "alibaba",
+          "reasoning_efforts": [
+            "none",
+            "low",
+            "medium",
+            "xhigh"
+          ],
           "timeout_seconds": 90,
           "data_note": "Served by Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
         },

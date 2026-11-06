@@ -13,8 +13,10 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -919,6 +921,34 @@ func TestAnAnsweredRequestIsDeliveredAndSettledThroughAControlPlaneOutage(t *tes
 	}
 }
 
+// capturingAuth records the client address each authentication carried for the control plane.
+type capturingAuth struct {
+	inner  auth.Authenticator
+	mu     sync.Mutex
+	actors []string
+}
+
+func (c *capturingAuth) Authenticate(ctx context.Context, authorization string) (auth.Principal, error) {
+	c.mu.Lock()
+	c.actors = append(c.actors, auth.ClientActor(ctx))
+	c.mu.Unlock()
+	return c.inner.Authenticate(ctx, authorization)
+}
+
+func (c *capturingAuth) seen() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.actors...)
+}
+
+func repeated(value string, n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = value
+	}
+	return out
+}
+
 func TestDirectClientsAreAdmittedWithoutTheEdgeAndNeverCappedByAddress(t *testing.T) {
 	up := newFakeUpstream(t, okJSON(`{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15,"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":8}`))
 	body := `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi there"}],"temperature":0}`
@@ -927,13 +957,35 @@ func TestDirectClientsAreAdmittedWithoutTheEdgeAndNeverCappedByAddress(t *testin
 	if response := closed.post(t, body, testKey); response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("without direct clients a call without the edge header must be 401, got %d", response.StatusCode)
 	}
-	// The attested endpoint: direct clients admitted; many calls from one address are just calls (limits are by key).
+	// The attested endpoint: direct clients admitted under its published name; the ingress in the
+	// same VM (here any loopback connection) writes the client's address in X-Real-IP.
+	capture := &capturingAuth{}
 	h := newHarnessWith(t, routeFor(upstream("deepseek/api", up.server.URL, 1)), board, func(s *Settings) {
 		s.EdgeProxySecret = "edge-secret"
 		s.DirectClients = true
+		s.DirectHosts = []string{"attested.lebrel.ai"}
+		s.ClientIPHeader = "X-Real-IP"
+		s.TrustedIngress = []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}
+		capture.inner, s.Auth = s.Auth, capture
 	})
+	direct := func(key string, headers map[string]string) *http.Response {
+		t.Helper()
+		request, _ := http.NewRequest(http.MethodPost, h.server.URL+"/v1/chat/completions", strings.NewReader(body))
+		request.Host = "attested.lebrel.ai"
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+key)
+		for name, value := range headers {
+			request.Header.Set(name, value)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	// Many calls from one address are just calls: limits are by key.
 	for i := 0; i < 12; i++ {
-		response := h.post(t, body, testKey)
+		response := direct(testKey, nil)
 		raw, _ := io.ReadAll(response.Body)
 		if response.StatusCode != 200 {
 			t.Fatalf("direct call %d: status %d: %s", i+1, response.StatusCode, raw)
@@ -942,7 +994,11 @@ func TestDirectClientsAreAdmittedWithoutTheEdgeAndNeverCappedByAddress(t *testin
 			t.Fatal("direct completions carry CORS for browsers")
 		}
 	}
-	// The platform's edge keeps working through the same server.
+	// Under another name (the machine's bare address, a provider's gateway hostname) a direct call is misdirected.
+	if response := h.post(t, body, testKey); response.StatusCode != http.StatusMisdirectedRequest {
+		t.Fatalf("a direct call under another name must be 421, got %d", response.StatusCode)
+	}
+	// The platform's edge keeps working through the same server, under any name.
 	request, _ := http.NewRequest(http.MethodPost, h.server.URL+"/v1/chat/completions", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+testKey)
@@ -954,17 +1010,117 @@ func TestDirectClientsAreAdmittedWithoutTheEdgeAndNeverCappedByAddress(t *testin
 	if viaEdge.StatusCode != 200 {
 		t.Fatalf("the edge's own call: %d", viaEdge.StatusCode)
 	}
-	// A browser's preflight.
+	// A browser's preflight is answered with the headers it asks for (the OpenAI SDK's own among them).
 	preflight, _ := http.NewRequest(http.MethodOptions, h.server.URL+"/v1/chat/completions", nil)
+	preflight.Header.Set("Access-Control-Request-Headers", "authorization, content-type, x-stainless-os")
 	response, err := http.DefaultClient.Do(preflight)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.StatusCode != http.StatusNoContent || response.Header.Get("Access-Control-Allow-Headers") == "" {
-		t.Fatalf("preflight: %d", response.StatusCode)
+	if response.StatusCode != http.StatusNoContent || response.Header.Get("Access-Control-Allow-Headers") != "authorization, content-type, x-stainless-os" {
+		t.Fatalf("preflight: %d %q", response.StatusCode, response.Header.Get("Access-Control-Allow-Headers"))
 	}
-	// A wrong key is still a wrong key.
-	if response := h.post(t, body, "leb_live_wrong"); response.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("a wrong key is refused: %d", response.StatusCode)
+	// A wrong key is still a wrong key, and the control plane learns the address it came from: the
+	// last entry of the ingress's header (a client may write entries of its own before it), an IPv6
+	// address by its /64.
+	for _, address := range []string{"203.0.113.9, 198.51.100.7", "2001:db8:85a3:1::7"} {
+		if response := direct("leb_live_wrong", map[string]string{"X-Real-IP": address}); response.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("a wrong key is refused: %d", response.StatusCode)
+		}
+	}
+	want := append(repeated("ipv4:127.0.0.1", 12), "", "ipv4:198.51.100.7", "ipv6:2001:0db8:85a3:0001::/64")
+	if got := capture.seen(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("client addresses told to the control plane:\n got %q\nwant %q", got, want)
+	}
+	// From a connection that is not the ingress's, the header is a client's word and ignored.
+	elsewhere := &capturingAuth{}
+	other := newHarnessWith(t, routeFor(upstream("deepseek/api", up.server.URL, 1)), board, func(s *Settings) {
+		s.EdgeProxySecret = "edge-secret"
+		s.DirectClients = true
+		s.ClientIPHeader = "X-Real-IP"
+		s.TrustedIngress = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+		elsewhere.inner, s.Auth = s.Auth, elsewhere
+	})
+	request, _ = http.NewRequest(http.MethodPost, other.server.URL+"/v1/chat/completions", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer leb_live_wrong")
+	request.Header.Set("X-Real-IP", "203.0.113.9")
+	if response, err := http.DefaultClient.Do(request); err != nil || response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("a wrong key from elsewhere: %v %v", err, response)
+	}
+	if got := elsewhere.seen(); !reflect.DeepEqual(got, []string{"ipv4:127.0.0.1"}) {
+		t.Fatalf("an untrusted header must not name the client: %q", got)
+	}
+}
+
+func TestAFallbackAnswerAlertsTheOperatorOnceAWhile(t *testing.T) {
+	down := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) })
+	up := newFakeUpstream(t, okJSON(`{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15,"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":8}`))
+	var mu sync.Mutex
+	var alerts []string
+	h := newHarnessWith(t, routeFor(upstream("alibaba/model-studio", down.server.URL, 1), upstream("deepseek/api", up.server.URL, 2)), board, func(s *Settings) {
+		s.Alert = func(text string) { mu.Lock(); alerts = append(alerts, text); mu.Unlock() }
+	})
+	body := `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi there"}],"temperature":0}`
+	for i := 0; i < 3; i++ {
+		response := h.post(t, body, testKey)
+		raw, _ := io.ReadAll(response.Body)
+		if response.StatusCode != 200 || response.Header.Get(upstreamHeader) != "deepseek/api" {
+			t.Fatalf("call %d: %d served by %q: %s", i+1, response.StatusCode, response.Header.Get(upstreamHeader), raw)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(alerts) != 1 || !strings.Contains(alerts[0], "alibaba/model-studio (HTTP 503)") || !strings.Contains(alerts[0], "deepseek/api") {
+		t.Fatalf("one alert naming the failed upstream and the fallback, got %q", alerts)
+	}
+}
+
+func TestAnOutageAlertsTheOperator(t *testing.T) {
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close()
+	var mu sync.Mutex
+	var alerts []string
+	h := newHarnessWith(t, routeFor(upstream("alibaba/model-studio", deadURL, 1), upstream("deepseek/api", deadURL, 2)), board, func(s *Settings) {
+		s.Alert = func(text string) { mu.Lock(); alerts = append(alerts, text); mu.Unlock() }
+	})
+	body := `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi there"}],"temperature":0}`
+	for i := 0; i < 2; i++ {
+		response := h.post(t, body, testKey)
+		_, _ = io.Copy(io.Discard, response.Body)
+		if response.StatusCode != http.StatusBadGateway {
+			t.Fatalf("call %d: %d", i+1, response.StatusCode)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(alerts) != 1 || !strings.Contains(alerts[0], "ningún proveedor") {
+		t.Fatalf("one alert for the outage, got %q", alerts)
+	}
+}
+
+func TestAnUpstreamThatDoesNotAnswerInItsTimeIsSkipped(t *testing.T) {
+	release := make(chan struct{})
+	slow := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	})
+	t.Cleanup(func() { close(release) })
+	up := newFakeUpstream(t, okJSON(`{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15,"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":8}`))
+	first := upstream("slow/api", slow.server.URL, 1)
+	first.TimeoutSeconds = 1
+	h := newHarness(t, routeFor(first, upstream("deepseek/api", up.server.URL, 2)), board)
+	body := `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi there"}],"temperature":0}`
+	started := time.Now()
+	response := h.post(t, body, testKey)
+	raw, _ := io.ReadAll(response.Body)
+	if response.StatusCode != 200 || response.Header.Get(upstreamHeader) != "deepseek/api" {
+		t.Fatalf("%d served by %q: %s", response.StatusCode, response.Header.Get(upstreamHeader), raw)
+	}
+	if waited := time.Since(started); waited >= 3*time.Second {
+		t.Fatalf("the silent upstream held the request %s; its time was 1s", waited)
 	}
 }

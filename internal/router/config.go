@@ -181,7 +181,13 @@ type Upstream struct {
 	// ReasoningFixed marks an endpoint that cannot reason less than always (Alibaba's qwen3.8-max
 	// through OpenRouter refuses `reasoning.enabled: false`): a client asking for no reasoning gets
 	// the lowest effort instead, which is the closest the endpoint offers, and the data note says so.
-	ReasoningFixed bool   `json:"reasoning_fixed,omitempty"`
+	ReasoningFixed bool `json:"reasoning_fixed,omitempty"`
+	// ReasoningEfforts lists the `reasoning_effort` values the endpoint takes, lowest first, for a
+	// dialect that checks them (Alibaba's Model Studio refuses any other with an error): a value
+	// outside the list is dropped and the host's default applies. Empty: every value is forwarded.
+	ReasoningEfforts []string `json:"reasoning_efforts,omitempty"`
+	// TimeoutSeconds is how long the upstream has to answer with headers (default 90) before the
+	// next one is tried; the body then streams for as long as the customer waits.
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 	DataNote       string `json:"data_note,omitempty"`
 }
@@ -288,6 +294,23 @@ func (r *Route) validate() error {
 		}
 		if parsed.Scheme != "https" && !isLoopback(parsed.Hostname()) {
 			return fmt.Errorf("upstream %q: base_url must use https", u.Name)
+		}
+		if u.BaseURLEnv != "" {
+			if strings.ContainsAny(u.BaseURLEnv, " =\r\n\t") {
+				return fmt.Errorf("upstream %q: base_url_env must be a variable name", u.Name)
+			}
+			// the endpoint from the environment is checked the same way, at start and at every reload
+			if endpoint := u.Endpoint(); endpoint != u.BaseURL {
+				parsed, err := url.Parse(endpoint)
+				if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+					return fmt.Errorf("upstream %q: %s must hold an absolute https URL", u.Name, u.BaseURLEnv)
+				}
+			}
+		}
+		for _, effort := range u.ReasoningEfforts {
+			if effort == "" || len(effort) > 32 || strings.ContainsAny(effort, " \t\r\n\"") {
+				return fmt.Errorf("upstream %q: reasoning_efforts entries must be plain words", u.Name)
+			}
 		}
 		if strings.TrimSpace(u.Model) == "" {
 			return fmt.Errorf("upstream %q: model is required", u.Name)
@@ -420,6 +443,14 @@ func (r Route) BillingContractHash() (string, error) {
 // rates on a route, so only the queue name changes, and it must match the control plane's.
 func (r Route) LongContextThreshold() int64 {
 	return r.MaxContextTokens - 1
+}
+
+// Name is how the operator knows the route: its display name, else the model id.
+func (r Route) Name() string {
+	if strings.TrimSpace(r.DisplayName) != "" {
+		return r.DisplayName
+	}
+	return r.ModelID
 }
 
 // Slug is the path segment a route lives under: "deepseek/deepseek-v4.1-flash" -> "deepseek--deepseek-v4.1-flash".

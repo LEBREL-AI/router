@@ -8,7 +8,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 
 	"lebrel-router/internal/controlplane"
@@ -36,6 +38,49 @@ type Record struct {
 
 type Authenticator interface {
 	Authenticate(context.Context, string) (Principal, error)
+}
+
+// ClientActorHeader carries, to the control plane, the address a direct client's key came from.
+const ClientActorHeader = "X-Lebrel-Client-Actor"
+
+// clientActorKey marks a direct client's request with the address the control plane counts wrong
+// keys for; a request the platform's edge admitted carries none (the edge counted it already).
+type clientActorKey struct{}
+
+// WithClientActor returns ctx marked with the client's address as ActorForAddress writes it; an
+// empty actor marks nothing.
+func WithClientActor(ctx context.Context, actor string) context.Context {
+	if actor == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, clientActorKey{}, actor)
+}
+
+// ClientActor is the address WithClientActor marked ctx with, or "".
+func ClientActor(ctx context.Context) string {
+	actor, _ := ctx.Value(clientActorKey{}).(string)
+	return actor
+}
+
+// ActorForAddress writes an address the way the platform's edge counts wrong keys: an IPv4 address
+// whole, an IPv6 address by its /64, so one customer's block counts as one and an attacker cannot
+// spread over the 2^64 addresses of theirs. A port or a zone is dropped; what is not an address
+// gives "".
+func ActorForAddress(address string) string {
+	address = strings.TrimSpace(address)
+	if host, _, err := net.SplitHostPort(address); err == nil {
+		address = host
+	}
+	addr, err := netip.ParseAddr(strings.Trim(address, "[]"))
+	if err != nil {
+		return ""
+	}
+	addr = addr.Unmap().WithZone("")
+	if addr.Is4() {
+		return "ipv4:" + addr.String()
+	}
+	b := addr.As16()
+	return fmt.Sprintf("ipv6:%02x%02x:%02x%02x:%02x%02x:%02x%02x::/64", b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7])
 }
 
 type HMACAuthenticator struct {
@@ -108,13 +153,19 @@ func (a *RemoteAuthenticator) Authenticate(ctx context.Context, authorization st
 		Concurrency        int    `json:"concurrency"`
 		AccountConcurrency int    `json:"accountConcurrency"`
 	}
+	// A direct client's address goes along: the control plane counts wrong keys per address, so
+	// guessing stays slow; for the requests the platform's edge admits, the edge sent it itself.
+	var headers http.Header
+	if actor := ClientActor(ctx); actor != "" {
+		headers = http.Header{ClientActorHeader: {actor}}
+	}
 	if err := a.client.DoJSON(
 		ctx,
 		http.MethodPost,
 		"/api/internal/gateway/authenticate",
 		request,
 		&response,
-		nil,
+		headers,
 	); err != nil {
 		var httpError *controlplane.HTTPError
 		if errors.As(err, &httpError) &&

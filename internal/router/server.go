@@ -16,6 +16,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -100,10 +101,18 @@ type Settings struct {
 	// DirectClients admits completions without the edge header: the machine terminates TLS itself and
 	// serves ordinary API clients, and the key is checked here as always. No ceiling by address:
 	// limits are by key and by account, as published; the only thing counted per address is a wrong
-	// key, by the control plane, so guessing stays slow. ClientIPHeader names the header an ingress
-	// in the same VM sets with the client's address (empty: the connection's own address).
-	DirectClients   bool
-	ClientIPHeader  string
+	// key, by the control plane, so guessing stays slow. DirectHosts are the names (lowercase, no
+	// port) direct clients may call the machine by; under any other name a direct call is refused as
+	// misdirected, so the service exists only at its published address (empty: any name).
+	// ClientIPHeader names the header an ingress sets with the client's address, honoured only when
+	// the connection comes from TrustedIngress (the ingress in the same VM) and read from its last
+	// entry, the one that ingress wrote; otherwise the connection's own address counts.
+	DirectClients  bool
+	DirectHosts    []string
+	ClientIPHeader string
+	TrustedIngress []netip.Prefix
+	// Alert hands the operator an alert (the notifier's Notify); nil only logs.
+	Alert           func(string)
 	MaxRequestBytes int64
 	ManifestWindow  time.Duration
 	HTTPClient      *http.Client
@@ -137,6 +146,9 @@ type Server struct {
 	cutAll context.CancelFunc
 	cutMu  sync.Mutex
 	cutIDs []string
+	// alerts throttles the operator's alerts per subject (a route's fallbacks, a route's outage)
+	alertMu sync.Mutex
+	alerts  map[string]alertState
 }
 
 type cachedManifest struct {
@@ -202,7 +214,7 @@ func New(settings Settings) (*Server, error) {
 	if err := settings.Routes.Validate(); err != nil {
 		return nil, err
 	}
-	server := &Server{settings: settings, routes: map[string]*Route{}, slugs: map[string]*Route{}, hashes: map[string]string{}, manifests: map[string]cachedManifest{}}
+	server := &Server{settings: settings, routes: map[string]*Route{}, slugs: map[string]*Route{}, hashes: map[string]string{}, alerts: map[string]alertState{}, manifests: map[string]cachedManifest{}}
 	server.cutCtx, server.cutAll = context.WithCancel(context.Background())
 	for i := range settings.Routes.Routes {
 		route := &settings.Routes.Routes[i]
@@ -262,9 +274,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", "*")
 		h.Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, X-Lebrel-Model, Ehbp-Encapsulated-Key")
+		h.Set("Access-Control-Allow-Headers", allowedRequestHeaders(r))
 		h.Set("Access-Control-Expose-Headers", "X-Request-ID, Proof-Of-Edition-Receipt, X-Lebrel-Upstream, X-Lebrel-Verification, Retry-After")
 		h.Set("Access-Control-Max-Age", "86400")
+		h.Add("Vary", "Access-Control-Request-Headers")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -311,8 +324,29 @@ func (s *Server) validEdge(r *http.Request) bool {
 	return len(received) == len(s.edgeToken) && hmac.Equal([]byte(received), []byte(s.edgeToken))
 }
 
-// admit lets a completion through on the edge's word or, for direct clients, as it is: the key is
-// checked by the handler, and limits are by key and account. It writes the refusal itself.
+// corsAllowedHeaders is the preflight's answer when the browser names no headers of its own.
+const corsAllowedHeaders = "Authorization, Content-Type, Accept, X-Lebrel-Model, Ehbp-Encapsulated-Key"
+
+// allowedRequestHeaders answers a preflight with the headers the browser asks for, when they are
+// plain header names (the OpenAI SDK in a browser sends its own x-stainless-* set, which a fixed
+// list would refuse), else the known list. Authentication is a bearer token, never a cookie, so
+// allowing a page's headers gives it nothing it could not send from a server.
+func allowedRequestHeaders(r *http.Request) string {
+	asked := strings.TrimSpace(r.Header.Get("Access-Control-Request-Headers"))
+	if asked == "" || len(asked) > 1024 {
+		return corsAllowedHeaders
+	}
+	for _, c := range asked {
+		if !(c == ',' || c == ' ' || c == '-' || c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z') {
+			return corsAllowedHeaders
+		}
+	}
+	return asked
+}
+
+// admit lets a completion through on the edge's word or, for direct clients, as it is when it came
+// by one of the machine's published names: the key is checked by the handler, and limits are by key
+// and account. It writes the refusal itself.
 func (s *Server) admit(w http.ResponseWriter, r *http.Request) bool {
 	if s.validEdge(r) {
 		return true
@@ -321,25 +355,74 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) bool {
 		s.writeError(w, http.StatusUnauthorized, "edge_unauthorized", "missing edge authorization")
 		return false
 	}
+	if !s.directHost(r.Host) {
+		// the machine's bare address, a provider's gateway hostname: not where the service is published
+		s.writeError(w, http.StatusMisdirectedRequest, "misdirected_request", "this name does not serve API clients directly")
+		return false
+	}
 	return true
 }
 
-// clientIP is the address the control plane's wrong-key throttle counts for a direct client: the
-// ingress header when one is trusted, else the connection's own address.
-func (s *Server) clientIP(r *http.Request) string {
-	if s.settings.ClientIPHeader != "" {
-		if value := r.Header.Get(s.settings.ClientIPHeader); value != "" {
-			first, _, _ := strings.Cut(value, ",")
-			if first = strings.TrimSpace(first); first != "" {
-				return first
-			}
+// directHost says whether direct clients are served under the name the request came by.
+func (s *Server) directHost(host string) bool {
+	if len(s.settings.DirectHosts) == 0 {
+		return true
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.TrimSuffix(strings.Trim(host, "[]"), "."))
+	for _, allowed := range s.settings.DirectHosts {
+		if host == allowed {
+			return true
 		}
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
+	return false
+}
+
+// clientIP is the address the control plane's wrong-key throttle counts for a direct client: the
+// connection's own address or, when the connection is a trusted ingress's, the last address that
+// ingress wrote in ClientIPHeader (a client may write the header too: its entries sit before).
+func (s *Server) clientIP(r *http.Request) string {
+	connection := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(connection); err == nil {
+		connection = host
 	}
-	return host
+	if s.settings.ClientIPHeader == "" || !s.fromTrustedIngress(connection) {
+		return connection
+	}
+	values := r.Header.Values(s.settings.ClientIPHeader)
+	if len(values) == 0 {
+		return connection
+	}
+	entries := strings.Split(values[len(values)-1], ",")
+	if last := strings.TrimSpace(entries[len(entries)-1]); last != "" {
+		return last
+	}
+	return connection
+}
+
+func (s *Server) fromTrustedIngress(address string) bool {
+	addr, err := netip.ParseAddr(strings.Trim(address, "[]"))
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap().WithZone("")
+	for _, prefix := range s.settings.TrustedIngress {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// authContext marks a direct client's request with its address, for the control plane's count of
+// wrong keys; a request the edge admitted was counted there already and carries nothing.
+func (s *Server) authContext(ctx context.Context, r *http.Request) context.Context {
+	if !s.settings.DirectClients || s.validEdge(r) {
+		return ctx
+	}
+	return auth.WithClientActor(ctx, auth.ActorForAddress(s.clientIP(r)))
 }
 
 func newRequestID() string {
@@ -598,6 +681,8 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request, scoped *Ro
 type upstreamResult struct {
 	upstream *Upstream
 	response *http.Response
+	// release ends the call's context once the answer is done with
+	release func()
 }
 
 func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped *Route) {
@@ -624,7 +709,7 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 	principal, already := ctx.Value(principalKey{}).(auth.Principal)
 	var err error
 	if !already {
-		principal, err = s.settings.Auth.Authenticate(ctx, r.Header.Get("Authorization"))
+		principal, err = s.settings.Auth.Authenticate(s.authContext(ctx, r), r.Header.Get("Authorization"))
 	}
 	if err != nil {
 		if errors.Is(err, auth.ErrUnauthorized) {
@@ -745,11 +830,13 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 			return
 		}
 		s.settings.Logger.Printf("request=%s model=%s all upstreams failed: %v", requestID, route.ModelID, lastErr)
+		s.noteOutage(route, lastErr)
 		s.writeError(w, http.StatusBadGateway, "upstream_unavailable", "no upstream could serve the request")
 		return
 	}
 	upstream, response := result.upstream, result.response
 	servedBy = upstream.Name
+	defer result.release()
 	defer response.Body.Close()
 	w.Header().Set(upstreamHeader, upstream.Name)
 	status := s.settings.Verification.ForRoute(upstream.Name, route.ModelID)
@@ -917,14 +1004,22 @@ func contentTypeOr(response *http.Response, fallback string) string {
 
 func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []byte, requestID, accept string) (*upstreamResult, error) {
 	var lastErr error
+	// the upstreams tried before the one that answers, each with why it did not
+	var skipped []string
 	for i := range route.Upstreams {
 		upstream := &route.Upstreams[i]
 		body, err := upstreamBody(normalized, upstream)
 		if err != nil {
 			return nil, err
 		}
-		request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(upstream.Endpoint(), "/")+"/chat/completions", bytes.NewReader(body))
+		// The upstream has its own time to answer with headers; the body then streams under ctx, and
+		// the call's context ends with the answer (release) or here, when the next upstream is tried.
+		callCtx, endCall := context.WithCancelCause(ctx)
+		silence := time.AfterFunc(upstream.Timeout(), func() { endCall(errUpstreamSilent) })
+		request, err := http.NewRequestWithContext(callCtx, http.MethodPost, strings.TrimRight(upstream.Endpoint(), "/")+"/chat/completions", bytes.NewReader(body))
 		if err != nil {
+			silence.Stop()
+			endCall(nil)
 			return nil, err
 		}
 		request.Header.Set("Content-Type", "application/json")
@@ -942,12 +1037,19 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 			request.Header.Set("Authorization", "Bearer "+key)
 		}
 		response, err := s.settings.HTTPClient.Do(request)
+		silence.Stop()
 		if err != nil {
-			lastErr = fmt.Errorf("%s: %w", upstream.Name, err)
-			s.settings.Logger.Printf("request=%s upstream=%s transport error, trying next", requestID, upstream.Name)
+			endCall(nil)
+			reason := "transport error"
+			if errors.Is(context.Cause(callCtx), errUpstreamSilent) {
+				reason = fmt.Sprintf("no answer within %s", upstream.Timeout())
+			}
+			lastErr = fmt.Errorf("%s: %s: %w", upstream.Name, reason, err)
+			s.settings.Logger.Printf("request=%s upstream=%s %s, trying next", requestID, upstream.Name, reason)
 			if ctx.Err() != nil {
 				return nil, lastErr
 			}
+			skipped = append(skipped, upstream.Name+" ("+reason+")")
 			continue
 		}
 		if retryStatuses[response.StatusCode] && i < len(route.Upstreams)-1 {
@@ -955,6 +1057,8 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 			s.settings.Logger.Printf("request=%s upstream=%s status=%d, trying next", requestID, upstream.Name, response.StatusCode)
 			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxErrorBodyBytes))
 			response.Body.Close()
+			endCall(nil)
+			skipped = append(skipped, fmt.Sprintf("%s (HTTP %d)", upstream.Name, response.StatusCode))
 			continue
 		}
 		if credentialStatuses[response.StatusCode] {
@@ -965,14 +1069,69 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 			s.settings.Logger.Printf("request=%s upstream=%s status=%d refused Lebrel's credential, no upstream left", requestID, upstream.Name, response.StatusCode)
 			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxErrorBodyBytes))
 			response.Body.Close()
+			endCall(nil)
 			return nil, lastErr
 		}
-		return &upstreamResult{upstream: upstream, response: response}, nil
+		if len(skipped) > 0 {
+			s.noteFallback(route, upstream, skipped, requestID)
+		}
+		return &upstreamResult{upstream: upstream, response: response, release: func() { endCall(nil) }}, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no upstreams")
 	}
 	return nil, lastErr
+}
+
+// errUpstreamSilent ends a call whose upstream has not answered within its time.
+var errUpstreamSilent = errors.New("the upstream did not answer in time")
+
+// alertEvery is how often the operator hears about one subject again (a route's fallbacks, a
+// route's outage): the first time at once, then with the count since.
+const alertEvery = 10 * time.Minute
+
+type alertState struct {
+	count     int
+	alertedAt time.Time
+}
+
+// alertThrottled counts an occurrence of subject and, the first time and then at most every
+// alertEvery, hands the operator text(count) with the occurrences since the last alert. Without
+// an Alert sink nothing is sent; the count still keeps its place.
+func (s *Server) alertThrottled(subject string, text func(count int) string) {
+	s.alertMu.Lock()
+	state := s.alerts[subject]
+	state.count++
+	now := s.settings.Now()
+	due := state.alertedAt.IsZero() || now.Sub(state.alertedAt) >= alertEvery
+	count := state.count
+	if due {
+		state.alertedAt, state.count = now, 0
+	}
+	s.alerts[subject] = state
+	s.alertMu.Unlock()
+	if due && s.settings.Alert != nil {
+		s.settings.Alert(text(count))
+	}
+}
+
+// noteFallback records an answer served by a later upstream because the ones before it failed:
+// Lebrel's cost (a fallback is dearer than the first choice) and worth the operator's look, told
+// at most every alertEvery per route, in Spanish for the founder.
+func (s *Server) noteFallback(route *Route, upstream *Upstream, skipped []string, requestID string) {
+	s.settings.Logger.Printf("request=%s model=%s served by fallback %s after %s", requestID, route.ModelID, upstream.Name, strings.Join(skipped, ", "))
+	s.alertThrottled("fallback:"+route.ModelID, func(count int) string {
+		return fmt.Sprintf("%s: falló %s y respondió el respaldo %s. %d respuestas por respaldo en esta ruta desde el último aviso (avisa como mucho cada 10 min): cuesta más que el camino principal. 👉 Mira el proveedor principal si sigue.",
+			route.Name(), strings.Join(skipped, " y "), upstream.Name, count)
+	})
+}
+
+// noteOutage records a request no upstream could serve: the customer got a 502.
+func (s *Server) noteOutage(route *Route, cause error) {
+	s.alertThrottled("outage:"+route.ModelID, func(count int) string {
+		return fmt.Sprintf("%s: ningún proveedor pudo responder (%v). %d peticiones devueltas con 502 en esta ruta desde el último aviso (avisa como mucho cada 10 min). 👉 Revisa los proveedores de la ruta.",
+			route.Name(), cause, count)
+	})
 }
 
 // upstreamBody rewrites the model id and applies the upstream's fixed fields; a client
@@ -985,7 +1144,7 @@ func upstreamBody(normalized []byte, upstream *Upstream) ([]byte, error) {
 		return nil, err
 	}
 	payload["model"] = upstream.Model
-	translateDialect(payload, upstream.Dialect, upstream.ReasoningFixed)
+	translateDialect(payload, upstream.Dialect, upstream.ReasoningFixed, upstream.ReasoningEfforts)
 	for key, value := range upstream.Defaults {
 		if _, present := payload[key]; !present {
 			payload[key] = value
@@ -1001,11 +1160,11 @@ func upstreamBody(normalized []byte, upstream *Upstream) ([]byte, error) {
 // dialect. OpenRouter takes `reasoning: {"enabled": bool}`; DeepSeek documents `thinking:
 // {"type": "disabled" | "enabled"}` and Alibaba `enable_thinking: bool`, which the clients of these
 // routes send. Both are mapped onto `reasoning` unless the client sent `reasoning` itself, and the
-// lab-native keys are dropped: the relay would ignore them and reason by its own default. Any other
-// dialect leaves the payload as it is.
-func translateDialect(payload map[string]any, dialect string, reasoningFixed bool) {
+// lab-native keys are dropped: the relay would ignore them and reason by its own default. Alibaba's
+// Model Studio has its own translation (translateAlibaba). Any other dialect leaves the payload as it is.
+func translateDialect(payload map[string]any, dialect string, reasoningFixed bool, efforts []string) {
 	if dialect == "alibaba" {
-		translateAlibaba(payload, reasoningFixed)
+		translateAlibaba(payload, reasoningFixed, efforts)
 		return
 	}
 	if dialect != "openrouter" {
@@ -1042,9 +1201,13 @@ func translateDialect(payload map[string]any, dialect string, reasoningFixed boo
 // translateAlibaba speaks Model Studio's OpenAI-compatible mode: reasoning is `enable_thinking: bool`
 // (Alibaba's own switch, which Qwen clients already send); DeepSeek's `thinking: {"type"}` and
 // OpenRouter's `reasoning: {"enabled"}` are mapped onto it, and the keys the host does not take
-// (`thinking`, `reasoning`, `reasoning_effort`) are dropped so the request is not refused. A host
-// that always reasons (`reasoning_fixed`) gets no switch at all.
-func translateAlibaba(payload map[string]any, reasoningFixed bool) {
+// (`thinking`, `reasoning`) are dropped so the request is not refused. `reasoning_effort` goes
+// through: Model Studio takes it for DeepSeek, GLM, Kimi and Qwen, each with its own values and an
+// error for any other, so a value outside the endpoint's list (efforts, lowest first) is dropped and
+// the host's default effort applies rather than the request failing. A host that always reasons
+// (`reasoning_fixed`) gets no switch; a client asking it for no reasoning gets the lowest effort
+// the endpoint takes, unless the client named one.
+func translateAlibaba(payload map[string]any, reasoningFixed bool, efforts []string) {
 	var enabled *bool
 	if value, ok := payload["enable_thinking"].(bool); ok {
 		enabled = &value
@@ -1066,11 +1229,33 @@ func translateAlibaba(payload map[string]any, reasoningFixed bool) {
 	}
 	delete(payload, "thinking")
 	delete(payload, "reasoning")
-	delete(payload, "reasoning_effort")
 	delete(payload, "enable_thinking")
-	if enabled != nil && !reasoningFixed {
-		payload["enable_thinking"] = *enabled
+	if effort, ok := payload["reasoning_effort"].(string); !ok || !effortAllowed(effort, efforts) {
+		delete(payload, "reasoning_effort")
 	}
+	if enabled == nil {
+		return
+	}
+	if !reasoningFixed {
+		payload["enable_thinking"] = *enabled
+		return
+	}
+	if _, named := payload["reasoning_effort"]; !*enabled && !named && len(efforts) > 0 {
+		payload["reasoning_effort"] = efforts[0]
+	}
+}
+
+// effortAllowed says whether the endpoint takes the effort: any, when it lists none.
+func effortAllowed(effort string, efforts []string) bool {
+	if len(efforts) == 0 {
+		return true
+	}
+	for _, allowed := range efforts {
+		if allowed == effort {
+			return true
+		}
+	}
+	return false
 }
 
 type assistantContent struct {
