@@ -5,6 +5,7 @@ check that the running machine is this code:
 
 | Version | Git tag | Image digest | dstack compose hash | Receipt key id | Since |
 |---|---|---|---|---|---|
+| 1.3.7 (attested endpoint, instance A2, app `40b35a05…`, Phala KMS 2026-11) | `v1.3.7` | `sha256:ad3f533f0b7fd67b8df9cbf407a9cfb54c90f10c67fa8bd9a01c458bec52bd35` (`deploy/dstack/docker-compose.attested.yml`: TLS ends in the router, Let's Encrypt in-process, attested.lebrel.ai; reached through the relay described below) | `2bcd6faeb21e6c6edb805f923107bca8f3a210a04049361ecce355d2f9316465` | receipt key id `ecfe903e9da3fcee15ee0758ce5d716ce77617d2c0d5840c1330e518d372297c`, public key `59a65997e76163c6e97bed374cbfde543958899e1623c24c7e4ff1166b994342` | 10 Nov 2026 21:19 UTC |
 | 1.3.7 (attested endpoint, instance A) | `v1.3.7` | `sha256:ad3f533f0b7fd67b8df9cbf407a9cfb54c90f10c67fa8bd9a01c458bec52bd35` (`deploy/dstack/docker-compose.attested.yml`: TLS ends in the router, Let's Encrypt in-process, attested.lebrel.ai and router-tee.lebrel.ai; no dstack-ingress) | `15bd7be7b090da7b83859cfbe8f3277cf05cc67c1cf249486801159222939e54` | receipt key id `721568bba8eb1424b02aef6134572c6f928deec3f967e42dc49633a3ca39f159`, public key `5b10c282dba4d68171cc2c629a8e277654cf0f4819e944e6dc3cd46faaa175a5` | 6 Nov 2026 08:20 UTC |
 | 1.3.7 | `v1.3.7` | `sha256:ad3f533f0b7fd67b8df9cbf407a9cfb54c90f10c67fa8bd9a01c458bec52bd35` (linux/amd64, Go 1.26, BuildKit v0.27.1, OCI media types; two builds identical) | `2ba084cd6a4bb044e6a03a4d2a7902bb7ae7b88a52e4ff707fd9681a63b7b663` (gateway compose, replica B) | receipt key id `95f8e35094b2aea22ceb3ff27a123871ef7092b2bdcf216e54527eaf9b649a82`, public key `dca6c014ee3f32c82f4a1fec440e66effd130de5b65808a7e54ec980b018e3b3` | 6 Nov 2026 08:20 UTC |
 | 1.3.6 (custom domain, instance A) | `v1.3.6` | `sha256:d3725f05e6017caee09adeb431c2b2e3d70b010c92cfc99f8bb4c55bd26c8b54` + dstack-ingress 2.2 (`deploy/dstack/docker-compose.custom-domain.yml`, router-tee.lebrel.ai) | `aa4f6387441feb40048718db273a58ab4c0457d8832580fbaff0470d9f44d835` | receipt key id `5ea853292f89ef2fa181fbff6c978b979c855c9a5ecbe2201bfb4d0478847872`, public key `832c4891654af084f2366d7156bc2bb3141fc0270920dbfd160d4d317612bec2` (an app key derived inside the VM); the request-encryption key is born at random inside the VM per boot and per UTC day and named only by the attestation | 2026-11-06 |
@@ -36,8 +37,12 @@ here the compose hash dstack reports, the image digest, and the receipt key id t
 derives.
 
 How anyone checks a running router: `scripts/verify-attestation.py <router> --compose-hash <row>
---app-id 4d72eae647c67ad42c972d24175d7c32ce9c871a --key-id <row> --reference deploy/dstack/reference-measurements/dstack-0.6.1.json
---compose-file deploy/dstack/<the row's compose>`.
+--app-id <the row's app> --key-id <row> --reference deploy/dstack/reference-measurements/<the app's file>
+--compose-file deploy/dstack/<the row's compose>`. The machine that serves today (first row):
+`scripts/verify-attestation.py https://attested.lebrel.ai --compose-hash 2bcd6faeb21e6c6edb805f923107bca8f3a210a04049361ecce355d2f9316465
+--app-id 40b35a054d2eff752b1b5c3e4dee7253ab941f68 --key-id ecfe903e9da3fcee15ee0758ce5d716ce77617d2c0d5840c1330e518d372297c
+--reference deploy/dstack/reference-measurements/dstack-0.6.1-phala-kms-2026-11.json --compose-file deploy/dstack/docker-compose.attested.yml`.
+The rows below it belong to the earlier app (`4d72eae647c67ad42c972d24175d7c32ce9c871a`, reference file `dstack-0.6.1.json`), which no longer runs the router.
 It asks the machine for a quote with a fresh nonce, verifies Intel's chain (dcap-qvl), recomputes
 every runtime event of the log and replays the log into the RTMRs, reads the compose hash, app id
 and key provider from the verified log, and compares them with the row and the arguments.
@@ -86,10 +91,29 @@ secrets were rotated the same morning. The 1.3.7 rows above were deployed in pla
 their keys are still derived under that app: the move to Phala's replacement KMS (new instances, new
 app id) follows and gets its own rows.
 
-`router-tee.lebrel.ai` carries a CAA record written by the retired dstack-ingress (Let's Encrypt, DNS-01,
-one ACME account), so the router in-process cannot obtain that name's certificate until the record is
-removed; the platform's edge reaches instance A as `attested.lebrel.ai` meanwhile, and that name is the
-one every client is told.
+**The move, 10 Nov 2026 21:19 UTC.** The router that serves `attested.lebrel.ai` is instance A2 of a new app
+(`40b35a054d2eff752b1b5c3e4dee7253ab941f68`) created under Phala's replacement KMS ("Phala KMS 2026-11"): its
+receipt key, the key of the name's certificate and its sealed secrets were never under the earlier KMS (first
+row; same image, same compose file, same OS measurements; the manifest's flags are public logs off, public
+system info off, public attestation data on). Every row of the earlier app, 1.1.0 to 1.3.7, is retired: a
+receipt signed with one of their keys after 6 Nov 2026 02:00 UTC carries the incident's doubt, and none is
+signed after 10 Nov 2026 21:17 UTC.
+
+The gateway of the new KMS's zone does not connect custom names to its apps yet, so the name is still
+connected to the earlier app, whose two instances now run only a relay
+(`deploy/dstack/docker-compose.relay.yml`, the official haproxy image pinned by digest, its whole
+configuration in that file; manifest hashes `fe259a1cea4cc683125bbfc7d56e3194385a5cb2eb4bb2dc526912a5d4ec6955`
+on prod9, the one in the name's path, and `c2f3e534ce5ef037874a939b147960bf7587e47ea1e02641b422ccc51ad28775` on
+prod5). The relay passes each connection, unread, inside its own verified TLS to the new app's gateway
+hostname, which hands it to the router's TLS listener: the client's TLS session ends in the router of the new
+app, and neither gateway nor the relay holds a key of it. What the relay does not change is who decides which
+machine receives the name's connections: the earlier zone's gateway, which knows the earlier app by
+certificates of the earlier KMS. Until the name is connected to the new app directly, the issuance of its
+certificate is to be pinned in DNS to the router's own ACME account (a CAA record), which a later row
+records. The Python client verifies this machine from 0.5.3.
+
+`router-tee.lebrel.ai` is not served any more: `attested.lebrel.ai` is the one name, for clients and for the
+platform's edge alike.
 
 From 1.3.3 an encrypted request also carries the moment it was sent, inside the ciphertext
 (`"lebrel_sent_at":<unix seconds>,` right after the salt, or first; required): a request older or
@@ -107,7 +131,8 @@ renewed outside the quote line (one renewal at a time, the others waiting for it
 most, so a crowd asking for fresh quotes starves nobody and a slow agent lines nobody up), and a
 document is not cached if the key rotated since its quote.
 
-Two compose files are kept: `deploy/dstack/docker-compose.yml` (the machine reached through the
+Besides `deploy/dstack/docker-compose.attested.yml` (the first row) and `docker-compose.relay.yml`, two
+earlier compose files are kept: `deploy/dstack/docker-compose.yml` (the machine reached through the
 dstack gateway hostname; its TLS terminates at Phala's gateway, outside the quote) and
 `deploy/dstack/docker-compose.custom-domain.yml` (the same router with dstack-ingress beside it,
 terminating TLS for router-tee.lebrel.ai inside the VM). Each has its own compose hash; the ledger

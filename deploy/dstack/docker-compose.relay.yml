@@ -1,0 +1,72 @@
+# The relay: a confidential VM of the EARLIER app (4d72eae6…, the app whose KMS root may have leaked on
+# 6 November 2026) that no longer runs the router. It only passes bytes: every TCP connection that dstack's
+# gateway hands it for attested.lebrel.ai (the custom name is still connected to the earlier app, because
+# the gateway of the new KMS's zone does not route custom names yet) is piped, unread, to the router's own
+# TLS listener in the NEW app (40b35a05…, Phala KMS 2026-11), through that app's gateway hostname.
+#
+#   client ──TLS (ends in the router, new app)──────────────────────────────────────────────┐
+#     └─ gateway (earlier zone, passes the stream by SNI) ─ this relay ─ gateway (new zone) ─ router :443
+#
+# The relay opens its own TLS connection to the new zone's gateway (the gateway's certificate and name are
+# verified; the gateway ends that outer TLS and hands the inner stream to port 443 of the new app); what
+# travels inside is the client's TLS session with the router, which neither gateway nor this relay can
+# read or alter. The relay holds no key and no certificate of the name, and this file passes it no secret:
+# the router's signing key, its certificate key and its sealed secrets live in the new app, under the new
+# KMS. Let's Encrypt's validation of the name (TLS-ALPN-01) travels the same way and is answered by the
+# router.
+#
+# What the relay does NOT change: which machine receives the name's connections is still decided by the
+# earlier zone's gateway, which knows the earlier app's instances by certificates of the earlier KMS. Until
+# the name is connected to the new app directly, the name's certificate issuance has to be pinned in DNS
+# (a CAA record naming the router's own ACME account), so that receiving its connections is not enough to
+# obtain a certificate for it. See RELEASES.md.
+#
+# The whole configuration is in this file, so dstack measures it (image digest included) into the
+# relay's quote. Image: the official haproxy 3.4.7-alpine (docker-library), pinned by digest. Nothing is
+# logged about a connection that ends normally; a failed one logs its time, duration and byte counts
+# (the address on the other side is the gateway's, never a customer's).
+services:
+  relay:
+    image: haproxy:3.4.7-alpine@sha256:b9fe316f718d5015c5cfebd8ca019591f3e44656f61d93cb8b59a1028961e530
+    restart: unless-stopped
+    ports:
+      - "443:8443"
+    entrypoint: ["/bin/sh", "-c", "printf '%s\\n' \"$$RELAY_CONFIG\" > /tmp/relay.cfg && exec haproxy -W -db -f /tmp/relay.cfg"]
+    environment:
+      RELAY_CONFIG: |
+        global
+          log stdout format raw local0 notice
+          maxconn 30000
+        defaults
+          mode tcp
+          log global
+          option tcplog
+          option dontlog-normal
+          option log-separate-errors
+          option clitcpka
+          option srvtcpka
+          clitcpka-idle 60s
+          clitcpka-intvl 15s
+          clitcpka-cnt 4
+          srvtcpka-idle 60s
+          srvtcpka-intvl 15s
+          srvtcpka-cnt 4
+          retries 1
+          timeout connect 4s
+          timeout client 1h
+          timeout server 1h
+          timeout tunnel 1h
+          timeout client-fin 30s
+          timeout server-fin 30s
+        resolvers system
+          parse-resolv-conf
+          timeout resolve 10s
+          hold timeout 24h
+          hold other 24h
+          hold refused 24h
+          hold nx 24h
+        frontend names
+          bind :8443
+          default_backend router
+        backend router
+          server a2 40b35a054d2eff752b1b5c3e4dee7253ab941f68-443.dstack-pha1-prod9.phala.network:443 ssl sni str(40b35a054d2eff752b1b5c3e4dee7253ab941f68-443.dstack-pha1-prod9.phala.network) verify required verifyhost 40b35a054d2eff752b1b5c3e4dee7253ab941f68-443.dstack-pha1-prod9.phala.network ca-file @system-ca resolvers system init-addr libc,last,none

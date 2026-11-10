@@ -1,0 +1,13 @@
+{
+  "os_image": "dstack-0.6.1",
+  "os_image_hash": "ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6",
+  "instance_type": "tdx.large (4 vCPU, 8 GB)",
+  "observed_on": "Phala Cloud prod9, 10 Nov 2026 (instance A2, app 40b35a05\u2026)",
+  "how": "OBSERVED on the TDX quotes of lebrel-router-a and its replica (Phala prod9/prod5), not an independent rebuild: dstack publishes for mkosi-os-v0.6.1 the os_image_hash ec43cb8c\u2026 (it matches the measured event) and a tdx_mrtd of 83baf004\u2026 that does NOT match the mr_td observed here (2a674327\u2026); the difference (QEMU page-add mode, firmware or build) is not reconciled yet. Until it is, the OS identity rests on Phala's build of the image.",
+  "mr_td": "2a674327c50218dba880066b349b8d559d749ed68dce33fd651c184a877d084b07a9e583767a7ad5da13ed91deec2b70",
+  "rtmr0": "fb14dc139f33d6fcf474bc8332cac001259fb31cfbcb6b34d4ceeb552a2c4466884a0cbde45ad98a05c5c060c23ad65a",
+  "rtmr1": "89ef86c5125b986c325f0a94acfa87718a4ef3a4d4f237dbb72dda3cf777fd2c054555fb4407eb53338d7d67329a7333",
+  "rtmr2": "e9000e338f33233e8f51b7fd031e1c158bdcf8572eab041c0bc8eb7fef48b23259a6a556e6c8e2af99999fc39c793179",
+  "kms_id": "3059301306072a8648ce3d020106082a8648ce3d03010703420004e8e325a477b0bf22800dc927a46c68638938d283fe73d1f9028eeac7028193f3470122193875f598b7addc503e534712ab437b4120776bbac32ddf8897f844ee",
+  "kms": "Phala KMS 2026-11, the replacement KMS after the incident of 6 Nov 2026 (key_provider_id in the app manifest)"
+}
