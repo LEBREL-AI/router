@@ -98,7 +98,7 @@
       "level": 2,
       "family": "deepseek-v4-pro",
       "claimed_revision": "deepseek-v4-pro",
-      "data_note": "Relayed by Lebrel's router, which keeps nothing, to Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the request, not you, and keeps its own retention policy. If Model Studio cannot answer, the request goes to DeepSeek's own API, through OpenRouter (which forwards it without storing it) or directly; DeepSeek keeps its own retention policy (China). The receipt names which served. Priced by Lebrel's published rates, whoever serves; Lebrel's rates for this model carry a peak-hour schedule (weekdays 01-04 and 06-10 UTC, except Chinese public holidays), named in the receipt; a fifth of the price is Lebrel's route fee.",
+      "data_note": "Relayed by Lebrel's router, which keeps nothing, to Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the request, not you, and keeps its own retention policy. If Model Studio cannot answer, or the request asks for token probabilities (logprobs), which its copy does not return, the request goes to DeepSeek's own API, through OpenRouter (which forwards it without storing it) or directly; DeepSeek keeps its own retention policy (China). The receipt names which served. Priced by Lebrel's published rates, whoever serves; Lebrel's rates for this model carry a peak-hour schedule (weekdays 01-04 and 06-10 UTC, except Chinese public holidays), named in the receipt; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
           "name": "alibaba/model-studio",
@@ -115,6 +115,7 @@
             "high",
             "max"
           ],
+          "unsupported": ["logprobs", "top_logprobs"],
           "timeout_seconds": 90,
           "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
         },

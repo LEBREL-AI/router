@@ -186,10 +186,33 @@ type Upstream struct {
 	// dialect that checks them (Alibaba's Model Studio refuses any other with an error): a value
 	// outside the list is dropped and the host's default applies. Empty: every value is forwarded.
 	ReasoningEfforts []string `json:"reasoning_efforts,omitempty"`
+	// Unsupported lists request fields this endpoint refuses outright (Alibaba's copy of DeepSeek V4 Pro
+	// answers 400 to `logprobs`, which DeepSeek's own API returns): a request that asks for one of them
+	// skips this upstream and goes to the next, so a route never takes less than the lab's API does.
+	// That is no failure and no fallback: nothing went wrong, the request was sent where it can be served.
+	// The last upstream of a route cannot list any: nothing would be left to take the request.
+	Unsupported []string `json:"unsupported,omitempty"`
 	// TimeoutSeconds is how long the upstream has to answer with headers (default 90) before the
 	// next one is tried; the body then streams for as long as the customer waits.
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 	DataNote       string `json:"data_note,omitempty"`
+}
+
+// refuses names the first field of the request this endpoint does not take, or "" when it takes them
+// all. A field sent as null, false or 0 asks for nothing and is not a reason to skip.
+func (u Upstream) refuses(fields map[string]json.RawMessage) string {
+	for _, name := range u.Unsupported {
+		raw, present := fields[name]
+		if !present {
+			continue
+		}
+		switch strings.TrimSpace(string(raw)) {
+		case "", "null", "false", "0":
+			continue
+		}
+		return name
+	}
+	return ""
 }
 
 // Endpoint is the base URL the requests go to: the environment's when BaseURLEnv names one, else BaseURL.
@@ -328,6 +351,11 @@ func (r *Route) validate() error {
 				return fmt.Errorf("upstream %q: reasoning_efforts entries must be plain words", u.Name)
 			}
 		}
+		for _, field := range u.Unsupported {
+			if field == "" || len(field) > 64 || strings.ContainsAny(field, " \t\r\n\"") {
+				return fmt.Errorf("upstream %q: unsupported entries must be request field names", u.Name)
+			}
+		}
 		if strings.TrimSpace(u.Model) == "" {
 			return fmt.Errorf("upstream %q: model is required", u.Name)
 		}
@@ -341,6 +369,15 @@ func (r *Route) validate() error {
 		default:
 			return fmt.Errorf("upstream %q: unknown dialect %q", u.Name, u.Dialect)
 		}
+	}
+	last := &r.Upstreams[0]
+	for i := range r.Upstreams {
+		if r.Upstreams[i].Priority >= last.Priority {
+			last = &r.Upstreams[i]
+		}
+	}
+	if len(last.Unsupported) > 0 {
+		return fmt.Errorf("upstream %q: the last upstream of a route cannot list unsupported fields, nothing would be left to take the request", last.Name)
 	}
 	if r.MaxContextTokens <= 0 || r.MaxOutputTokens <= 0 || r.DefaultMaxOutputTokens <= 0 || r.DefaultMaxOutputTokens > r.MaxOutputTokens {
 		return errors.New("max_context_tokens, max_output_tokens and default_max_output_tokens must be positive, default <= max")

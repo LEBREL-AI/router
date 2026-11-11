@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -189,5 +190,63 @@ func TestAFixedReasoningEndpointTurnsOffIntoTheLowestEffort(t *testing.T) {
 	silent := bodyFor(t, `{"model":"qwen/qwen3.8-max","messages":[]}`, u)
 	if _, present := silent["reasoning"]; present {
 		t.Fatalf("reasoning invented for a client that said nothing: %v", silent)
+	}
+}
+
+// An upstream that does not take a request field (Alibaba's copy of DeepSeek V4 Pro refuses logprobs)
+// is skipped for a request that asks for it and serves every other request; the skip is neither a
+// failure nor a fallback, so nobody is alerted, and a field sent as false asks for nothing.
+func TestAnUpstreamThatDoesNotTakeAFieldIsSkippedForRequestsThatAskForIt(t *testing.T) {
+	copyOfTheModel := newFakeUpstream(t, okJSON(`{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}`))
+	lab := newFakeUpstream(t, okJSON(`{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}`))
+	first := upstream("alibaba/model-studio", copyOfTheModel.server.URL, 1)
+	first.Unsupported = []string{"logprobs", "top_logprobs"}
+	var mu sync.Mutex
+	var alerts []string
+	h := newHarnessWith(t, routeFor(first, upstream("deepseek/api", lab.server.URL, 2)), board, func(s *Settings) {
+		s.Alert = func(text string) { mu.Lock(); alerts = append(alerts, text); mu.Unlock() }
+	})
+
+	served := func(body string) string {
+		t.Helper()
+		response := h.post(t, body, testKey)
+		io.Copy(io.Discard, response.Body)
+		if response.StatusCode != 200 {
+			t.Fatalf("status %d for %s", response.StatusCode, body)
+		}
+		return response.Header.Get(upstreamHeader)
+	}
+	if got := served(`{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`); got != "alibaba/model-studio" {
+		t.Fatalf("a plain request was served by %q", got)
+	}
+	if got := served(`{"model":"deepseek/deepseek-v4.1-flash","logprobs":true,"top_logprobs":5,"messages":[{"role":"user","content":"hi"}]}`); got != "deepseek/api" {
+		t.Fatalf("a request for token probabilities was served by %q", got)
+	}
+	if got := served(`{"model":"deepseek/deepseek-v4.1-flash","logprobs":false,"top_logprobs":null,"messages":[{"role":"user","content":"hi"}]}`); got != "alibaba/model-studio" {
+		t.Fatalf("logprobs false asks for nothing, yet %q served", got)
+	}
+	if len(copyOfTheModel.requests) != 2 || len(lab.requests) != 1 {
+		t.Fatalf("calls: first=%d lab=%d", len(copyOfTheModel.requests), len(lab.requests))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(alerts) != 0 {
+		t.Fatalf("a skipped upstream alerted the operator: %v", alerts)
+	}
+}
+
+// The last upstream of a route may not refuse fields: nothing would be left to take the request.
+func TestTheLastUpstreamCannotListUnsupportedFields(t *testing.T) {
+	last := upstream("deepseek/api", "https://example.invalid/v1", 2)
+	last.Unsupported = []string{"logprobs"}
+	route := routeFor(upstream("alibaba/model-studio", "https://example.invalid/v1", 1), last)
+	if err := route.validate(); err == nil || !strings.Contains(err.Error(), "last upstream") {
+		t.Fatalf("validate: %v", err)
+	}
+	only := upstream("zai/api", "https://example.invalid/v1", 1)
+	only.Unsupported = []string{"log probs"}
+	single := routeFor(only)
+	if err := single.validate(); err == nil {
+		t.Fatal("a field name with a space passed validation")
 	}
 }

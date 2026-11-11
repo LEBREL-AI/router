@@ -1148,8 +1148,24 @@ func (e *attemptsError) Summary() string { return strings.Join(e.attempts, " y "
 
 func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []byte, requestID, accept string) (*upstreamResult, error) {
 	failed := &attemptsError{}
+	// What the request asks for, read once and only for a route with an upstream that refuses fields.
+	var fields map[string]json.RawMessage
+	for i := range route.Upstreams {
+		if len(route.Upstreams[i].Unsupported) > 0 {
+			if err := json.Unmarshal(normalized, &fields); err != nil {
+				return nil, err
+			}
+			break
+		}
+	}
 	for i := range route.Upstreams {
 		upstream := &route.Upstreams[i]
+		if field := upstream.refuses(fields); field != "" && i < len(route.Upstreams)-1 {
+			// Not a failure and not a fallback: this endpoint does not take what the request asks
+			// for and the next one does, so the request goes where it can be served.
+			s.settings.Logger.Printf("request=%s upstream=%s does not take %s, next", requestID, upstream.Name, field)
+			continue
+		}
 		body, err := upstreamBody(normalized, upstream)
 		if err != nil {
 			return nil, err
