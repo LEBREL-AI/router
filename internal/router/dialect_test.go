@@ -243,10 +243,85 @@ func TestTheLastUpstreamCannotListUnsupportedFields(t *testing.T) {
 	if err := route.validate(); err == nil || !strings.Contains(err.Error(), "last upstream") {
 		t.Fatalf("validate: %v", err)
 	}
-	only := upstream("zai/api", "https://example.invalid/v1", 1)
-	only.Unsupported = []string{"log probs"}
-	single := routeFor(only)
-	if err := single.validate(); err == nil {
-		t.Fatal("a field name with a space passed validation")
+	for bad, want := range map[string]string{"log probs": "request field names", "max_tokens": "the router sets itself", "stream": "the router sets itself"} {
+		first := upstream("alibaba/model-studio", "https://example.invalid/v1", 1)
+		first.Unsupported = []string{bad}
+		named := routeFor(first, upstream("deepseek/api", "https://example.invalid/v1", 2))
+		if err := named.validate(); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("unsupported %q: %v", bad, err)
+		}
+	}
+	sends := upstream("alibaba/model-studio", "https://example.invalid/v1", 1)
+	sends.Unsupported = []string{"logprobs"}
+	sends.Defaults = map[string]any{"logprobs": true}
+	own := routeFor(sends, upstream("deepseek/api", "https://example.invalid/v1", 2))
+	if err := own.validate(); err == nil || !strings.Contains(err.Error(), "its own defaults send") {
+		t.Fatalf("an upstream that sends what it lists as unsupported: %v", err)
+	}
+}
+
+// A request only the later upstreams take, and they are down: the customer gets their failure, nothing
+// is charged, and the operator's alert says the first upstream was not asked instead of counting it as down.
+func TestASkippedUpstreamIsNotCountedAsDownWhenTheOthersFail(t *testing.T) {
+	copyOfTheModel := newFakeUpstream(t, okJSON(`{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}`))
+	down := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) })
+	alsoDown := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) })
+	first := upstream("alibaba/model-studio", copyOfTheModel.server.URL, 1)
+	first.Unsupported = []string{"logprobs", "top_logprobs"}
+	var mu sync.Mutex
+	var alerts []string
+	h := newHarnessWith(t, routeFor(first, upstream("openrouter/deepseek", down.server.URL, 2), upstream("deepseek/api", alsoDown.server.URL, 3)), board, func(s *Settings) {
+		s.Alert = func(text string) { mu.Lock(); alerts = append(alerts, text); mu.Unlock() }
+	})
+	before := h.balance(t)
+	response := h.post(t, `{"model":"deepseek/deepseek-v4.1-flash","logprobs":true,"messages":[{"role":"user","content":"hi"}]}`, testKey)
+	io.Copy(io.Discard, response.Body)
+	if response.StatusCode < 500 {
+		t.Fatalf("status %d", response.StatusCode)
+	}
+	if len(copyOfTheModel.requests) != 0 || len(down.requests) != 1 || len(alsoDown.requests) != 1 {
+		t.Fatalf("calls: skipped=%d second=%d third=%d", len(copyOfTheModel.requests), len(down.requests), len(alsoDown.requests))
+	}
+	if after := h.balance(t); after != before {
+		t.Fatalf("charged %d for a request nobody served", before-after)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(alerts) != 1 || !strings.Contains(alerts[0], "openrouter/deepseek (HTTP 503)") || !strings.Contains(alerts[0], "deepseek/api (HTTP 503)") ||
+		!strings.Contains(alerts[0], "sin preguntar a alibaba/model-studio (no admite logprobs)") {
+		t.Fatalf("the alert must name the two that failed and the one not asked: %q", alerts)
+	}
+}
+
+// The routes file the release ships loads and validates, and every lab's own API has one upstream name
+// per model: the watch's board is keyed by that name, so a shared one would lend a model another's verdict.
+func TestTheProductionRoutesFileLoads(t *testing.T) {
+	t.Setenv("ALIBABA_MODEL_STUDIO_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+	config, err := LoadConfig("../../routes.production.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	owners := map[string]string{}
+	routed := 0
+	for _, route := range config.Routes {
+		if route.Kind == routeKindEdition {
+			continue
+		}
+		routed++
+		if _, err := route.BillingContractHash(); err != nil {
+			t.Fatalf("%s: %v", route.ModelID, err)
+		}
+		for _, u := range route.Upstreams {
+			if strings.HasPrefix(u.Name, "alibaba/") || strings.HasPrefix(u.Name, "openrouter/") {
+				continue // a cloud or a relay serving several models: the board has no row under these names
+			}
+			if other, taken := owners[u.Name]; taken {
+				t.Fatalf("upstream name %q serves both %s and %s", u.Name, other, route.ModelID)
+			}
+			owners[u.Name] = route.ModelID
+		}
+	}
+	if routed != 8 {
+		t.Fatalf("%d routed models in the production file, 8 expected", routed)
 	}
 }

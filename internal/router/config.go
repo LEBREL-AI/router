@@ -158,7 +158,8 @@ func PricingTier(percent int64) string {
 
 // Upstream is one place a route can send a request. Lower priority goes first; the
 // order is fixed in the routes file and never changes with the clock. Body fields are
-// forced on every request (a client never picks the provider behind a route); Defaults
+// forced on every request (a client cannot name the provider behind a route; only a request field an
+// upstream does not take, see Unsupported, moves a request to the next one); Defaults
 // apply only when the client did not send the key (a lab's thinking mode, for instance).
 // Dialect names the request format the upstream speaks: "" or "openai" forwards the
 // client's fields as they are; "openrouter" maps the labs' own reasoning switches
@@ -190,13 +191,20 @@ type Upstream struct {
 	// answers 400 to `logprobs`, which DeepSeek's own API returns): a request that asks for one of them
 	// skips this upstream and goes to the next, so a route never takes less than the lab's API does.
 	// That is no failure and no fallback: nothing went wrong, the request was sent where it can be served.
-	// The last upstream of a route cannot list any: nothing would be left to take the request.
+	// The list suits only fields whose null, false or 0 mean "not asked" (logprobs, top_logprobs): such a
+	// value does not skip the upstream and is forwarded to it as sent. The last upstream of a route cannot
+	// list any (nothing would be left to take the request), and no upstream can list a field the router
+	// sets itself or one its own body or defaults add.
 	Unsupported []string `json:"unsupported,omitempty"`
 	// TimeoutSeconds is how long the upstream has to answer with headers (default 90) before the
 	// next one is tried; the body then streams for as long as the customer waits.
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 	DataNote       string `json:"data_note,omitempty"`
 }
+
+// routerSetFields are the request fields the router writes on every request: an upstream that listed one
+// as unsupported would never be asked.
+var routerSetFields = map[string]bool{"model": true, "messages": true, "max_tokens": true, "stream": true, "stream_options": true}
 
 // refuses names the first field of the request this endpoint does not take, or "" when it takes them
 // all. A field sent as null, false or 0 asks for nothing and is not a reason to skip.
@@ -207,7 +215,7 @@ func (u Upstream) refuses(fields map[string]json.RawMessage) string {
 			continue
 		}
 		switch strings.TrimSpace(string(raw)) {
-		case "", "null", "false", "0":
+		case "null", "false", "0":
 			continue
 		}
 		return name
@@ -354,6 +362,15 @@ func (r *Route) validate() error {
 		for _, field := range u.Unsupported {
 			if field == "" || len(field) > 64 || strings.ContainsAny(field, " \t\r\n\"") {
 				return fmt.Errorf("upstream %q: unsupported entries must be request field names", u.Name)
+			}
+			if routerSetFields[field] {
+				return fmt.Errorf("upstream %q: unsupported cannot list %q, a field the router sets itself", u.Name, field)
+			}
+			if _, forced := u.Body[field]; forced {
+				return fmt.Errorf("upstream %q: unsupported lists %q, which its own body sends", u.Name, field)
+			}
+			if _, defaulted := u.Defaults[field]; defaulted {
+				return fmt.Errorf("upstream %q: unsupported lists %q, which its own defaults send", u.Name, field)
 			}
 		}
 		if strings.TrimSpace(u.Model) == "" {

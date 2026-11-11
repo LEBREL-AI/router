@@ -23,7 +23,7 @@
       "level": 2,
       "family": "deepseek-v4.1-flash",
       "claimed_revision": "deepseek-flash",
-      "data_note": "Relayed by Lebrel's router, which keeps nothing, to Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the request, not you, and keeps its own retention policy. If Model Studio cannot answer, the request goes to DeepSeek's own API, through OpenRouter (which forwards it without storing it) or directly; DeepSeek keeps its own retention policy (China). The receipt names which served. Priced by Lebrel's published rates, the same day and night, whoever serves; a fifth of the price is Lebrel's route fee.",
+      "data_note": "Relayed by Lebrel's router, which keeps nothing, to Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the request, not you, and keeps its own retention policy. Its copy answers like DeepSeek's own API in Lebrel's sampled check; the token probabilities it reports (logprobs) differ from DeepSeek's. If Model Studio cannot answer, the request goes to DeepSeek's own API, through OpenRouter (which forwards it without storing it) or directly; DeepSeek keeps its own retention policy (China). The receipt names which served. Priced by Lebrel's published rates, the same day and night, whoever serves; a fifth of the price is Lebrel's route fee.",
       "upstreams": [
         {
           "name": "alibaba/model-studio",
@@ -44,7 +44,7 @@
             "max"
           ],
           "timeout_seconds": 90,
-          "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
+          "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy. Its token probabilities (logprobs) are this copy's own and differ from those of DeepSeek's own API."
         },
         {
           "name": "openrouter/deepseek",
@@ -352,7 +352,7 @@
           "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
         },
         {
-          "name": "moonshot/api",
+          "name": "moonshot/api-k3.1-pro",
           "base_url": "https://api.moonshot.ai/v1",
           "model": "kimi-k3.1-pro",
           "api_key_env": "MOONSHOT_API_KEY",

@@ -1131,7 +1131,10 @@ func contentTypeOr(response *http.Response, fallback string) string {
 // error itself, which may name an endpoint (for the log; an alert gets the Summary).
 type attemptsError struct {
 	attempts []string
-	last     error
+	// skipped names the upstreams that were not asked because they do not take a field of the request
+	// ("alibaba/model-studio (no admite logprobs)"): they did not fail and serve every other request.
+	skipped []string
+	last    error
 }
 
 func (e *attemptsError) Error() string {
@@ -1143,15 +1146,34 @@ func (e *attemptsError) Error() string {
 
 func (e *attemptsError) Unwrap() error { return e.last }
 
-// Summary names the attempts by upstream and reason, never an endpoint.
-func (e *attemptsError) Summary() string { return strings.Join(e.attempts, " y ") }
+// Summary names the attempts by upstream and reason, never an endpoint, and says which upstreams were
+// not asked at all, so a request only some upstreams take does not read as the whole route down.
+func (e *attemptsError) Summary() string {
+	summary := strings.Join(e.attempts, " y ")
+	if len(e.skipped) > 0 {
+		summary += "; sin preguntar a " + strings.Join(e.skipped, " ni a ")
+	}
+	return summary
+}
+
+// mayCarry reports whether the normalized request may carry one of the fields as a key.
+func mayCarry(normalized []byte, fields []string) bool {
+	for _, name := range fields {
+		if bytes.Contains(normalized, []byte(`"`+name+`":`)) {
+			return true
+		}
+	}
+	return false
+}
 
 func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []byte, requestID, accept string) (*upstreamResult, error) {
 	failed := &attemptsError{}
-	// What the request asks for, read once and only for a route with an upstream that refuses fields.
+	// What the request asks for, read once and only when it may carry a field some upstream of the route
+	// refuses: the normalized body is compact JSON and a quote inside a JSON string is always escaped, so
+	// `"name":` can only be a key, and every other request is spared the parsing.
 	var fields map[string]json.RawMessage
 	for i := range route.Upstreams {
-		if len(route.Upstreams[i].Unsupported) > 0 {
+		if mayCarry(normalized, route.Upstreams[i].Unsupported) {
 			if err := json.Unmarshal(normalized, &fields); err != nil {
 				return nil, err
 			}
@@ -1164,6 +1186,7 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 			// Not a failure and not a fallback: this endpoint does not take what the request asks
 			// for and the next one does, so the request goes where it can be served.
 			s.settings.Logger.Printf("request=%s upstream=%s does not take %s, next", requestID, upstream.Name, field)
+			failed.skipped = append(failed.skipped, upstream.Name+" (no admite "+field+")")
 			continue
 		}
 		body, err := upstreamBody(normalized, upstream)
@@ -1253,7 +1276,7 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 		case retryStatuses[response.StatusCode]:
 			// the last upstream failed as well: its status is relayed, and that is an outage, not a fallback
 			attempts := append(append([]string{}, failed.attempts...), fmt.Sprintf("%s (HTTP %d)", upstream.Name, response.StatusCode))
-			s.noteOutage(route, &attemptsError{attempts: attempts})
+			s.noteOutage(route, &attemptsError{attempts: attempts, skipped: failed.skipped})
 		case len(failed.attempts) > 0 && response.StatusCode >= 200 && response.StatusCode <= 299:
 			s.noteFallback(route, upstream, failed.attempts, requestID)
 		}
@@ -1332,7 +1355,7 @@ func (s *Server) noteOutage(route *Route, cause error) {
 }
 
 // upstreamBody rewrites the model id and applies the upstream's fixed fields; a client
-// can never choose the provider behind a route, only the route.
+// cannot name the provider behind a route, only the route.
 func upstreamBody(normalized []byte, upstream *Upstream) ([]byte, error) {
 	decoder := json.NewDecoder(bytes.NewReader(normalized))
 	decoder.UseNumber()

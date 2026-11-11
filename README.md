@@ -145,7 +145,8 @@ most every ten minutes per route, by upstream name and reason.
 An upstream may list request fields it refuses (`unsupported`): Model Studio's copy of DeepSeek V4 Pro
 answers 400 to `logprobs`, which DeepSeek's own API returns, so a request that asks for token
 probabilities skips Model Studio and goes to the next upstream. That is neither a failure nor a
-fallback, and the last upstream of a route cannot list any.
+fallback, and the last upstream of a route cannot list any. The list suits only fields whose null,
+false or 0 mean "not asked": such a value is forwarded as sent.
 Qwen: `qwen/qwen3.8-max` (Alibaba's `qwen3.8-max-0902` snapshot) and `qwen/qwen3.8-flash`, both
 1,000,000 context and 131,072 max output.
 
@@ -209,9 +210,9 @@ holidays. The route passes that through: `pricing.peak` in the routes file (mult
 weekdays, windows, holidays) is part of the billing contract, the customer pays the
 lab's rate of the moment plus the fee, and the receipt names the tier. The control plane
 prices with its own clock; if the two clocks sit on different sides of a boundary the
-router retries the hold once with the other tier. Nothing ever leaves DeepSeek for
-another host on price grounds; failover is only for outages, and only if a backup
-upstream is configured.
+router retries the hold once with the other tier. The order of a route's upstreams never
+changes with the clock or the price of the moment: a later upstream serves only when the
+ones before it cannot (an outage, or a request field they do not take).
 
 ```bash
 go test ./...
