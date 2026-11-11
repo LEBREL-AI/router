@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -202,9 +203,14 @@ type Upstream struct {
 	DataNote       string `json:"data_note,omitempty"`
 }
 
-// routerSetFields are the request fields the router writes on every request: an upstream that listed one
-// as unsupported would never be asked.
-var routerSetFields = map[string]bool{"model": true, "messages": true, "max_tokens": true, "stream": true, "stream_options": true}
+// routerSetFields are request fields the router writes itself (the model id on every request, a cap on
+// the output and the usage option of a stream when the client names none) or every request carries (the
+// messages): an upstream that listed one as unsupported would be asked almost never, or never.
+var routerSetFields = map[string]bool{"model": true, "messages": true, "max_tokens": true, "stream_options": true}
+
+// unsupportedName is what a refused field may be called: a plain identifier, written in the normalized
+// request exactly as listed (the JSON encoder escapes nothing in it), so the request can be searched for it.
+var unsupportedName = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
 
 // refuses names the first field of the request this endpoint does not take, or "" when it takes them
 // all. A field sent as null, false or 0 asks for nothing and is not a reason to skip.
@@ -360,11 +366,11 @@ func (r *Route) validate() error {
 			}
 		}
 		for _, field := range u.Unsupported {
-			if field == "" || len(field) > 64 || strings.ContainsAny(field, " \t\r\n\"") {
+			if !unsupportedName.MatchString(field) {
 				return fmt.Errorf("upstream %q: unsupported entries must be request field names", u.Name)
 			}
 			if routerSetFields[field] {
-				return fmt.Errorf("upstream %q: unsupported cannot list %q, a field the router sets itself", u.Name, field)
+				return fmt.Errorf("upstream %q: unsupported cannot list %q, a field the router writes or every request carries", u.Name, field)
 			}
 			if _, forced := u.Body[field]; forced {
 				return fmt.Errorf("upstream %q: unsupported lists %q, which its own body sends", u.Name, field)

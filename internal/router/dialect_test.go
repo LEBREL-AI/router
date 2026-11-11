@@ -225,7 +225,15 @@ func TestAnUpstreamThatDoesNotTakeAFieldIsSkippedForRequestsThatAskForIt(t *test
 	if got := served(`{"model":"deepseek/deepseek-v4.1-flash","logprobs":false,"top_logprobs":null,"messages":[{"role":"user","content":"hi"}]}`); got != "alibaba/model-studio" {
 		t.Fatalf("logprobs false asks for nothing, yet %q served", got)
 	}
-	if len(copyOfTheModel.requests) != 2 || len(lab.requests) != 1 {
+	// The key written with an escape is the same key: the request is normalized before it is searched.
+	if got := served(`{"model":"deepseek/deepseek-v4.1-flash","\u006cogprobs":true,"messages":[{"role":"user","content":"hi"}]}`); got != "deepseek/api" {
+		t.Fatalf("an escaped logprobs key was served by %q", got)
+	}
+	// A value that only looks like the field inside a message is not the field.
+	if got := served(`{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"\"logprobs\":true"}]}`); got != "alibaba/model-studio" {
+		t.Fatalf("a message that mentions logprobs was served by %q", got)
+	}
+	if len(copyOfTheModel.requests) != 3 || len(lab.requests) != 2 {
 		t.Fatalf("calls: first=%d lab=%d", len(copyOfTheModel.requests), len(lab.requests))
 	}
 	mu.Lock()
@@ -243,7 +251,8 @@ func TestTheLastUpstreamCannotListUnsupportedFields(t *testing.T) {
 	if err := route.validate(); err == nil || !strings.Contains(err.Error(), "last upstream") {
 		t.Fatalf("validate: %v", err)
 	}
-	for bad, want := range map[string]string{"log probs": "request field names", "max_tokens": "the router sets itself", "stream": "the router sets itself"} {
+	for bad, want := range map[string]string{"log probs": "request field names", "a<b": "request field names", "a\\b": "request field names",
+		"max_tokens": "the router writes or every request carries", "model": "the router writes or every request carries"} {
 		first := upstream("alibaba/model-studio", "https://example.invalid/v1", 1)
 		first.Unsupported = []string{bad}
 		named := routeFor(first, upstream("deepseek/api", "https://example.invalid/v1", 2))
@@ -257,6 +266,19 @@ func TestTheLastUpstreamCannotListUnsupportedFields(t *testing.T) {
 	own := routeFor(sends, upstream("deepseek/api", "https://example.invalid/v1", 2))
 	if err := own.validate(); err == nil || !strings.Contains(err.Error(), "its own defaults send") {
 		t.Fatalf("an upstream that sends what it lists as unsupported: %v", err)
+	}
+	forces := upstream("alibaba/model-studio", "https://example.invalid/v1", 1)
+	forces.Unsupported = []string{"logprobs"}
+	forces.Body = map[string]any{"logprobs": true}
+	forced := routeFor(forces, upstream("deepseek/api", "https://example.invalid/v1", 2))
+	if err := forced.validate(); err == nil || !strings.Contains(err.Error(), "its own body sends") {
+		t.Fatalf("an upstream whose body sends what it lists as unsupported: %v", err)
+	}
+	cannotStream := upstream("alibaba/model-studio", "https://example.invalid/v1", 1)
+	cannotStream.Unsupported = []string{"stream"}
+	fine := routeFor(cannotStream, upstream("deepseek/api", "https://example.invalid/v1", 2))
+	if err := fine.validate(); err != nil {
+		t.Fatalf("an upstream that cannot stream may say so: %v", err)
 	}
 }
 
@@ -297,6 +319,7 @@ func TestASkippedUpstreamIsNotCountedAsDownWhenTheOthersFail(t *testing.T) {
 // per model: the watch's board is keyed by that name, so a shared one would lend a model another's verdict.
 func TestTheProductionRoutesFileLoads(t *testing.T) {
 	t.Setenv("ALIBABA_MODEL_STUDIO_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+	t.Setenv("LEBREL_EDGE_ORIGIN", "")
 	config, err := LoadConfig("../../routes.production.json")
 	if err != nil {
 		t.Fatal(err)
