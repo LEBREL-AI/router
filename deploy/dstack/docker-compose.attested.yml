@@ -15,7 +15,7 @@
 # Image digest: 1.3.7 (RELEASES.md), the first image that knows these settings.
 services:
   router:
-    image: ghcr.io/lebrel-ai/router@sha256:ad3f533f0b7fd67b8df9cbf407a9cfb54c90f10c67fa8bd9a01c458bec52bd35
+    image: ghcr.io/lebrel-ai/router@sha256:de1cfaa9fe6218af1748bf5de38289b245f92099aba096e574c1f71cd7a40540
     restart: unless-stopped
     ports:
       - "8080:8090"
