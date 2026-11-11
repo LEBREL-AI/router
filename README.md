@@ -125,13 +125,13 @@ Browsers get CORS on the completion path, with the headers they ask for.
 
 ## Production: Alibaba Model Studio first, the labs behind
 
-Since 6 November 2026 six routes (the two DeepSeek, GLM-5.3, Kimi K3 and the two Qwen) go first
-to Alibaba Cloud Model Studio's copy of each model (`dialect: "alibaba"`, `DASHSCOPE_API_KEY`;
+Since 6 November 2026 the routes Model Studio serves (the two DeepSeek, GLM-5.3, Kimi K3, Kimi K3.1 Pro
+since 11 November, and the two Qwen) go first to Alibaba Cloud Model Studio's copy of each model (`dialect: "alibaba"`, `DASHSCOPE_API_KEY`;
 `base_url_env: ALIBABA_MODEL_STUDIO_BASE_URL` may move the endpoint to the workspace form of the
 same service, and the signed manifest keeps naming the public one). The previous upstreams stay
 behind as fallback: OpenRouter pinned to the lab for DeepSeek and Qwen (`dialect: "openrouter"`,
 `provider.order` = the lab, `allow_fallbacks: false`), then DeepSeek's own API; Z.ai's and
-Moonshot AI's own APIs for GLM-5.3 and Kimi K3. A fallback is taken on a transport error, a 5xx,
+Moonshot AI's own APIs for GLM-5.3 and the two Kimi. A fallback is taken on a transport error, a 5xx,
 or a refusal of Lebrel's credential or credit (401, 402 and 403 fail over like a 503); each
 upstream has `timeout_seconds` (default 90) to answer with headers. The receipt names the upstream
 that served. The Alibaba dialect maps every lab's reasoning switch (`thinking: {"type"}`,
@@ -142,6 +142,10 @@ effort when the switch is off (Qwen refuses the pair), and gives a host that alw
 (`reasoning_fixed`) its lowest listed effort to a client asking for none. GLM-5.3 Flash stays at Z.ai only. An answer served by
 a fallback, and a request no upstream could serve, alert the operator (`ALERT_WEBHOOK_URL`) at
 most every ten minutes per route, by upstream name and reason.
+An upstream may list request fields it refuses (`unsupported`): Model Studio's copy of DeepSeek V4 Pro
+answers 400 to `logprobs`, which DeepSeek's own API returns, so a request that asks for token
+probabilities skips Model Studio and goes to the next upstream. That is neither a failure nor a
+fallback, and the last upstream of a route cannot list any.
 Qwen: `qwen/qwen3.8-max` (Alibaba's `qwen3.8-max-0902` snapshot) and `qwen/qwen3.8-flash`, both
 1,000,000 context and 131,072 max output.
 

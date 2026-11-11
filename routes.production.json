@@ -326,6 +326,55 @@
       "default_max_output_tokens": 32768
     },
     {
+      "model_id": "moonshotai/kimi-k3.1-pro",
+      "display_name": "Kimi K3.1 Pro",
+      "base_model": "Kimi K3.1 Pro",
+      "level": 2,
+      "family": "kimi-k3.1-pro",
+      "claimed_revision": "kimi-k3.1-pro",
+      "data_note": "Relayed by Lebrel's router, which keeps nothing, to Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the request, not you, and keeps its own retention policy. If Model Studio cannot answer, the request goes to Moonshot AI's own API, which keeps its own retention policy. The receipt names which served. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
+      "upstreams": [
+        {
+          "name": "alibaba/model-studio",
+          "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+          "base_url_env": "ALIBABA_MODEL_STUDIO_BASE_URL",
+          "model": "kimi-k3.1-pro",
+          "api_key_env": "DASHSCOPE_API_KEY",
+          "priority": 1,
+          "usage_format": "openai",
+          "dialect": "alibaba",
+          "reasoning_efforts": [
+            "low",
+            "high",
+            "max"
+          ],
+          "timeout_seconds": 90,
+          "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
+        },
+        {
+          "name": "moonshot/api",
+          "base_url": "https://api.moonshot.ai/v1",
+          "model": "kimi-k3.1-pro",
+          "api_key_env": "MOONSHOT_API_KEY",
+          "priority": 2,
+          "usage_format": "openai",
+          "data_note": "Moonshot AI's own API, forwarded as-is (reasoning on, effort max by default; clients lower it with reasoning_effort or turn it off with thinking disabled)"
+        }
+      ],
+      "pricing": {
+        "input_microusd_per_million_tokens": 1950000,
+        "cached_input_microusd_per_million_tokens": 195000,
+        "output_microusd_per_million_tokens": 9750000,
+        "reservation_bps": 15000,
+        "fee_bps": 2000,
+        "version": "router-v3",
+        "effective_at": "2026-11-11T02:00:00.000Z"
+      },
+      "max_context_tokens": 1048576,
+      "max_output_tokens": 131072,
+      "default_max_output_tokens": 32768
+    },
+    {
       "model_id": "qwen/qwen3.8-max",
       "display_name": "Qwen3.8 Max",
       "base_model": "Qwen3.8-Max",

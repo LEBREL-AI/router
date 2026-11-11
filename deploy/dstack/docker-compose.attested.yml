@@ -37,7 +37,7 @@ services:
       - DIRECT_HOSTS=attested.lebrel.ai
       # dstack's gateway shows no client address: wrong keys are counted for nobody, never for everyone.
       - CLIENT_ADDRESS=none
-      # Alibaba Model Studio's endpoint for the six routes it serves first: public and measured, so the
+      # Alibaba Model Studio's endpoint for the routes it serves first: public and measured, so the
       # signed manifests name where requests go (the workspace form of the same service may replace it).
       - ALIBABA_MODEL_STUDIO_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
       - ROUTES_FILE=/etc/lebrel-router/routes.json

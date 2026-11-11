@@ -25,7 +25,7 @@ services:
       - BOARD_URL=https://models.lebrel.ai/watch
       - BOARD_REFRESH_SECONDS=300
       - BOARD_PUBLIC_KEY_HEX=536a6eaa6c97091b653519008b0ffc1d76e5e32067b36f3802c7574aebf498c4
-      # Alibaba Model Studio's endpoint for the six routes it serves first: public and measured, so the
+      # Alibaba Model Studio's endpoint for the routes it serves first: public and measured, so the
       # signed manifests name where requests go.
       - ALIBABA_MODEL_STUDIO_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
       - MAX_REQUEST_BYTES=33554432
