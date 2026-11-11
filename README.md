@@ -181,8 +181,7 @@ reported. The backlog, its alerts, restarts and the way to add capacity are in
 
 ## Control plane
 
-The control plane changes routed models need live on the platform branch
-`claude/router-billing` (worktree `platform-router`): the edge serves routed models
+The control plane changes routed models need live on the platform: the edge serves routed models
 next to the encrypted runtime (EHBP requests take the encrypted path, everything else
 the routes, and the encrypted model is refused in plaintext), and settlements accept
 `provider`, the upstream that served the request, stored on the usage event. The

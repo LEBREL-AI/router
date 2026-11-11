@@ -9,7 +9,7 @@ saturates (another instance), and the alerts that say when to pull it.
   the customer's first byte (`ACCEPT_TIMEOUT_MS`, 3 s). Only if lebrel.ai cannot answer in time is
   the acceptance queued, and the queue delivers it before the settlement. A routed hold is no longer
   "never accepted" while its answer streams (audit `audit3-plans-scale` HIGH-1, `audit3-plans-money`
-  finding 3). On the platform's branch `claude/subscriptions` (58e3794) a `router-*` hold never
+  finding 3). With the platform's subscriptions change a `router-*` hold never
   accepted is closed at zero after 30 minutes and an accepted one waits 6 hours; an acceptance that
   arrives after such a close is answered 200 (`closedByReconciler`) and the settlement behind it is
   taken as the close's correction. A refusal (reservation gone or closed: nothing could be charged)
@@ -160,11 +160,11 @@ open streams do (requests per second × seconds per answer).
 2. **The platform's ledger**, shared by every instance: more router instances do not add to it.
    In production every charged settlement credits one revenue row; the scale audit measured that row
    at about 380 postings/s with a 2.5 ms commit (500 to 950/s estimated for Aurora), so one
-   instance's 320/s is already in its range. The platform's branch `claude/subscriptions` (not
+   instance's 320/s is already in its range. The platform's subscriptions change (not
    deployed) splits it into 16 revenue rows (audit `audit3-plans-scale` HIGH-2); until that ships,
    the next step past one instance is the platform's, not another router. The platform holds a database
    connection only while one of a call's statements runs; when the platform keeps failing (5xx,
-   `ledger_busy` on branch `claude/subscriptions`) the router drops to one probe at a time. Calls in
+   `ledger_busy` with that change) the router drops to one probe at a time. Calls in
    flight add up across instances: watch Hyperdrive's connections (about 100 for the whole site)
    when adding one.
 3. **The labs' limits per account**, shared by every instance, never raised by the router:
