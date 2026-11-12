@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -127,8 +128,11 @@ type Settings struct {
 	// Alert hands the operator an alert (the notifier's Notify); nil only logs. AbandonAfter is how
 	// long a customer must have waited for the first upstream's answer before their leaving counts
 	// as a route in trouble (default 10 s): many of those are an outage no upstream error shows.
-	Alert           func(string)
-	AbandonAfter    time.Duration
+	Alert        func(string)
+	AbandonAfter time.Duration
+	// Patience is how long, and how, a request waits for a route whose upstreams all refuse for the
+	// moment before the customer is told (patience.go).
+	Patience        Patience
 	MaxRequestBytes int64
 	ManifestWindow  time.Duration
 	HTTPClient      *http.Client
@@ -167,6 +171,9 @@ type Server struct {
 	alerts  map[string]alertState
 	// editions holds each edition route's verified encryption key (edition.go)
 	editions editionKeys
+	// pauses holds what each upstream of each route said about its limit (patience.go); the map is
+	// built once and only read afterwards
+	pauses map[string]*pause
 }
 
 type cachedManifest struct {
@@ -206,6 +213,7 @@ func New(settings Settings) (*Server, error) {
 	if settings.AbandonAfter <= 0 {
 		settings.AbandonAfter = defaultAbandonAfter
 	}
+	settings.Patience = settings.Patience.withDefaults()
 	if settings.PeerClient == nil {
 		settings.PeerClient = &http.Client{Timeout: peerReceiptTimeout, Transport: &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 8, IdleConnTimeout: 90 * time.Second},
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
@@ -239,7 +247,7 @@ func New(settings Settings) (*Server, error) {
 	for i, host := range settings.DirectHosts {
 		settings.DirectHosts[i] = normaliseHost(host)
 	}
-	server := &Server{settings: settings, routes: map[string]*Route{}, slugs: map[string]*Route{}, hashes: map[string]string{}, alerts: map[string]alertState{}, manifests: map[string]cachedManifest{}}
+	server := &Server{settings: settings, routes: map[string]*Route{}, slugs: map[string]*Route{}, hashes: map[string]string{}, alerts: map[string]alertState{}, manifests: map[string]cachedManifest{}, pauses: map[string]*pause{}}
 	server.cutCtx, server.cutAll = context.WithCancel(context.Background())
 	for i := range settings.Routes.Routes {
 		route := &settings.Routes.Routes[i]
@@ -258,6 +266,7 @@ func New(settings Settings) (*Server, error) {
 		server.slugs[route.Slug()] = route
 		server.hashes[route.ModelID] = hash
 		for _, u := range route.Upstreams {
+			server.pauses[pauseKey(route, u.Name)] = &pause{}
 			if u.APIKeyEnv != "" && u.APIKey() == "" {
 				settings.Logger.Printf("route=%s upstream=%s warning: %s is not set, upstream will fail", route.ModelID, u.Name, u.APIKeyEnv)
 			}
@@ -956,6 +965,14 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 			// outage the outage alert never sees (every customer leaves before the upstream's time)
 			s.noteAbandoned(route)
 		}
+		var failed *attemptsError
+		if errors.As(lastErr, &failed) && failed.busy {
+			// The upstreams are at their limit with Lebrel for longer than the request could wait. The
+			// customer is told to come back, in Lebrel's words and with the time an upstream named.
+			w.Header().Set("Retry-After", strconv.Itoa(failed.retrySeconds()))
+			s.writeError(w, http.StatusServiceUnavailable, "upstream_busy", "the model's provider is at capacity; retry in a few seconds")
+			return
+		}
 		s.writeError(w, http.StatusBadGateway, "upstream_unavailable", "no upstream could serve the request")
 		return
 	}
@@ -1135,6 +1152,13 @@ type attemptsError struct {
 	// ("alibaba/model-studio (no admite logprobs)"): they did not fail and serve every other request.
 	skipped []string
 	last    error
+	// rounds is how many times the route was asked and waited how long it took in all; busy says
+	// that what kept the request unanswered was an upstream at its limit with Lebrel, and retryAfter
+	// when one of them may be asked again.
+	rounds     int
+	waited     time.Duration
+	busy       bool
+	retryAfter time.Duration
 }
 
 func (e *attemptsError) Error() string {
@@ -1153,7 +1177,25 @@ func (e *attemptsError) Summary() string {
 	if len(e.skipped) > 0 {
 		summary += "; sin preguntar a " + strings.Join(e.skipped, " ni a ")
 	}
+	if e.rounds > 1 {
+		summary += fmt.Sprintf("; %d intentos en %s", e.rounds, e.waited.Round(100*time.Millisecond))
+	}
 	return summary
+}
+
+// retrySeconds is the Retry-After a customer is given when the route is busy: when an upstream may
+// be asked again, in whole seconds, never under one.
+func (e *attemptsError) retrySeconds() int {
+	seconds := int((e.retryAfter + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
+}
+
+// pauseKey names one upstream of one route.
+func pauseKey(route *Route, upstream string) string {
+	return route.ModelID + "\x00" + upstream
 }
 
 // mayCarry reports whether the normalized request may carry one of the fields as a key.
@@ -1166,8 +1208,11 @@ func mayCarry(normalized []byte, fields []string) bool {
 	return false
 }
 
+// callUpstreams asks the route's upstreams, in order, until one takes the request. When none does and
+// what they said may pass in a moment (a rate limit, an overload, a broken connection), the route is
+// asked again after a wait, for as long as the request's patience lasts: a provider's "not now" costs
+// the customer a moment, not the answer.
 func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []byte, requestID, accept string) (*upstreamResult, error) {
-	failed := &attemptsError{}
 	// What the request asks for, read once and only when it may carry a field some upstream of the route
 	// refuses: the normalized body is compact JSON and a quote inside a JSON string is always escaped, so
 	// `"name":` can only be a key, and every other request is spared the parsing.
@@ -1180,18 +1225,58 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 			break
 		}
 	}
+	began := time.Now()
+	for round := 1; ; round++ {
+		result, failed, wait, again, err := s.askUpstreams(ctx, route, fields, normalized, requestID, accept, round, began)
+		if err != nil || result != nil {
+			return result, err
+		}
+		if !again {
+			return nil, failed
+		}
+		s.settings.Logger.Printf("request=%s model=%s no upstream took it (%s), asking again in %s", requestID, route.ModelID, failed.Summary(), wait.Round(time.Millisecond))
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			// the customer left, or a shutdown cut the wait: nothing more is asked
+			timer.Stop()
+			failed.last = fmt.Errorf("waiting to ask the route again: %w", ctx.Err())
+			return nil, failed
+		}
+	}
+}
+
+// askUpstreams is one round over the route's upstreams. It returns the answer (or the refusal that is
+// relayed to the customer), or else what each upstream said, with whether the route may be asked
+// again and after how long.
+func (s *Server) askUpstreams(ctx context.Context, route *Route, fields map[string]json.RawMessage, normalized []byte, requestID, accept string, round int, began time.Time) (*upstreamResult, *attemptsError, time.Duration, bool, error) {
+	patience := s.settings.Patience
+	failed := &attemptsError{rounds: round}
+	var end roundEnd
 	for i := range route.Upstreams {
 		upstream := &route.Upstreams[i]
-		if field := upstream.refuses(fields); field != "" && i < len(route.Upstreams)-1 {
+		last := i == len(route.Upstreams)-1
+		if field := upstream.refuses(fields); field != "" && !last {
 			// Not a failure and not a fallback: this endpoint does not take what the request asks
 			// for and the next one does, so the request goes where it can be served.
 			s.settings.Logger.Printf("request=%s upstream=%s does not take %s, next", requestID, upstream.Name, field)
 			failed.skipped = append(failed.skipped, upstream.Name+" (no admite "+field+")")
 			continue
 		}
+		held := s.pauses[pauseKey(route, upstream.Name)]
+		if left := held.left(time.Now()); left > 0 && patience.Budget >= 0 {
+			// It is being left alone (it named a time, or it has been refusing everyone): by this
+			// request as by every other, and the next upstream is asked meanwhile.
+			failed.attempts = append(failed.attempts, upstream.Name+" (en pausa por su límite)")
+			failed.last = fmt.Errorf("%s: left alone for %s after it refused", upstream.Name, left.Round(time.Millisecond))
+			end.note(left, true)
+			s.settings.Logger.Printf("request=%s upstream=%s is left alone for %s more, next", requestID, upstream.Name, left.Round(time.Millisecond))
+			continue
+		}
 		body, err := upstreamBody(normalized, upstream)
 		if err != nil {
-			return nil, err
+			return nil, nil, 0, false, err
 		}
 		// The upstream has its own time to answer with headers; the body then streams under ctx, and
 		// the call's context ends with the answer (release) or here, when the next upstream is tried.
@@ -1211,7 +1296,7 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 		if err != nil {
 			silence.Stop()
 			endCall(nil)
-			return nil, err
+			return nil, nil, 0, false, err
 		}
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("Accept", "application/json, text/event-stream")
@@ -1241,51 +1326,107 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 			endCall(nil)
 			reason := "transport error"
 			if errors.Is(err, errUpstreamSilent) || errors.Is(context.Cause(callCtx), errUpstreamSilent) {
+				// it had its whole time and said nothing: this request does not ask it again
 				reason = fmt.Sprintf("no answer within %s", upstream.Timeout())
+			} else {
+				// a connection that broke may hold the next time
+				end.note(patience.wait(round), false)
 			}
 			failed.attempts = append(failed.attempts, upstream.Name+" ("+reason+")")
 			failed.last = fmt.Errorf("%s: %s: %w", upstream.Name, reason, err)
 			s.settings.Logger.Printf("request=%s upstream=%s %s, trying next", requestID, upstream.Name, reason)
 			if ctx.Err() != nil {
-				return nil, failed
+				failed.waited = time.Since(began)
+				return nil, failed, 0, false, nil
 			}
 			continue
 		}
-		if retryStatuses[response.StatusCode] && i < len(route.Upstreams)-1 {
-			failed.attempts = append(failed.attempts, fmt.Sprintf("%s (HTTP %d)", upstream.Name, response.StatusCode))
-			failed.last = fmt.Errorf("%s: HTTP %d", upstream.Name, response.StatusCode)
-			s.settings.Logger.Printf("request=%s upstream=%s status=%d, trying next", requestID, upstream.Name, response.StatusCode)
+		status := response.StatusCode
+		switch {
+		case status >= 200 && status <= 299:
+			held.served()
+		case busyStatuses[status]:
+			// At its limit with Lebrel, or overloaded. If it named a time, or has refused everyone for
+			// a while, it is left alone until then by every request; if not, this request waits its own
+			// wait and nobody else is held back.
+			now := time.Now()
+			left := held.refuse(now, retryAfter(response.Header, now), patience)
+			if left <= 0 {
+				left = patience.wait(round)
+			}
+			end.note(left, true)
+		case passingStatuses[status]:
+			end.note(patience.wait(round), false)
+		}
+		if retryStatuses[status] && !last {
+			failed.attempts = append(failed.attempts, fmt.Sprintf("%s (HTTP %d)", upstream.Name, status))
+			failed.last = fmt.Errorf("%s: HTTP %d", upstream.Name, status)
+			s.settings.Logger.Printf("request=%s upstream=%s status=%d, trying next", requestID, upstream.Name, status)
 			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxErrorBodyBytes))
 			response.Body.Close()
 			endCall(nil)
 			continue
 		}
-		if credentialStatuses[response.StatusCode] {
-			// The last upstream refused Lebrel's own credential or credit: that is Lebrel's outage,
-			// never the customer's, so its words ("insufficient credits", "invalid key") are not
-			// relayed as if they were about the customer's account.
-			failed.attempts = append(failed.attempts, fmt.Sprintf("%s (HTTP %d, Lebrel's credential refused)", upstream.Name, response.StatusCode))
-			failed.last = fmt.Errorf("%s: HTTP %d", upstream.Name, response.StatusCode)
-			s.settings.Logger.Printf("request=%s upstream=%s status=%d refused Lebrel's credential, no upstream left", requestID, upstream.Name, response.StatusCode)
+		if retryStatuses[status] {
+			// The last upstream failed as well. If the route may be asked again, it is. If not, what the
+			// upstream answered is relayed, with two exceptions that are Lebrel's affair and never the
+			// customer's, so their words are not passed on as if they were about the customer's account:
+			// a refused credential ("insufficient credits", "invalid key") and a limit reached ("too
+			// many requests", which speaks of Lebrel's account with the upstream).
+			wait, again := s.another(ctx, began, end)
+			if !again && !credentialStatuses[status] && !busyStatuses[status] {
+				attempts := append(append([]string{}, failed.attempts...), fmt.Sprintf("%s (HTTP %d)", upstream.Name, status))
+				s.noteOutage(route, &attemptsError{attempts: attempts, skipped: failed.skipped, rounds: round, waited: time.Since(began)})
+				return &upstreamResult{upstream: upstream, response: response, release: func() { endCall(nil) }}, nil, 0, false, nil
+			}
+			reason := fmt.Sprintf("HTTP %d", status)
+			if credentialStatuses[status] {
+				reason += ", Lebrel's credential refused"
+				s.settings.Logger.Printf("request=%s upstream=%s status=%d refused Lebrel's credential, no upstream left", requestID, upstream.Name, status)
+			}
+			failed.attempts = append(failed.attempts, upstream.Name+" ("+reason+")")
+			failed.last = fmt.Errorf("%s: HTTP %d", upstream.Name, status)
 			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxErrorBodyBytes))
 			response.Body.Close()
 			endCall(nil)
-			return nil, failed
+			return s.roundOver(failed, end, wait, again, began)
 		}
-		switch {
-		case retryStatuses[response.StatusCode]:
-			// the last upstream failed as well: its status is relayed, and that is an outage, not a fallback
-			attempts := append(append([]string{}, failed.attempts...), fmt.Sprintf("%s (HTTP %d)", upstream.Name, response.StatusCode))
-			s.noteOutage(route, &attemptsError{attempts: attempts, skipped: failed.skipped})
-		case len(failed.attempts) > 0 && response.StatusCode >= 200 && response.StatusCode <= 299:
+		if len(failed.attempts) > 0 && status >= 200 && status <= 299 {
 			s.noteFallback(route, upstream, failed.attempts, requestID)
 		}
-		return &upstreamResult{upstream: upstream, response: response, release: func() { endCall(nil) }}, nil
+		return &upstreamResult{upstream: upstream, response: response, release: func() { endCall(nil) }}, nil, 0, false, nil
 	}
 	if failed.last == nil {
 		failed.last = errors.New("no upstreams")
 	}
-	return nil, failed
+	wait, again := s.another(ctx, began, end)
+	return s.roundOver(failed, end, wait, again, began)
+}
+
+// another reports whether the route may be asked again, and after how long: only when something it
+// was told may pass in a moment, the customer is still waiting, and the wait fits what is left of the
+// request's patience.
+func (s *Server) another(ctx context.Context, began time.Time, end roundEnd) (time.Duration, bool) {
+	patience := s.settings.Patience
+	if patience.Budget < 0 || !end.passing || ctx.Err() != nil {
+		return 0, false
+	}
+	wait := patience.spread(end.wait)
+	if time.Since(began)+wait > patience.Budget {
+		return 0, false
+	}
+	return wait, true
+}
+
+// roundOver closes a round no upstream answered: asked again after wait, or given up, and then said
+// whether what kept the request unanswered was an upstream at its limit and when it may be asked.
+func (s *Server) roundOver(failed *attemptsError, end roundEnd, wait time.Duration, again bool, began time.Time) (*upstreamResult, *attemptsError, time.Duration, bool, error) {
+	failed.waited = time.Since(began)
+	if again {
+		return nil, failed, wait, true, nil
+	}
+	failed.busy, failed.retryAfter = end.busy, end.wait
+	return nil, failed, 0, false, nil
 }
 
 // errUpstreamSilent ends a call whose upstream has not answered within its time.

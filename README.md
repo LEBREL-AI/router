@@ -142,6 +142,18 @@ effort when the switch is off (Qwen refuses the pair), and gives a host that alw
 (`reasoning_fixed`) its lowest listed effort to a client asking for none. GLM-5.3 Flash stays at Z.ai only. An answer served by
 a fallback, and a request no upstream could serve, alert the operator (`ALERT_WEBHOOK_URL`) at
 most every ten minutes per route, by upstream name and reason.
+When no upstream of a route takes a request and what they answered may pass in a moment (a rate limit
+or an overload: 429, 503; a gateway's error: 408, 425, 500, 502, 504; a connection that broke), the
+route is asked again after a wait instead of the customer being refused: half a second after the first
+round, doubled each round up to four seconds, or the time the upstream names with `Retry-After`, for
+up to twelve seconds from the request's first call. An upstream that names a time, or that has refused
+eight requests in a row with no answer between them, is left alone by every request until that time
+is over, and the route's next upstream is asked meanwhile; one that refuses a request now and then
+holds nobody else back. A request an upstream at its limit kept unanswered past that patience gets
+`503 upstream_busy` with `Retry-After`, in the router's own words: an upstream's 429 speaks of Lebrel's
+account with it, never of the customer's, and is not relayed. Nothing is charged for it, and only
+then is the operator alerted. A refused credential, an unknown model and an upstream that kept silent
+for its whole `timeout_seconds` are not waited for.
 An upstream may list request fields it refuses (`unsupported`): Model Studio's copy of DeepSeek V4 Pro
 answers 400 to `logprobs`, which DeepSeek's own API returns, so a request that asks for token
 probabilities skips Model Studio and goes to the next upstream. That is neither a failure nor a

@@ -97,6 +97,7 @@ func sseHandler(w http.ResponseWriter, r *http.Request) {
 
 type harness struct {
 	server      *httptest.Server
+	router      *Server
 	ledger      *ledger.InMemory
 	signer      *Signer
 	route       Route
@@ -165,8 +166,10 @@ func newHarnessWith(t *testing.T, route Route, board string, adjust func(*Settin
 	}
 	receipts := NewReceiptStore(time.Hour, 100)
 	settlements := runningQueue(t, inMemory)
+	// One round and no pauses unless a test asks for patience: what these tests say about an upstream
+	// that fails is what the route does once its patience is spent.
 	settings := Settings{Routes: Config{Routes: []Route{route}}, Auth: authenticator, Ledger: inMemory, Signer: signer, Receipts: receipts, Settlements: settlements,
-		Verification: verification, BoardURL: "https://models.lebrel.ai/watch", Now: func() time.Time { return time.Unix(1_900_000_000, 0) }}
+		Verification: verification, BoardURL: "https://models.lebrel.ai/watch", Now: func() time.Time { return time.Unix(1_900_000_000, 0) }, Patience: Patience{Budget: -1}}
 	if adjust != nil {
 		adjust(&settings)
 	}
@@ -176,7 +179,7 @@ func newHarnessWith(t *testing.T, route Route, board string, adjust func(*Settin
 	}
 	ts := httptest.NewServer(server)
 	t.Cleanup(ts.Close)
-	return &harness{server: ts, ledger: inMemory, signer: signer, route: route, receipts: receipts, auth: authenticator, settlements: settlements}
+	return &harness{server: ts, router: server, ledger: inMemory, signer: signer, route: route, receipts: receipts, auth: authenticator, settlements: settlements}
 }
 
 func (h *harness) post(t *testing.T, body string, key string) *http.Response {
