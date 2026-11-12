@@ -8,6 +8,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"lebrel-router/internal/router"
 )
 
 func TestTrustedIngressPrefixesReadAddressesAndCIDRsAndUnmapIPv4(t *testing.T) {
@@ -61,4 +64,31 @@ func TestTheTLSListenerTakesOneCertificateSource(t *testing.T) {
 	if _, err := config.GetCertificate(&tls.ClientHelloInfo{ServerName: "evil.example"}); err == nil {
 		t.Fatal("a name outside TLS_ACME_HOSTS must be refused")
 	}
+}
+
+// The patience of the routes can be set, or switched off, from the machine's configuration.
+func TestUpstreamPatienceIsReadFromTheEnvironment(t *testing.T) {
+	for value, want := range map[string]time.Duration{"": 0, "  ": 0, "8": 8 * time.Second, " 20 ": 20 * time.Second, "0": -1} {
+		got, err := upstreamPatience(value)
+		if err != nil || got.Budget != want {
+			t.Errorf("%q: budget %s, %v; want %s", value, got.Budget, err, want)
+		}
+	}
+	for _, bad := range []string{"-1", "1.5", "soon", "61", "8s"} {
+		if _, err := upstreamPatience(bad); err == nil {
+			t.Errorf("%q must be refused", bad)
+		}
+	}
+	if describePatience(mustPatience(t, "0")) != "off (one round per request)" || describePatience(mustPatience(t, "")) != "default" || describePatience(mustPatience(t, "8")) != "8s" {
+		t.Error("the start-up line says what the routes will do")
+	}
+}
+
+func mustPatience(t *testing.T, value string) router.Patience {
+	t.Helper()
+	got, err := upstreamPatience(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
 }

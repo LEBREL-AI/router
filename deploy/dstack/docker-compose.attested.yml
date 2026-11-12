@@ -50,6 +50,9 @@ services:
       - SETTLEMENT_CONCURRENCY=8
       - SETTLEMENT_ALERT_SECONDS=5
       - SHUTDOWN_SECONDS=600
+      # How long a request may wait for a route whose providers all refuse for the moment before the
+      # customer is told (0: no waiting).
+      - UPSTREAM_PATIENCE_SECONDS=8
       # Encrypted at deploy time, released by the KMS to this measurement only. CONTROL_PLANE_SECRET
       # is this machine's own credential (the platform's GATEWAY_MACHINE_CREDENTIALS), which opens the
       # router's routes and nothing else; EDGE_PROXY_TOKEN is the edge header's value, so the

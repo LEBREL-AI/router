@@ -146,14 +146,22 @@ When no upstream of a route takes a request and what they answered may pass in a
 or an overload: 429, 503; a gateway's error: 408, 425, 500, 502, 504; a connection that broke), the
 route is asked again after a wait instead of the customer being refused: half a second after the first
 round, doubled each round up to four seconds, or the time the upstream names with `Retry-After`, for
-up to twelve seconds from the request's first call. An upstream that names a time, or that has refused
-eight requests in a row with no answer between them, is left alone by every request until that time
-is over, and the route's next upstream is asked meanwhile; one that refuses a request now and then
-holds nobody else back. A request an upstream at its limit kept unanswered past that patience gets
-`503 upstream_busy` with `Retry-After`, in the router's own words: an upstream's 429 speaks of Lebrel's
-account with it, never of the customer's, and is not relayed. Nothing is charged for it, and only
-then is the operator alerted. A refused credential, an unknown model and an upstream that kept silent
-for its whole `timeout_seconds` are not waited for.
+up to eight seconds from the request's first call (`UPSTREAM_PATIENCE_SECONDS`; 0 for no waiting), so
+the customer has an answer, one way or the other, inside the ten seconds many clients wait.
+An upstream that refuses a request now and then holds nobody else back. One that names a time is left
+alone by every request until that time is over (a time longer than four seconds only from its second
+refusal in a row, so a single odd refusal closes the route to nobody else), and so is one that has
+refused eight calls in a row with no answer between them; the route's next upstream is asked
+meanwhile. Once such an upstream has refused again when its time was over, a customer who comes while
+it is left alone is told at once. At most 32 requests of a route wait to ask it again at one time;
+past that a request is told at once too, so the calls a provider that refuses gets are bounded however
+many customers come.
+A request an upstream at its limit kept unanswered gets `503 upstream_busy` with `Retry-After`, in the
+router's own words: an upstream's 429 speaks of Lebrel's account with it, never of the customer's, and
+is not relayed. Nothing is charged for it, and only then is the operator alerted, with the upstream's
+own code for the refusal when it gives one (a rate limit and an empty balance are both a 429). A
+refused credential, an unknown model and an upstream that kept silent for its whole `timeout_seconds`
+are not waited for.
 An upstream may list request fields it refuses (`unsupported`): Model Studio's copy of DeepSeek V4 Pro
 answers 400 to `logprobs`, which DeepSeek's own API returns, so a request that asks for token
 probabilities skips Model Studio and goes to the next upstream. That is neither a failure nor a

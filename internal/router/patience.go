@@ -1,6 +1,7 @@
 package router
 
 import (
+	"encoding/json"
 	"math/rand/v2"
 	"net/http"
 	"strconv"
@@ -13,7 +14,8 @@ import (
 // rate limit or overload passes in seconds, and so does a broken connection: the route is asked again
 // after a wait, and the customer gets the answer a moment late instead of the provider's "not now".
 type Patience struct {
-	// Budget is how long after a request's first call another round may still begin (default 12 s).
+	// Budget is how long after a request's first call another round may still begin (default 8 s, so
+	// a customer is answered, one way or the other, inside the ten seconds many clients wait).
 	// Negative: one round and no pauses; the route answers with whatever that round got.
 	Budget time.Duration
 	// First is the wait after a failure that names none (default 500 ms). It doubles with each round
@@ -25,12 +27,17 @@ type Patience struct {
 	// Jitter spreads the requests that wait for the same moment (nil: up to a quarter more, at random),
 	// so a provider that reopens is not asked by all of them in the same instant.
 	Jitter func(wait time.Duration) time.Duration
+	// Waiting is how many requests of one route may be waiting to ask it again at one time (default
+	// 32). Past it a request is told at once: every waiting request asks the route again, so their
+	// number is what bounds the calls a provider that refuses gets, however many customers come.
+	Waiting int
 }
 
 const (
-	defaultPatienceBudget  = 12 * time.Second
+	defaultPatienceBudget  = 8 * time.Second
 	defaultPatienceFirst   = 500 * time.Millisecond
 	defaultPatienceLongest = 4 * time.Second
+	defaultPatienceWaiting = 32
 	// pauseLongest caps what an upstream may ask for with Retry-After. A longer one (an hour, a date far
 	// away) speaks of a quota, not of a moment: the upstream is asked again after this much, which costs
 	// it two calls a minute while it keeps refusing.
@@ -59,6 +66,9 @@ func (p Patience) withDefaults() Patience {
 	if p.Longest < p.First {
 		p.Longest = p.First
 	}
+	if p.Waiting <= 0 {
+		p.Waiting = defaultPatienceWaiting
+	}
 	return p
 }
 
@@ -85,9 +95,9 @@ func (p Patience) spread(wait time.Duration) time.Duration {
 // pauseAfter is how many refusals in a row, with no answer between them, show an upstream that is
 // refusing everyone rather than the odd request. A provider near its capacity refuses a request now
 // and then and takes the next: each request waits and asks again on its own, and nobody else is held
-// back. One that refuses this many in a row is taking nothing: from then on it is left alone by every
-// request, so that the customers are told at once instead of each waiting out its patience, and the
-// provider is not asked by all of them again and again.
+// back. One that refuses this many calls in a row is taking nothing: from then on it is left alone
+// by every request, and if it refuses again when its time is over, a customer who comes while it is
+// left alone is told at once instead of waiting out a patience nothing suggests will be rewarded.
 const pauseAfter = 8
 
 // pause is what one upstream of one route has said about its limit: until when it is left alone, and
@@ -113,13 +123,26 @@ func (p *pause) left(now time.Time) time.Duration {
 	return 0
 }
 
+// refusing says whether the upstream is being left alone because it refused everyone and, asked again
+// when its time was over, refused again: nothing shows it would take the next request.
+func (p *pause) refusing(now time.Time) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return now.Before(p.until) && p.refused > pauseAfter
+}
+
 // refuse records a refusal and returns how long the upstream is left alone from now; zero when it is
 // not, and the request that was refused waits on its own. A time the upstream names is kept as asked
-// (never under a quarter of First, nor over pauseLongest). Without one, the upstream is left alone
-// from its pauseAfter-th refusal in a row, for the router's own wait, doubled with each refusal after
-// that. Refusals that arrive while it is already being left alone are answers to calls made before:
-// they belong to the same refusal and are not counted again, or one busy moment met by many requests
-// at once would read as many refusals in a row.
+// (never under a quarter of First, nor over pauseLongest); one longer than Longest is kept for
+// everyone only from the second refusal in a row, so a single odd refusal that names a minute does
+// not close the route to every customer. Without a named time, the upstream is left alone from its
+// pauseAfter-th refusal in a row, for the router's own wait, doubled with each refusal after that.
+// Refusals that arrive while it is already being left alone are answers to calls made before: they
+// belong to the same refusal and are not counted again, or one busy moment met by many requests at
+// once would read as many refusals in a row.
 func (p *pause) refuse(now time.Time, asked time.Duration, patience Patience) time.Duration {
 	if p == nil {
 		return 0
@@ -136,6 +159,9 @@ func (p *pause) refuse(now time.Time, asked time.Duration, patience Patience) ti
 	if wait > 0 {
 		if wait > pauseLongest {
 			wait = pauseLongest
+		}
+		if wait > patience.Longest && p.refused < 2 {
+			wait = patience.Longest
 		}
 		if floor := patience.First / 4; wait < floor {
 			// an upstream that asks for no time at all would be asked again at once, and again
@@ -187,6 +213,50 @@ func retryAfter(header http.Header, now time.Time) time.Duration {
 	return 0
 }
 
+// refusalCode finds the code a provider gives a refusal in the usual places of an error body
+// (error.code, error.type, or a top-level code), as a few plain characters or nothing.
+func refusalCode(body []byte) string {
+	var parsed struct {
+		Error json.RawMessage `json:"error"`
+		Code  json.RawMessage `json:"code"`
+	}
+	if json.Unmarshal(body, &parsed) != nil {
+		return ""
+	}
+	var inner struct {
+		Code json.RawMessage `json:"code"`
+		Type json.RawMessage `json:"type"`
+	}
+	if json.Unmarshal(parsed.Error, &inner) == nil {
+		if code := plainCode(inner.Code); code != "" {
+			return code
+		}
+		if code := plainCode(inner.Type); code != "" {
+			return code
+		}
+	}
+	return plainCode(parsed.Code)
+}
+
+// plainCode is a JSON string or number of at most forty letters, digits, dots, dashes and underscores.
+func plainCode(raw json.RawMessage) string {
+	text := strings.TrimSpace(string(raw))
+	if strings.HasPrefix(text, `"`) {
+		if json.Unmarshal(raw, &text) != nil {
+			return ""
+		}
+	}
+	if text == "" || text == "null" || len(text) > 40 {
+		return ""
+	}
+	for _, r := range text {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '.' || r == '-') {
+			return ""
+		}
+	}
+	return text
+}
+
 // roundEnd is what a round that no upstream answered leaves behind: whether anything it was told may
 // pass in a moment, the shortest wait after which some upstream may be asked again, and whether an
 // upstream was at its limit.
@@ -194,6 +264,16 @@ type roundEnd struct {
 	passing bool
 	wait    time.Duration
 	busy    bool
+}
+
+// closed notes an upstream that keeps refusing everyone: the route is busy, and that is no reason
+// for a request that has asked nobody yet to wait. Its time is kept for the customer's Retry-After
+// unless something else of the round is worth waiting for.
+func (e *roundEnd) closed(left time.Duration) {
+	e.busy = true
+	if !e.passing && (e.wait == 0 || left < e.wait) {
+		e.wait = left
+	}
 }
 
 func (e *roundEnd) note(wait time.Duration, busy bool) {

@@ -282,8 +282,14 @@ func run(logger *log.Logger) error {
 		}
 		logger.Printf("direct clients: on hosts=%v client_address=%q header=%q from=%v", directHosts, clientAddress, clientIPHeader, trustedIngress)
 	}
+	patience, err := upstreamPatience(env("UPSTREAM_PATIENCE_SECONDS", ""))
+	if err != nil {
+		return err
+	}
+	logger.Printf("upstream patience: %s", describePatience(patience))
 	server, err := router.New(router.Settings{
-		Routes: routes, Auth: authenticator, Ledger: ledgerImpl, Signer: signer, Settlements: settlements,
+		Patience: patience,
+		Routes:   routes, Auth: authenticator, Ledger: ledgerImpl, Signer: signer, Settlements: settlements,
 		AcceptTimeout: time.Duration(acceptMillis) * time.Millisecond, AlertAge: alertAge, ReceiptPeers: peers,
 		HealthToken: strings.TrimSpace(env("HEALTH_TOKEN", "")),
 		Receipts:    router.NewReceiptStore(24*time.Hour, 100_000), Verification: verification,
@@ -557,6 +563,35 @@ func (c *certificates) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 }
 
 // positive reads a whole number setting above zero, or its default when unset.
+// upstreamPatience reads UPSTREAM_PATIENCE_SECONDS: how long after its first call a request may
+// still ask again a route whose upstreams refuse for the moment. Unset: the router's own default.
+// Zero: no waiting, a route answers with what its first round got.
+func upstreamPatience(value string) (router.Patience, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return router.Patience{}, nil
+	}
+	seconds, err := strconv.Atoi(value)
+	if err != nil || seconds < 0 || seconds > 60 {
+		return router.Patience{}, errors.New("UPSTREAM_PATIENCE_SECONDS must be a whole number of seconds from 0 (no waiting) to 60")
+	}
+	if seconds == 0 {
+		return router.Patience{Budget: -1}, nil
+	}
+	return router.Patience{Budget: time.Duration(seconds) * time.Second}, nil
+}
+
+func describePatience(patience router.Patience) string {
+	switch {
+	case patience.Budget < 0:
+		return "off (one round per request)"
+	case patience.Budget == 0:
+		return "default"
+	default:
+		return patience.Budget.String()
+	}
+}
+
 func positive(name string, fallback int) (int, error) {
 	value, err := strconv.Atoi(env(name, strconv.Itoa(fallback)))
 	if err != nil || value < 1 {

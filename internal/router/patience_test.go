@@ -2,6 +2,7 @@ package router
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -11,8 +12,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"lebrel-router/internal/auth"
 )
 
 // scriptedUpstream answers each call with the next answer of its script (the last one answers every
@@ -144,7 +148,7 @@ func TestAnUpstreamIsLeftAloneForAsLongAsItAsks(t *testing.T) {
 // left alone waits for it too instead of asking and being refused in its turn.
 func TestEveryRequestLeavesAnUpstreamAloneWhileItAsksForIt(t *testing.T) {
 	up := scripted(t, refusing(429, "Retry-After-Ms", "200"), answering)
-	h := newHarnessWith(t, routeFor(upstream("zai/api-flash", up.server.URL, 1)), "", patient(2*time.Second, 5*time.Millisecond, 20*time.Millisecond, nil))
+	h := newHarnessWith(t, routeFor(upstream("zai/api-flash", up.server.URL, 1)), "", patient(2*time.Second, 5*time.Millisecond, 400*time.Millisecond, nil))
 	post := func() (int, error) {
 		request, _ := http.NewRequest(http.MethodPost, h.server.URL+"/v1/chat/completions", strings.NewReader(patienceBody))
 		request.Header.Set("Authorization", "Bearer "+testKey)
@@ -192,7 +196,7 @@ func TestAnUpstreamBeingLeftAloneIsPassedOverForTheNext(t *testing.T) {
 	limited := scripted(t, refusing(429, "Retry-After-Ms", "5000"))
 	backup := newFakeUpstream(t, answering)
 	var alerts alertLog
-	h := newHarnessWith(t, routeFor(upstream("alibaba/model-studio", limited.server.URL, 1), upstream("deepseek/api", backup.server.URL, 2)), board, patient(2*time.Second, 5*time.Millisecond, 20*time.Millisecond, &alerts))
+	h := newHarnessWith(t, routeFor(upstream("alibaba/model-studio", limited.server.URL, 1), upstream("deepseek/api", backup.server.URL, 2)), board, patient(2*time.Second, 5*time.Millisecond, 10*time.Second, &alerts))
 	started := time.Now()
 	for i := 0; i < 3; i++ {
 		response := h.post(t, patienceBody, testKey)
@@ -208,7 +212,7 @@ func TestAnUpstreamBeingLeftAloneIsPassedOverForTheNext(t *testing.T) {
 		t.Fatalf("the upstream that asked to be left alone was called %d times", calls)
 	}
 	got := alerts.all()
-	if len(got) != 1 || !strings.Contains(got[0], "alibaba/model-studio (HTTP 429)") || !strings.Contains(got[0], "deepseek/api") {
+	if len(got) != 1 || !strings.Contains(got[0], "alibaba/model-studio (HTTP 429, código 1302)") || !strings.Contains(got[0], "deepseek/api") {
 		t.Fatalf("one fallback alert naming the refusal and who answered, got %q", got)
 	}
 }
@@ -219,7 +223,7 @@ func TestAnUpstreamBeingLeftAloneIsPassedOverForTheNext(t *testing.T) {
 func TestWhenTheWaitIsLongerThanThePatienceTheCustomerIsToldToRetryInLebrelsWords(t *testing.T) {
 	up := scripted(t, refusing(429, "Retry-After", "7"))
 	var alerts alertLog
-	h := newHarnessWith(t, routeFor(upstream("zai/api-flash", up.server.URL, 1)), "", patient(300*time.Millisecond, 5*time.Millisecond, 20*time.Millisecond, &alerts))
+	h := newHarnessWith(t, routeFor(upstream("zai/api-flash", up.server.URL, 1)), "", patient(300*time.Millisecond, 5*time.Millisecond, 10*time.Second, &alerts))
 	before := h.balance(t)
 	started := time.Now()
 	response := h.post(t, patienceBody, testKey)
@@ -237,8 +241,8 @@ func TestWhenTheWaitIsLongerThanThePatienceTheCustomerIsToldToRetryInLebrelsWord
 		t.Fatalf("nothing is charged for no answer: %d", before-h.balance(t))
 	}
 	got := alerts.all()
-	if len(got) != 1 || !strings.Contains(got[0], "ningún proveedor") || !strings.Contains(got[0], "zai/api-flash (HTTP 429)") {
-		t.Fatalf("one outage alert naming the refusal, got %q", got)
+	if len(got) != 1 || !strings.Contains(got[0], "ningún proveedor") || !strings.Contains(got[0], "zai/api-flash (HTTP 429, código 1302)") {
+		t.Fatalf("one outage alert naming the refusal and the upstream's own code for it, got %q", got)
 	}
 	// A request that comes while the upstream is being left alone is told the same, without a call.
 	second := h.post(t, patienceBody, testKey)
@@ -270,7 +274,7 @@ func TestAnUpstreamThatKeepsRefusingIsAskedAFewTimesAndThenTheRouteSaysBusy(t *t
 		t.Fatalf("each wait is twice the one before: %s then %s", first, second)
 	}
 	got := alerts.all()
-	if len(got) != 1 || !strings.Contains(got[0], "zai/api-flash (HTTP 429)") || !strings.Contains(got[0], fmt.Sprintf("%d intentos", len(times))) {
+	if len(got) != 1 || !strings.Contains(got[0], "zai/api-flash (HTTP 429, código 1302)") || !strings.Contains(got[0], fmt.Sprintf("%d intentos", len(times))) {
 		t.Fatalf("one outage alert saying how many times the route was asked, got %q", got)
 	}
 }
@@ -359,7 +363,13 @@ func TestACustomerWhoLeavesWhileTheRouteWaitsIsNoOutageAndNothingMoreIsAsked(t *
 		response.Body.Close()
 		t.Fatalf("the customer left before any answer, got %d", response.StatusCode)
 	}
-	time.Sleep(450 * time.Millisecond) // past the time the upstream asked for
+	for deadline := time.Now().Add(150 * time.Millisecond); h.router.InFlight() > 0 && time.Now().Before(deadline); {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if h.router.InFlight() != 0 {
+		t.Fatal("the request ends when its customer leaves, not when the upstream's time is over")
+	}
+	time.Sleep(400 * time.Millisecond) // past the time the upstream asked for
 	if calls := len(up.times()); calls != 1 {
 		t.Fatalf("the upstream was asked %d times for a customer who had left", calls)
 	}
@@ -427,7 +437,7 @@ func TestAShutdownThatCutsTheWaitAsksTheCustomerToRetry(t *testing.T) {
 	h := newHarness(t, routeFor(upstream("zai/api-flash", up.server.URL, 1)), "")
 	queue := runningQueue(t, h.ledger)
 	server, err := New(Settings{Routes: Config{Routes: []Route{h.route}}, Auth: h.auth, Ledger: h.ledger, Signer: h.signer, Receipts: h.receipts,
-		Settlements: queue, Logger: log.New(io.Discard, "", 0), Patience: Patience{Budget: 10 * time.Second}})
+		Settlements: queue, Logger: log.New(io.Discard, "", 0), Patience: Patience{Budget: 10 * time.Second, Longest: 9 * time.Second, Jitter: func(wait time.Duration) time.Duration { return wait }}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -505,12 +515,37 @@ func TestAnUpstreamIsLeftAloneOnlyWhenItRefusesEveryone(t *testing.T) {
 	if got := held.refuse(now, 0, patience); got != 0 {
 		t.Fatalf("after an answer the next refusal is a first one: %s", got)
 	}
-	// A time the upstream names is kept as asked from its first refusal, within reason at both ends.
-	for asked, want := range map[time.Duration]time.Duration{7 * time.Second: 7 * time.Second, time.Hour: pauseLongest, time.Millisecond: 25 * time.Millisecond} {
+	// A time the upstream names is kept as asked from its first refusal, within reason at both ends...
+	for asked, want := range map[time.Duration]time.Duration{300 * time.Millisecond: 300 * time.Millisecond, time.Millisecond: 25 * time.Millisecond} {
 		var fresh pause
 		if got := fresh.refuse(now, asked, patience); got != want {
 			t.Fatalf("asked for %s: left alone %s, want %s", asked, got, want)
 		}
+	}
+	// ...but one longer than the router's own longest wait is kept by everyone only from the second
+	// refusal in a row: a single odd refusal that names a minute closes the route to nobody else.
+	var long pause
+	if got := long.refuse(now, 7*time.Second, patience); got != 400*time.Millisecond {
+		t.Fatalf("a first refusal that names 7 s leaves it alone for the router's longest wait: %s", got)
+	}
+	if got := long.refuse(now.Add(50*time.Millisecond), 7*time.Second, patience); got != 400*time.Millisecond || long.refused != 1 {
+		t.Fatalf("an answer to a call made before is the same refusal, and no reason to trust the long time yet: %s, %d in a row", got, long.refused)
+	}
+	later := now.Add(460 * time.Millisecond)
+	if got := long.refuse(later, 7*time.Second, patience); got != 7*time.Second {
+		t.Fatalf("refused again when its time was over, it is left alone for what it names: %s", got)
+	}
+	if got := long.refuse(later.Add(time.Second), 100*time.Millisecond, patience); got != 6*time.Second {
+		t.Fatalf("a shorter time named later does not shorten what it is left alone: %s", got)
+	}
+	long.served()
+	if got := long.left(later.Add(time.Second)); got != 6*time.Second {
+		t.Fatalf("an answer starts the count over and leaves the time it asked for as it is: %s", got)
+	}
+	var hour pause
+	hour.refuse(now, time.Hour, patience)
+	if got := hour.refuse(now.Add(400*time.Millisecond), time.Hour, patience); got != pauseLongest {
+		t.Fatalf("an hour speaks of a quota: it is asked again after %s, not %s", pauseLongest, got)
 	}
 	var none *pause // a route that is not the router's own never panics
 	if none.left(now) != 0 || none.refuse(now, time.Second, patience) != 0 {
@@ -519,37 +554,78 @@ func TestAnUpstreamIsLeftAloneOnlyWhenItRefusesEveryone(t *testing.T) {
 	none.served()
 }
 
-// An upstream that refuses everyone: from its pauseAfter-th refusal in a row it is left alone, and a
-// customer who comes meanwhile is told at once to come back, without a call and without waiting out
-// the patience. When its time is over it is asked again, and an answer puts everything back.
+// An upstream that refuses everyone: it is left alone, and once it has refused again when its time
+// was over, a customer who comes while it is left alone is told at once, without a call and without
+// waiting out a patience nothing suggests will be rewarded. The requests already waiting are the
+// ones that ask it again, and an answer puts everything back.
 func TestAnUpstreamThatRefusesEveryoneIsLeftAloneAndCustomersAreToldAtOnce(t *testing.T) {
-	script := make([]http.HandlerFunc, 0, pauseAfter+1)
-	for i := 0; i < pauseAfter; i++ {
-		script = append(script, refusing(429))
-	}
-	up := scripted(t, append(script, answering)...)
-	// a patience too short for any wait: each request is one call
-	h := newHarnessWith(t, routeFor(upstream("zai/api-flash", up.server.URL, 1)), "", patient(time.Millisecond, 300*time.Millisecond, time.Second, nil))
-	ask := func() (int, string) {
-		response := h.post(t, patienceBody, testKey)
+	var open atomic.Bool
+	up := scripted(t, func(w http.ResponseWriter, r *http.Request) {
+		if open.Load() {
+			answering(w, r)
+			return
+		}
+		refusing(429)(w, r)
+	})
+	h := newHarnessWith(t, routeFor(upstream("zai/api-flash", up.server.URL, 1)), "", func(s *Settings) {
+		patient(time.Second, 100*time.Millisecond, 400*time.Millisecond, nil)(s)
+		s.Auth = manyAtOnce(t)
+	})
+	ask := func() (int, string, time.Duration) {
+		started := time.Now()
+		request, _ := http.NewRequest(http.MethodPost, h.server.URL+"/v1/chat/completions", strings.NewReader(patienceBody))
+		request.Header.Set("Authorization", "Bearer "+testKey)
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			return 0, err.Error(), time.Since(started)
+		}
+		defer response.Body.Close()
 		raw, _ := io.ReadAll(response.Body)
-		return response.StatusCode, string(raw)
+		return response.StatusCode, string(raw), time.Since(started)
 	}
-	for i := 1; i <= pauseAfter; i++ {
-		if status, raw := ask(); status != http.StatusServiceUnavailable || len(up.times()) != i {
-			t.Fatalf("refusal %d: status %d after %d calls: %s", i, status, len(up.times()), raw)
+	const crowd = 12
+	statuses := make(chan int, crowd)
+	for i := 0; i < crowd; i++ {
+		go func() {
+			status, _, _ := ask()
+			statuses <- status
+		}()
+	}
+	// The crowd is refused, waits out the first pause (100 ms) and is refused again: now nothing shows
+	// the upstream would take the next request, and it is left alone for 200 ms.
+	for deadline := time.Now().Add(5 * time.Second); len(up.times()) <= crowd && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	held := h.router.pauses[pauseKey(&h.route, "zai/api-flash")]
+	for deadline := time.Now().Add(time.Second); !held.refusing(time.Now()) && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	before := len(up.times())
+	status, raw, took := ask()
+	if status != http.StatusServiceUnavailable || !strings.Contains(raw, `"upstream_busy"`) || took > 100*time.Millisecond {
+		t.Fatalf("a customer who comes while it refuses everyone is told at once: status %d in %s: %s", status, took, raw)
+	}
+	if after := len(up.times()); after > before+crowd {
+		t.Fatalf("the customer told at once made no call of its own: %d calls before, %d after", before, after)
+	}
+	open.Store(true)
+	served := 0
+	for i := 0; i < crowd; i++ {
+		if <-statuses == 200 {
+			served++
 		}
 	}
-	started := time.Now()
-	if status, raw := ask(); status != http.StatusServiceUnavailable || !strings.Contains(raw, `"upstream_busy"`) || len(up.times()) != pauseAfter || time.Since(started) > 200*time.Millisecond {
-		t.Fatalf("while it is left alone the customer is told at once and it is not called: status %d, %d calls, %s: %s", status, len(up.times()), time.Since(started), raw)
+	if served == 0 {
+		t.Fatal("the requests that were waiting ask again when its time is over, and are answered")
 	}
-	time.Sleep(320 * time.Millisecond) // its time is over
-	if status, raw := ask(); status != 200 || len(up.times()) != pauseAfter+1 {
-		t.Fatalf("asked again when its time is over: status %d after %d calls: %s", status, len(up.times()), raw)
+	if held.refused != 0 {
+		t.Fatalf("an answer starts the count over: %d in a row", held.refused)
 	}
-	if held := h.router.pauses[pauseKey(&h.route, "zai/api-flash")]; held.refused != 0 || held.left(time.Now()) != 0 {
-		t.Fatalf("an answer puts everything back: %d in a row, left alone %s", held.refused, held.left(time.Now()))
+	for deadline := time.Now().Add(2 * time.Second); held.left(time.Now()) > 0 && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if status, raw, _ := ask(); status != 200 {
+		t.Fatalf("and the next customer is served: %d %s", status, raw)
 	}
 }
 
@@ -577,7 +653,7 @@ func TestRetryAfterIsReadInSecondsAsADateAndInMilliseconds(t *testing.T) {
 // With no patience at all the route answers with what its one round got, except that a limit reached
 // is still told in Lebrel's words: it never was about the customer.
 func TestWithoutPatienceALimitReachedIsStillToldInLebrelsWords(t *testing.T) {
-	up := scripted(t, refusing(429))
+	up := scripted(t, refusing(429, "Retry-After", "5"))
 	h := newHarness(t, routeFor(upstream("zai/api-flash", up.server.URL, 1)), "")
 	response := h.post(t, patienceBody, testKey)
 	raw, _ := io.ReadAll(response.Body)
@@ -588,5 +664,418 @@ func TestWithoutPatienceALimitReachedIsStillToldInLebrelsWords(t *testing.T) {
 	_, _ = io.Copy(io.Discard, again.Body)
 	if len(up.times()) != 2 {
 		t.Fatalf("without patience no upstream is left alone: %d calls", len(up.times()))
+	}
+}
+
+// manyAtOnce is the test account with room for a crowd of requests at once.
+func manyAtOnce(t *testing.T) auth.Authenticator {
+	t.Helper()
+	secret := bytes.Repeat([]byte{9}, 32)
+	return auth.NewHMACAuthenticator(secret, []auth.Record{{AccountID: "acct_test_000001", Digest: auth.Digest(secret, testKey), Concurrency: 512, AccountConcurrency: 512}})
+}
+
+// The waiting room has a size: however many customers come to a route whose provider refuses, the
+// requests that ask it again are never more than the room holds, and the rest are told at once.
+func TestTheWaitingRoomBoundsTheCallsAProviderThatRefusesGets(t *testing.T) {
+	up := scripted(t, refusing(429))
+	const crowd, room = 60, 4
+	h := newHarnessWith(t, routeFor(upstream("zai/api-flash", up.server.URL, 1)), "", func(s *Settings) {
+		patient(400*time.Millisecond, 20*time.Millisecond, 80*time.Millisecond, nil)(s)
+		s.Patience.Waiting = room
+		s.Auth = manyAtOnce(t)
+	})
+	type outcome struct {
+		status int
+		took   time.Duration
+	}
+	outcomes := make(chan outcome, crowd)
+	for i := 0; i < crowd; i++ {
+		go func() {
+			started := time.Now()
+			request, _ := http.NewRequest(http.MethodPost, h.server.URL+"/v1/chat/completions", strings.NewReader(patienceBody))
+			request.Header.Set("Authorization", "Bearer "+testKey)
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				outcomes <- outcome{0, time.Since(started)}
+				return
+			}
+			_, _ = io.Copy(io.Discard, response.Body)
+			response.Body.Close()
+			outcomes <- outcome{response.StatusCode, time.Since(started)}
+		}()
+	}
+	waited := 0
+	for i := 0; i < crowd; i++ {
+		got := <-outcomes
+		if got.status != http.StatusServiceUnavailable {
+			t.Fatalf("every customer is told the route is busy: %d", got.status)
+		}
+		if got.took >= 200*time.Millisecond {
+			waited++
+		}
+	}
+	// One call each at most for the customers told at once, and the room's requests asking again at
+	// 20, 40, 80, 80, 80 and 80 ms: without the room the crowd would make seven calls each.
+	if calls := len(up.times()); calls > crowd+room*8 {
+		t.Fatalf("%d customers made %d calls; the waiting room holds %d", crowd, calls, room)
+	}
+	if waited > room*2 {
+		t.Fatalf("%d customers waited; the room holds %d at a time", waited, room)
+	}
+	if left := h.router.waiting[h.route.ModelID].Load(); left != 0 {
+		t.Fatalf("nobody is left counted in the waiting room: %d", left)
+	}
+}
+
+// A single refusal that names a long time closes the route to nobody else: the customer it was said
+// to is told to come back then, and the next one is asked for after the router's own longest wait.
+func TestASingleRefusalThatNamesALongTimeClosesTheRouteToNobodyElse(t *testing.T) {
+	up := scripted(t, refusing(429, "Retry-After", "20"), answering)
+	h := newHarnessWith(t, routeFor(upstream("zai/api-flash", up.server.URL, 1)), "", patient(300*time.Millisecond, 5*time.Millisecond, 40*time.Millisecond, nil))
+	first := h.post(t, patienceBody, testKey)
+	_, _ = io.Copy(io.Discard, first.Body)
+	if first.StatusCode != http.StatusServiceUnavailable || first.Header.Get("Retry-After") != "20" {
+		t.Fatalf("the customer it was said to: %d, Retry-After %q", first.StatusCode, first.Header.Get("Retry-After"))
+	}
+	started := time.Now()
+	second := h.post(t, patienceBody, testKey)
+	raw, _ := io.ReadAll(second.Body)
+	if second.StatusCode != 200 || len(up.times()) != 2 || time.Since(started) > 250*time.Millisecond {
+		t.Fatalf("the next customer: %d after %d calls in %s: %s", second.StatusCode, len(up.times()), time.Since(started), raw)
+	}
+}
+
+// An upstream that names almost no time is not asked at every turn: a request that keeps being
+// refused asks less and less often, whatever the upstream says.
+func TestAnUpstreamThatNamesAlmostNoTimeIsNotAskedAtEveryTurn(t *testing.T) {
+	up := scripted(t, refusing(429, "Retry-After-Ms", "1"))
+	h := newHarnessWith(t, routeFor(upstream("zai/api-flash", up.server.URL, 1)), "", patient(300*time.Millisecond, 20*time.Millisecond, 80*time.Millisecond, nil))
+	response := h.post(t, patienceBody, testKey)
+	_, _ = io.Copy(io.Discard, response.Body)
+	// asked at 0, 20, 60, 140, 220 and 300 ms; every 5 ms would be sixty calls
+	if calls := len(up.times()); response.StatusCode != http.StatusServiceUnavailable || calls < 4 || calls > 7 {
+		t.Fatalf("status %d after %d calls", response.StatusCode, calls)
+	}
+}
+
+// The jitter spreads a wait within what is left of the patience; it never decides whether a
+// customer is answered.
+func TestTheJitterNeverDecidesWhetherACustomerIsAnswered(t *testing.T) {
+	up := scripted(t, refusing(429, "Retry-After-Ms", "100"), answering)
+	h := newHarnessWith(t, routeFor(upstream("zai/api-flash", up.server.URL, 1)), "", func(s *Settings) {
+		s.Patience = Patience{Budget: 150 * time.Millisecond, First: 5 * time.Millisecond, Longest: 200 * time.Millisecond, Jitter: func(wait time.Duration) time.Duration { return 10 * wait }}
+	})
+	started := time.Now()
+	response := h.post(t, patienceBody, testKey)
+	raw, _ := io.ReadAll(response.Body)
+	if response.StatusCode != 200 || time.Since(started) > 400*time.Millisecond {
+		t.Fatalf("a wait that fits is waited, however the jitter falls: %d in %s: %s", response.StatusCode, time.Since(started), raw)
+	}
+	times := up.times()
+	if gap := times[1].Sub(times[0]); gap < 100*time.Millisecond {
+		t.Fatalf("and never cut short: asked again after %s", gap)
+	}
+	// The default: up to a quarter more, never less, and not always the same.
+	defaults := Patience{}.withDefaults()
+	seen := map[time.Duration]bool{}
+	for i := 0; i < 200; i++ {
+		got := defaults.spread(time.Second)
+		if got < time.Second || got > 1250*time.Millisecond {
+			t.Fatalf("a second spread to %s", got)
+		}
+		seen[got] = true
+	}
+	if len(seen) < 20 {
+		t.Fatalf("the default jitter gave %d different waits in 200", len(seen))
+	}
+}
+
+// What production runs with, said once: a change of any of these is a change of what customers get.
+func TestTheDefaultsAreTheOnesTheReadmeNames(t *testing.T) {
+	got := Patience{}.withDefaults()
+	if got.Budget != 8*time.Second || got.First != 500*time.Millisecond || got.Longest != 4*time.Second || got.Waiting != 32 {
+		t.Fatalf("defaults: %+v", got)
+	}
+	if pauseLongest != 30*time.Second || pauseAfter != 8 {
+		t.Fatalf("an upstream's own time is kept up to %s and it is left alone after %d refusals", pauseLongest, pauseAfter)
+	}
+	var waits []time.Duration
+	for n := 1; n <= 6; n++ {
+		waits = append(waits, got.wait(n))
+	}
+	if fmt.Sprint(waits) != "[500ms 1s 2s 4s 4s 4s]" {
+		t.Fatalf("waits: %v", waits)
+	}
+	if fmt.Sprint(busyStatuses) != "map[429:true 503:true]" || fmt.Sprint(passingStatuses) != "map[408:true 425:true 500:true 502:true 504:true]" {
+		t.Fatalf("busy %v passing %v", busyStatuses, passingStatuses)
+	}
+	if off := (Patience{Budget: -1}).withDefaults(); off.Budget != -1 {
+		t.Fatalf("no patience stays no patience: %s", off.Budget)
+	}
+}
+
+// With those defaults a route whose provider refuses everything answers inside the ten seconds many
+// clients wait, having asked a handful of times.
+func TestWithTheDefaultsARouteThatRefusesEverythingAnswersInsideTenSeconds(t *testing.T) {
+	if testing.Short() {
+		t.Skip("eight seconds of real waiting")
+	}
+	up := scripted(t, refusing(429))
+	var alerts alertLog
+	h := newHarnessWith(t, routeFor(upstream("zai/api-flash", up.server.URL, 1)), "", func(s *Settings) {
+		s.Patience = Patience{}
+		s.Alert = alerts.add
+	})
+	started := time.Now()
+	response := h.post(t, patienceBody, testKey)
+	raw, _ := io.ReadAll(response.Body)
+	took := time.Since(started)
+	if response.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(raw), `"upstream_busy"`) {
+		t.Fatalf("status %d: %s", response.StatusCode, raw)
+	}
+	if calls := len(up.times()); calls < 4 || calls > 5 || took < 3*time.Second || took > 9*time.Second {
+		t.Fatalf("%d calls in %s", calls, took)
+	}
+	if got := alerts.all(); len(got) != 1 {
+		t.Fatalf("one outage alert: %q", got)
+	}
+}
+
+// Every status that says "busy" or "for the moment" is waited for, and the two that say "busy" are
+// never relayed.
+func TestTheStatusesOfTheMomentAreWaitedFor(t *testing.T) {
+	for _, status := range []int{408, 425, 429, 500, 502, 503, 504} {
+		up := scripted(t, refusing(status), answering)
+		h := newHarnessWith(t, routeFor(upstream("zai/api-flash", up.server.URL, 1)), "", patient(time.Second, 5*time.Millisecond, 20*time.Millisecond, nil))
+		response := h.post(t, patienceBody, testKey)
+		_, _ = io.Copy(io.Discard, response.Body)
+		if response.StatusCode != 200 || len(up.times()) != 2 {
+			t.Fatalf("%d: status %d after %d calls", status, response.StatusCode, len(up.times()))
+		}
+	}
+	for status, want := range map[int]int{429: 503, 503: 503, 500: 500, 504: 504} {
+		up := scripted(t, refusing(status))
+		h := newHarnessWith(t, routeFor(upstream("zai/api-flash", up.server.URL, 1)), "", patient(30*time.Millisecond, 5*time.Millisecond, 20*time.Millisecond, nil))
+		response := h.post(t, patienceBody, testKey)
+		raw, _ := io.ReadAll(response.Body)
+		relayed := strings.Contains(string(raw), "1302")
+		if response.StatusCode != want || relayed != (want != 503) || (want == 503) != strings.Contains(string(raw), `"upstream_busy"`) {
+			t.Fatalf("an upstream that keeps answering %d: status %d, its words relayed %v: %s", status, response.StatusCode, relayed, raw)
+		}
+	}
+}
+
+// Providers count per model: an upstream left alone on one route is asked as ever on another route
+// that names the same upstream.
+func TestAnUpstreamLeftAloneOnOneRouteIsAskedOnAnother(t *testing.T) {
+	limited := scripted(t, refusing(429, "Retry-After-Ms", "3000"))
+	other := scripted(t, answering)
+	second := routeFor(upstream("alibaba/model-studio", other.server.URL, 1))
+	second.ModelID, second.Family, second.ClaimedRevision = "qwen/qwen3.8-flash", "qwen3.8-flash", "qwen3.8-flash"
+	h := newHarnessWith(t, routeFor(upstream("alibaba/model-studio", limited.server.URL, 1)), "", func(s *Settings) {
+		patient(100*time.Millisecond, 5*time.Millisecond, 10*time.Second, nil)(s)
+		s.Routes.Routes = append(s.Routes.Routes, second)
+	})
+	first := h.post(t, patienceBody, testKey)
+	_, _ = io.Copy(io.Discard, first.Body)
+	if first.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("the route whose upstream refuses: %d", first.StatusCode)
+	}
+	started := time.Now()
+	response := h.post(t, strings.Replace(patienceBody, "deepseek/deepseek-v4.1-flash", "qwen/qwen3.8-flash", 1), testKey)
+	raw, _ := io.ReadAll(response.Body)
+	if response.StatusCode != 200 || len(other.times()) != 1 || time.Since(started) > 80*time.Millisecond {
+		t.Fatalf("the other route: %d after %d calls in %s: %s", response.StatusCode, len(other.times()), time.Since(started), raw)
+	}
+}
+
+// A round waits for the upstream that may be asked soonest, not for the one that asked for longest.
+func TestARoundWaitsForTheUpstreamThatMayBeAskedSoonest(t *testing.T) {
+	limited := scripted(t, refusing(429, "Retry-After-Ms", "400"))
+	flaky := scripted(t, refusing(502), answering)
+	h := newHarnessWith(t, routeFor(upstream("alibaba/model-studio", limited.server.URL, 1), upstream("deepseek/api", flaky.server.URL, 2)), board, patient(2*time.Second, 10*time.Millisecond, 500*time.Millisecond, nil))
+	started := time.Now()
+	response := h.post(t, patienceBody, testKey)
+	raw, _ := io.ReadAll(response.Body)
+	if response.StatusCode != 200 || response.Header.Get(upstreamHeader) != "deepseek/api" || time.Since(started) > 300*time.Millisecond {
+		t.Fatalf("%d served by %q in %s: %s", response.StatusCode, response.Header.Get(upstreamHeader), time.Since(started), raw)
+	}
+	if len(limited.times()) != 1 || len(flaky.times()) != 2 {
+		t.Fatalf("the one left alone is not asked again meanwhile: %d and %d calls", len(limited.times()), len(flaky.times()))
+	}
+}
+
+// The operator's alert says an upstream was being left alone, so an outage during a pause reads as
+// what it is.
+func TestAnAlertSaysWhichUpstreamWasBeingLeftAlone(t *testing.T) {
+	limited := scripted(t, refusing(429, "Retry-After-Ms", "5000"))
+	backup := scripted(t, answering, refusing(502))
+	var alerts alertLog
+	h := newHarnessWith(t, routeFor(upstream("alibaba/model-studio", limited.server.URL, 1), upstream("deepseek/api", backup.server.URL, 2)), board, patient(20*time.Millisecond, 5*time.Millisecond, 10*time.Second, &alerts))
+	first := h.post(t, patienceBody, testKey)
+	_, _ = io.Copy(io.Discard, first.Body)
+	second := h.post(t, patienceBody, testKey)
+	_, _ = io.Copy(io.Discard, second.Body)
+	if first.StatusCode != 200 || second.StatusCode != http.StatusBadGateway || len(limited.times()) != 1 {
+		t.Fatalf("statuses %d and %d, %d calls to the upstream left alone", first.StatusCode, second.StatusCode, len(limited.times()))
+	}
+	got := alerts.all()
+	if len(got) != 2 || !strings.Contains(got[1], "alibaba/model-studio (en pausa por su límite) y deepseek/api (HTTP 502)") {
+		t.Fatalf("the outage names the upstream left alone and the one that failed, got %q", got)
+	}
+}
+
+// closeTracking is a transport that knows, at every call, whether the calls before it were ended:
+// their bodies closed and their contexts done.
+type closeTracking struct {
+	inner http.RoundTripper
+	mu    sync.Mutex
+	calls []*trackedCall
+	open  []int
+}
+
+type trackedCall struct {
+	ctx    context.Context
+	closed atomic.Bool
+}
+
+type trackedBody struct {
+	io.ReadCloser
+	call *trackedCall
+}
+
+func (b *trackedBody) Close() error {
+	b.call.closed.Store(true)
+	return b.ReadCloser.Close()
+}
+
+func (c *closeTracking) RoundTrip(request *http.Request) (*http.Response, error) {
+	c.mu.Lock()
+	for i, earlier := range c.calls {
+		if !earlier.closed.Load() || earlier.ctx.Err() == nil {
+			c.open = append(c.open, i+1)
+		}
+	}
+	call := &trackedCall{ctx: request.Context()}
+	c.calls = append(c.calls, call)
+	c.mu.Unlock()
+	response, err := c.inner.RoundTrip(request)
+	if err != nil {
+		call.closed.Store(true)
+		return nil, err
+	}
+	response.Body = &trackedBody{ReadCloser: response.Body, call: call}
+	return response, nil
+}
+
+// A refused call is over before the route is asked again: its body closed and its context ended, so
+// rounds never pile up connections or goroutines.
+func TestARefusedCallIsOverBeforeTheRouteIsAskedAgain(t *testing.T) {
+	up := scripted(t, refusing(429), refusing(502), refusing(503), answering)
+	tracking := &closeTracking{inner: &http.Transport{}}
+	h := newHarnessWith(t, routeFor(upstream("zai/api-flash", up.server.URL, 1)), "", func(s *Settings) {
+		patient(time.Second, 5*time.Millisecond, 20*time.Millisecond, nil)(s)
+		s.HTTPClient = &http.Client{Transport: tracking}
+	})
+	response := h.post(t, patienceBody, testKey)
+	_, _ = io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+	if response.StatusCode != 200 || len(up.times()) != 4 {
+		t.Fatalf("status %d after %d calls", response.StatusCode, len(up.times()))
+	}
+	for deadline := time.Now().Add(time.Second); h.router.InFlight() > 0 && time.Now().Before(deadline); {
+		time.Sleep(2 * time.Millisecond)
+	}
+	tracking.mu.Lock()
+	defer tracking.mu.Unlock()
+	if len(tracking.open) != 0 {
+		t.Fatalf("calls still open when the route was asked again: %v", tracking.open)
+	}
+	for i, call := range tracking.calls {
+		if !call.closed.Load() || call.ctx.Err() == nil {
+			t.Fatalf("call %d is not over after the answer: closed %v, context %v", i+1, call.closed.Load(), call.ctx.Err())
+		}
+	}
+}
+
+// The time a customer is told to come back in is never earlier than the upstream's.
+func TestTheCustomersRetryAfterIsRoundedUp(t *testing.T) {
+	up := scripted(t, refusing(429, "Retry-After-Ms", "6200"))
+	h := newHarnessWith(t, routeFor(upstream("zai/api-flash", up.server.URL, 1)), "", patient(300*time.Millisecond, 5*time.Millisecond, 10*time.Second, nil))
+	response := h.post(t, patienceBody, testKey)
+	_, _ = io.Copy(io.Discard, response.Body)
+	if response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("Retry-After") != "7" {
+		t.Fatalf("status %d, Retry-After %q for 6.2 s", response.StatusCode, response.Header.Get("Retry-After"))
+	}
+}
+
+// An upstream skipped because it does not take a field of the request refused nothing: the route is
+// not busy for that. With the upstream that was asked failing, the customer is told no upstream could
+// serve, not to come back because a provider is at capacity.
+func TestAnUpstreamSkippedForAFieldIsNotAnUpstreamAtItsLimit(t *testing.T) {
+	never := scripted(t, answering)
+	down := scripted(t, func(w http.ResponseWriter, r *http.Request) {
+		if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+			conn.Close()
+		}
+	})
+	first := upstream("alibaba/model-studio", never.server.URL, 1)
+	first.Unsupported = []string{"logprobs"}
+	h := newHarnessWith(t, routeFor(first, upstream("deepseek/api", down.server.URL, 2)), board, patient(40*time.Millisecond, 5*time.Millisecond, 20*time.Millisecond, nil))
+	response := h.post(t, `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi there"}],"logprobs":true}`, testKey)
+	raw, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusBadGateway || !strings.Contains(string(raw), "upstream_unavailable") || response.Header.Get("Retry-After") != "" {
+		t.Fatalf("status %d, Retry-After %q: %s", response.StatusCode, response.Header.Get("Retry-After"), raw)
+	}
+	if len(never.times()) != 0 || len(down.times()) < 2 {
+		t.Fatalf("the upstream that does not take the field is never asked, the other is asked again: %d and %d calls", len(never.times()), len(down.times()))
+	}
+}
+
+// Only an answer starts the count of refusals over: a request the upstream refused as sent (relayed
+// to its customer) says nothing about the upstream taking requests.
+func TestOnlyAnAnswerStartsTheCountOfRefusalsOver(t *testing.T) {
+	script := make([]http.HandlerFunc, 0, pauseAfter+1)
+	for i := 1; i < pauseAfter; i++ {
+		script = append(script, refusing(429))
+	}
+	script = append(script, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"error":{"message":"bad temperature"}}`)
+	}, refusing(429))
+	up := scripted(t, script...)
+	h := newHarnessWith(t, routeFor(upstream("zai/api-flash", up.server.URL, 1)), "", patient(time.Millisecond, 300*time.Millisecond, time.Second, nil))
+	for i := 0; i <= pauseAfter; i++ {
+		response := h.post(t, patienceBody, testKey)
+		_, _ = io.Copy(io.Discard, response.Body)
+	}
+	held := h.router.pauses[pauseKey(&h.route, "zai/api-flash")]
+	if len(up.times()) != pauseAfter+1 || held.refused != pauseAfter || held.left(time.Now()) <= 0 {
+		t.Fatalf("%d calls, %d refusals in a row, left alone %s", len(up.times()), held.refused, held.left(time.Now()))
+	}
+}
+
+func TestAProvidersOwnCodeForARefusalIsReadForTheOperator(t *testing.T) {
+	for body, want := range map[string]string{
+		`{"error":{"code":"1302","message":"Rate limit reached for requests"}}`:                         "1302",
+		`{"error":{"message":"Rate limit reached","type":"rate_limit_error","param":null,"code":null}}`: "rate_limit_error",
+		`{"error":{"code":429,"message":"Provider returned error"}}`:                                    "429",
+		`{"code":"Throttling.RateQuota","message":"Requests rate limit exceeded","request_id":"x"}`:     "Throttling.RateQuota",
+		`{"error":"overloaded"}`:                                 "",
+		`{"error":{"code":"too many words here","message":"x"}}`: "",
+		`{"error":{"code":"` + strings.Repeat("a", 41) + `"}}`:   "",
+		`nope`: "",
+		``:     "",
+	} {
+		if got := refusalCode([]byte(body)); got != want {
+			t.Errorf("%s: %q, want %q", body, got, want)
+		}
+	}
+	if got := statusReason(429, "1302"); got != "HTTP 429, código 1302" {
+		t.Errorf("reason: %q", got)
+	}
+	if got := statusReason(502, ""); got != "HTTP 502" {
+		t.Errorf("reason: %q", got)
 	}
 }
