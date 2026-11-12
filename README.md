@@ -151,11 +151,12 @@ the customer has an answer, one way or the other, inside the ten seconds many cl
 An upstream that refuses a request now and then holds nobody else back. One that names a time is left
 alone by every request until that time is over (a time longer than three seconds only from its second
 refusal in a row, so a single odd refusal closes the route to nobody else), and so is one that has
-refused eight calls in a row with no answer between them; the route's next upstream is asked
-meanwhile. Once such an upstream has refused again when its time was over, a customer who comes while
-it is left alone is told at once. At most 32 requests of a route wait to ask it again at one time,
-each keeping its place until it is answered or given up; past that a request is told at once too, so
-the calls a provider that refuses gets are bounded however many customers come.
+refused eight calls in a row while answering nobody; the route's next upstream is asked meanwhile.
+An upstream that refuses while it is answering other requests is full, not refusing everyone: those
+refusals count for nothing and the requests wait on their own. Once such an upstream has refused again when its time was over, a customer who comes while
+it is left alone is told at once. Once 32 requests of a route are waiting to ask it again, a request
+that comes to wait for the first time is told at once too (one that has already waited is never
+turned away for it), so the calls a provider that refuses gets are bounded however many customers come.
 A request an upstream at its limit kept unanswered gets `503 upstream_busy` with `Retry-After`, in the
 router's own words: an upstream's 429 speaks of Lebrel's account with it, never of the customer's, and
 is not relayed. Nothing is charged for it, and only then is the operator alerted, with the upstream's

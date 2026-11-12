@@ -1231,15 +1231,7 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 	began := time.Now()
 	// each upstream's body is built once, however many rounds ask it
 	bodies := make([][]byte, len(route.Upstreams))
-	// A request takes its place in the route's waiting room at its first wait and keeps it until the
-	// route has answered it or it is given up, however it ends (an answer, no more patience, the
-	// customer leaving, a shutdown): a request that has waited is never turned away for a newcomer.
-	room, seated := s.waiting[route.ModelID], false
-	defer func() {
-		if seated {
-			room.Add(-1)
-		}
-	}()
+	room, waited := s.waiting[route.ModelID], false
 	for round := 1; ; round++ {
 		result, failed, wait, again, err := s.askUpstreams(ctx, route, fields, normalized, bodies, requestID, accept, round, began)
 		if err != nil || result != nil {
@@ -1248,24 +1240,33 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 		if !again {
 			return nil, failed
 		}
-		// The waiting room has a size. Every request in it asks the route again, so past it a request
-		// is told at once, as it would be when its wait did not fit: the calls a provider that refuses
-		// gets are bounded by the room, not by how many customers come.
-		if room != nil && !seated {
-			if room.Add(1) > int64(s.settings.Patience.Waiting) {
+		// The waiting room has a size: the requests waiting to ask the route again. Every one of them
+		// asks again, so a request that comes to wait for the first time when the room is full is told
+		// at once, as it would be when its wait did not fit, and the calls a provider that refuses
+		// gets stay bounded however many customers come. A request holds its place only while it
+		// waits, not while it asks or is answered; one that has waited before always gets a place
+		// again, so it is never turned away for a newcomer after its wait.
+		if room != nil {
+			if room.Add(1) > int64(s.settings.Patience.Waiting) && !waited {
 				room.Add(-1)
 				s.settings.Logger.Printf("request=%s model=%s no upstream took it (%s) and %d requests already wait for the route", requestID, route.ModelID, failed.Summary(), s.settings.Patience.Waiting)
 				return nil, failed
 			}
-			seated = true
+			waited = true
 		}
 		s.settings.Logger.Printf("request=%s model=%s no upstream took it (%s), asking again in %s", requestID, route.ModelID, failed.Summary(), wait.Round(time.Millisecond))
 		timer := time.NewTimer(wait)
 		select {
 		case <-timer.C:
+			if room != nil {
+				room.Add(-1)
+			}
 		case <-ctx.Done():
 			// the customer left, or a shutdown cut the wait: nothing more is asked
 			timer.Stop()
+			if room != nil {
+				room.Add(-1)
+			}
 			failed.last = fmt.Errorf("waiting to ask the route again: %w", ctx.Err())
 			return nil, failed
 		}
@@ -1347,7 +1348,10 @@ func (s *Server) askUpstreams(ctx context.Context, route *Route, fields map[stri
 		if key := upstream.APIKey(); key != "" {
 			request.Header.Set("Authorization", "Bearer "+key)
 		}
+		// A call still out after a refusal would have come back is one the upstream is answering.
+		out := held.call()
 		response, err := s.settings.HTTPClient.Do(request)
+		out()
 		callMu.Lock()
 		answered = true
 		callMu.Unlock()
@@ -1434,10 +1438,17 @@ func (s *Server) askUpstreams(ctx context.Context, route *Route, fields map[stri
 			failed.last = fmt.Errorf("%s: %s", upstream.Name, reason)
 			return s.roundOver(failed, end, wait, again, began)
 		}
-		if len(failed.attempts) > 0 && status >= 200 && status <= 299 {
+		if status < 200 || status > 299 {
+			// a refusal of the request as sent, relayed to its customer
+			return &upstreamResult{upstream: upstream, response: response, release: func() { endCall(nil) }}, nil, 0, false, nil
+		}
+		if len(failed.attempts) > 0 {
 			s.noteFallback(route, upstream, failed.attempts, requestID)
 		}
-		return &upstreamResult{upstream: upstream, response: response, release: func() { endCall(nil) }}, nil, 0, false, nil
+		// The upstream is answering this request until its answer has been relayed: a refusal it
+		// gives meanwhile says it is full, not that it refuses everyone.
+		relayed := held.answering()
+		return &upstreamResult{upstream: upstream, response: response, release: func() { relayed(); endCall(nil) }}, nil, 0, false, nil
 	}
 	if failed.last == nil {
 		failed.last = errors.New("no upstreams")

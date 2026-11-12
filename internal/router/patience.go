@@ -29,9 +29,10 @@ type Patience struct {
 	// so a provider that reopens is not asked by all of them in the same instant.
 	Jitter func(wait time.Duration) time.Duration
 	// Waiting is how many requests of one route may be waiting to ask it again at one time (default
-	// 32); a request keeps its place from its first wait until it is answered or given up. Past it a
-	// request is told at once: every waiting request asks the route again, so their number is what
-	// bounds the calls a provider that refuses gets, however many customers come.
+	// 32) before one that comes to wait for the first time is told at once: every waiting request
+	// asks the route again, so their number is what bounds the calls a provider that refuses gets,
+	// however many customers come. A place is held while waiting only, and a request that has
+	// waited before always gets one again.
 	Waiting int
 }
 
@@ -102,14 +103,69 @@ func (p Patience) spread(wait time.Duration) time.Duration {
 // left alone is told at once instead of waiting out a patience nothing suggests will be rewarded.
 const pauseAfter = 8
 
-// pause is what one upstream of one route has said about its limit: until when it is left alone, and
-// how many times in a row it refused. Providers count per model, so there is one per route and
-// upstream, read by every request. An upstream is left alone when it names a time itself
-// (Retry-After), or when it has refused pauseAfter times in a row.
+// servingAfter is how long a call must have been out for the upstream to be taken to be answering
+// it: a refusal comes back at once, an answer that sends its headers only when it is whole does not.
+const servingAfter = time.Second
+
+// pause is what one upstream of one route has said about its limit: until when it is left alone, how
+// many times in a row it refused, and how many calls it is answering now. Providers count per model,
+// so there is one per route and upstream, read by every request. An upstream is left alone when it
+// names a time itself (Retry-After), or when it has refused pauseAfter times in a row while
+// answering nobody: one that refuses while it answers others is full, not refusing everyone, and the
+// requests it refuses wait on their own.
 type pause struct {
 	mu      sync.Mutex
 	until   time.Time
 	refused int
+	serving int
+}
+
+// answering marks a call the upstream is answering (its answer is being relayed); the func returned
+// ends the mark, once.
+func (p *pause) answering() func() {
+	if p == nil {
+		return func() {}
+	}
+	p.mu.Lock()
+	p.serving++
+	p.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.mu.Lock()
+			p.serving--
+			p.mu.Unlock()
+		})
+	}
+}
+
+// call marks a call sent to the upstream and still unanswered: once it has been out for
+// servingAfter the upstream is taken to be answering it, until the func returned says the call is
+// over (headers or an error came back).
+func (p *pause) call() func() {
+	if p == nil {
+		return func() {}
+	}
+	var mu sync.Mutex
+	var over func()
+	done := false
+	timer := time.AfterFunc(servingAfter, func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if !done {
+			over = p.answering()
+		}
+	})
+	return func() {
+		timer.Stop()
+		mu.Lock()
+		defer mu.Unlock()
+		done = true
+		if over != nil {
+			over()
+			over = nil
+		}
+	}
 }
 
 // left is how long from now the upstream is left alone (zero: it may be asked).
@@ -126,18 +182,20 @@ func (p *pause) left(now time.Time) time.Duration {
 }
 
 // refusing says whether the upstream is being left alone because it refused everyone and, asked again
-// when its time was over, refused again: nothing shows it would take the next request.
+// when its time was over, refused again, while answering nobody: nothing shows it would take the
+// next request.
 func (p *pause) refusing(now time.Time) bool {
 	if p == nil {
 		return false
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return now.Before(p.until) && p.refused > pauseAfter
+	return now.Before(p.until) && p.refused > pauseAfter && p.serving == 0
 }
 
 // refuse records a refusal and returns how long the upstream is left alone from now; zero when it is
-// not, and the request that was refused waits on its own. A time the upstream names is kept as asked
+// not, and the request that was refused waits on its own. A refusal while the upstream is answering
+// other requests counts for nothing. A time the upstream names is kept as asked
 // (never under a quarter of First, nor over pauseLongest); one longer than Longest is kept for
 // everyone only from the second refusal in a row, so a single odd refusal that names a minute does
 // not close the route to every customer. Without a named time, the upstream is left alone from its
@@ -151,7 +209,12 @@ func (p *pause) refuse(now time.Time, asked time.Duration, patience Patience) ti
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !now.Before(p.until) {
+	switch {
+	case p.serving > 0:
+		// It is answering other requests: it is full, not refusing everyone. This is the odd refusal,
+		// and the count starts over as it does after an answer.
+		p.refused = 0
+	case !now.Before(p.until):
 		p.refused++
 	}
 	wait := asked
