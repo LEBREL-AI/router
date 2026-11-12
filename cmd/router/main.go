@@ -562,7 +562,6 @@ func (c *certificates) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	return c.loaded, nil
 }
 
-// positive reads a whole number setting above zero, or its default when unset.
 // upstreamPatience reads UPSTREAM_PATIENCE_SECONDS: how long after its first call a request may
 // still ask again a route whose upstreams refuse for the moment. Unset: the router's own default.
 // Zero: no waiting, a route answers with what its first round got.
@@ -592,6 +591,7 @@ func describePatience(patience router.Patience) string {
 	}
 }
 
+// positive reads a whole number setting above zero, or its default when unset.
 func positive(name string, fallback int) (int, error) {
 	value, err := strconv.Atoi(env(name, strconv.Itoa(fallback)))
 	if err != nil || value < 1 {

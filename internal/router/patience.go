@@ -21,22 +21,24 @@ type Patience struct {
 	// First is the wait after a failure that names none (default 500 ms). It doubles with each round
 	// of a request, and with each refusal in a row of an upstream that is being left alone.
 	First time.Duration
-	// Longest caps a wait the router chooses itself (default 4 s). What an upstream asks for with
-	// Retry-After is kept as asked, up to pauseLongest.
+	// Longest caps a wait the router chooses itself (default 3 s, so that five rounds fit the
+	// default Budget: 0.5, 1, 2 and 3 s between them). What an upstream asks for with Retry-After is
+	// kept as asked, up to pauseLongest.
 	Longest time.Duration
 	// Jitter spreads the requests that wait for the same moment (nil: up to a quarter more, at random),
 	// so a provider that reopens is not asked by all of them in the same instant.
 	Jitter func(wait time.Duration) time.Duration
 	// Waiting is how many requests of one route may be waiting to ask it again at one time (default
-	// 32). Past it a request is told at once: every waiting request asks the route again, so their
-	// number is what bounds the calls a provider that refuses gets, however many customers come.
+	// 32); a request keeps its place from its first wait until it is answered or given up. Past it a
+	// request is told at once: every waiting request asks the route again, so their number is what
+	// bounds the calls a provider that refuses gets, however many customers come.
 	Waiting int
 }
 
 const (
 	defaultPatienceBudget  = 8 * time.Second
 	defaultPatienceFirst   = 500 * time.Millisecond
-	defaultPatienceLongest = 4 * time.Second
+	defaultPatienceLongest = 3 * time.Second
 	defaultPatienceWaiting = 32
 	// pauseLongest caps what an upstream may ask for with Retry-After. A longer one (an hour, a date far
 	// away) speaks of a quota, not of a moment: the upstream is asked again after this much, which costs

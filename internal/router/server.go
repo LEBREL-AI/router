@@ -1231,7 +1231,15 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 	began := time.Now()
 	// each upstream's body is built once, however many rounds ask it
 	bodies := make([][]byte, len(route.Upstreams))
-	room := s.waiting[route.ModelID]
+	// A request takes its place in the route's waiting room at its first wait and keeps it until the
+	// route has answered it or it is given up, however it ends (an answer, no more patience, the
+	// customer leaving, a shutdown): a request that has waited is never turned away for a newcomer.
+	room, seated := s.waiting[route.ModelID], false
+	defer func() {
+		if seated {
+			room.Add(-1)
+		}
+	}()
 	for round := 1; ; round++ {
 		result, failed, wait, again, err := s.askUpstreams(ctx, route, fields, normalized, bodies, requestID, accept, round, began)
 		if err != nil || result != nil {
@@ -1243,24 +1251,21 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 		// The waiting room has a size. Every request in it asks the route again, so past it a request
 		// is told at once, as it would be when its wait did not fit: the calls a provider that refuses
 		// gets are bounded by the room, not by how many customers come.
-		if room != nil && room.Add(1) > int64(s.settings.Patience.Waiting) {
-			room.Add(-1)
-			s.settings.Logger.Printf("request=%s model=%s no upstream took it (%s) and %d requests already wait for the route", requestID, route.ModelID, failed.Summary(), s.settings.Patience.Waiting)
-			return nil, failed
+		if room != nil && !seated {
+			if room.Add(1) > int64(s.settings.Patience.Waiting) {
+				room.Add(-1)
+				s.settings.Logger.Printf("request=%s model=%s no upstream took it (%s) and %d requests already wait for the route", requestID, route.ModelID, failed.Summary(), s.settings.Patience.Waiting)
+				return nil, failed
+			}
+			seated = true
 		}
 		s.settings.Logger.Printf("request=%s model=%s no upstream took it (%s), asking again in %s", requestID, route.ModelID, failed.Summary(), wait.Round(time.Millisecond))
 		timer := time.NewTimer(wait)
 		select {
 		case <-timer.C:
-			if room != nil {
-				room.Add(-1)
-			}
 		case <-ctx.Done():
 			// the customer left, or a shutdown cut the wait: nothing more is asked
 			timer.Stop()
-			if room != nil {
-				room.Add(-1)
-			}
 			failed.last = fmt.Errorf("waiting to ask the route again: %w", ctx.Err())
 			return nil, failed
 		}
