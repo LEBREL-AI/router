@@ -344,7 +344,7 @@ func TestTheProductionRoutesFileLoads(t *testing.T) {
 			owners[u.Name] = route.ModelID
 		}
 	}
-	if routed != 8 {
-		t.Fatalf("%d routed models in the production file, 8 expected", routed)
+	if routed != 9 {
+		t.Fatalf("%d routed models in the production file, 9 expected", routed)
 	}
 }

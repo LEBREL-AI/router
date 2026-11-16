@@ -375,6 +375,50 @@
       "default_max_output_tokens": 32768
     },
     {
+      "model_id": "qwen/qwen4-max",
+      "display_name": "Qwen4 Max",
+      "base_model": "Qwen4-Max",
+      "level": 2,
+      "family": "qwen4-max",
+      "claimed_revision": "qwen/qwen4-max",
+      "data_note": "Relayed by Lebrel's router, which keeps nothing, to Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): Alibaba sees the request, not you, and keeps its own retention policy. Reasoning tokens are billed as output. Reasoning follows your switch (enable_thinking: false turns it off) and reasoning_effort sets its depth: low, high or xhigh, high when you name none. Priced by Lebrel's published rates; a fifth of the price is Lebrel's route fee.",
+      "upstreams": [
+        {
+          "name": "alibaba/model-studio",
+          "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+          "base_url_env": "ALIBABA_MODEL_STUDIO_BASE_URL",
+          "model": "qwen4-max",
+          "api_key_env": "DASHSCOPE_API_KEY",
+          "priority": 1,
+          "usage_format": "openai",
+          "dialect": "alibaba",
+          "reasoning_efforts": [
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "timeout_seconds": 90,
+          "data_note": "Served by Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy. Reasoning follows your switch (enable_thinking, as Alibaba documents) and reasoning_effort sets its depth."
+        }
+      ],
+      "pricing": {
+        "input_microusd_per_million_tokens": 1400000,
+        "cached_input_microusd_per_million_tokens": 70000,
+        "output_microusd_per_million_tokens": 4200000,
+        "reservation_bps": 15000,
+        "fee_bps": 2000,
+        "version": "router-v3",
+        "effective_at": "2026-11-16T03:00:00.000Z"
+      },
+      "max_context_tokens": 1000000,
+      "max_output_tokens": 131072,
+      "default_max_output_tokens": 32768
+    },
+    {
       "model_id": "qwen/qwen3.8-max",
       "display_name": "Qwen3.8 Max",
       "base_model": "Qwen3.8-Max",

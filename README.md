@@ -126,7 +126,7 @@ Browsers get CORS on the completion path, with the headers they ask for.
 ## Production: Alibaba Model Studio first, the labs behind
 
 Since 6 November 2026 the routes Model Studio serves (the two DeepSeek, GLM-5.3, Kimi K3, Kimi K3.1 Pro
-since 11 November, and the two Qwen) go first to Alibaba Cloud Model Studio's copy of each model (`dialect: "alibaba"`, `DASHSCOPE_API_KEY`;
+since 11 November, the two Qwen3.8, and Qwen4 Max since 16 November) go first to Alibaba Cloud Model Studio's copy of each model (`dialect: "alibaba"`, `DASHSCOPE_API_KEY`;
 `base_url_env: ALIBABA_MODEL_STUDIO_BASE_URL` may move the endpoint to the workspace form of the
 same service, and the signed manifest keeps naming the public one). The previous upstreams stay
 behind as fallback: OpenRouter pinned to the lab for DeepSeek and Qwen (`dialect: "openrouter"`,
@@ -168,8 +168,9 @@ answers 400 to `logprobs`, which DeepSeek's own API returns, so a request that a
 probabilities skips Model Studio and goes to the next upstream. That is neither a failure nor a
 fallback, and the last upstream of a route cannot list any. The list suits only fields whose null,
 false or 0 mean "not asked": such a value is forwarded as sent.
-Qwen: `qwen/qwen3.8-max` (Alibaba's `qwen3.8-max-0902` snapshot) and `qwen/qwen3.8-flash`, both
-1,000,000 context and 131,072 max output.
+Qwen: `qwen/qwen4-max` (Alibaba's `qwen4-max`, since 16 November 2026, Model Studio alone: reasoning
+at low, high or xhigh, or off), `qwen/qwen3.8-max` (Alibaba's `qwen3.8-max-0902` snapshot) and
+`qwen/qwen3.8-flash`, all 1,000,000 context and 131,072 max output.
 
 
 `routes.production.json` serves DeepSeek's two live models as-is from the lab's own API:
