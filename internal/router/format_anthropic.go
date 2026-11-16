@@ -50,7 +50,9 @@ func anthropicText(content any, what string) (string, error) {
 	return "", formatErrorf("%s content must be text", what)
 }
 
-// anthropicUserMessages is a user turn: tool results first (each its own tool message), then the user's own text.
+// anthropicUserMessages is a user turn: tool results first (each its own tool message), then the user's own text,
+// images and documents. Images a tool returned (Claude Code's Read of a picture or a screenshot) go to the model in
+// that user turn, after a line saying where they came from: a tool message carries text alone in the chat format.
 func anthropicUserMessages(content any) ([]map[string]any, error) {
 	if text, ok := content.(string); ok {
 		return []map[string]any{{"role": "user", "content": text}}, nil
@@ -60,7 +62,8 @@ func anthropicUserMessages(content any) ([]map[string]any, error) {
 		return nil, formatErrorf("message content must be a string or a list of blocks")
 	}
 	var tools []map[string]any
-	var texts []string
+	var toolImages []any
+	var parts []any
 	for _, block := range blocks {
 		object, ok := block.(map[string]any)
 		if !ok {
@@ -71,28 +74,147 @@ func anthropicUserMessages(content any) ([]map[string]any, error) {
 		toolUseID, hasToolUse := object["tool_use_id"].(string)
 		switch {
 		case kind == "text" && hasText:
-			texts = append(texts, text)
-		case kind == "tool_result" && hasToolUse:
-			result := ""
-			if object["content"] != nil {
-				var err error
-				if result, err = anthropicText(object["content"], "tool_result"); err != nil {
-					return nil, err
-				}
+			parts = append(parts, map[string]any{"type": "text", "text": text})
+		case kind == "image":
+			part, err := anthropicImagePart(object)
+			if err != nil {
+				return nil, err
 			}
-			if object["is_error"] == true && result != "" {
-				result = "Error: " + result
+			parts = append(parts, part)
+		case kind == "document":
+			part, err := anthropicDocumentPart(object)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, part)
+		case kind == "tool_result" && hasToolUse:
+			result, images, err := anthropicToolResult(object["content"], object["is_error"] == true)
+			if err != nil {
+				return nil, err
 			}
 			tools = append(tools, map[string]any{"role": "tool", "tool_call_id": toolUseID, "content": result})
+			toolImages = append(toolImages, images...)
 		default:
 			return nil, formatErrorf("user content of type %q is not supported", kind)
 		}
 	}
 	messages := tools
-	if len(texts) > 0 {
-		messages = append(messages, map[string]any{"role": "user", "content": strings.Join(texts, "\n")})
+	if len(toolImages) > 0 {
+		lead := map[string]any{"type": "text", "text": "The images returned by the tool calls above:"}
+		parts = append(append([]any{lead}, toolImages...), parts...)
+	}
+	if len(parts) > 0 {
+		messages = append(messages, map[string]any{"role": "user", "content": joinedIfText(parts)})
 	}
 	return messages, nil
+}
+
+// anthropicToolResult is what a tool returned: its text (with documents, its parts) for the tool message, and the
+// images it returned, which go to the user turn after it.
+func anthropicToolResult(content any, isError bool) (any, []any, error) {
+	var texts []string
+	var documents, images []any
+	switch value := content.(type) {
+	case nil:
+	case string:
+		texts = append(texts, value)
+	case []any:
+		for _, block := range value {
+			object, ok := block.(map[string]any)
+			kind := "unknown"
+			if ok {
+				kind, _ = object["type"].(string)
+			}
+			switch kind {
+			case "text":
+				text, hasText := object["text"].(string)
+				if !hasText {
+					return nil, nil, formatErrorf("tool_result text blocks need text")
+				}
+				texts = append(texts, text)
+			case "image":
+				part, err := anthropicImagePart(object)
+				if err != nil {
+					return nil, nil, err
+				}
+				images = append(images, part)
+			case "document":
+				part, err := anthropicDocumentPart(object)
+				if err != nil {
+					return nil, nil, err
+				}
+				documents = append(documents, part)
+			default:
+				return nil, nil, formatErrorf("tool_result content of type %q is not supported", kind)
+			}
+		}
+	default:
+		return nil, nil, formatErrorf("tool_result content must be text")
+	}
+	text := strings.Join(texts, "\n")
+	if isError && text != "" {
+		text = "Error: " + text
+	}
+	if text == "" && len(images) > 0 && len(documents) == 0 {
+		text = "The tool returned an image; it follows in the next message."
+	}
+	if len(documents) == 0 {
+		return text, images, nil
+	}
+	parts := []any{}
+	if text != "" {
+		parts = append(parts, map[string]any{"type": "text", "text": text})
+	}
+	return append(parts, documents...), images, nil
+}
+
+// anthropicImagePart is an image block as a chat part: base64 data checked now, an address fetched later.
+func anthropicImagePart(block map[string]any) (map[string]any, error) {
+	source, _ := block["source"].(map[string]any)
+	switch source["type"] {
+	case "base64":
+		data, _ := source["data"].(string)
+		return imagePartFromBase64(data)
+	case "url":
+		address, _ := source["url"].(string)
+		return imagePartFromURL(address)
+	case "file":
+		return nil, formatErrorf("files kept in Anthropic's Files API are not reachable here: send the image itself (base64) or its URL")
+	}
+	return nil, formatErrorf("an image block needs a base64 or url source")
+}
+
+// anthropicDocumentPart is a document block waiting to be read: a PDF or a text file, inline or by address.
+func anthropicDocumentPart(block map[string]any) (map[string]any, error) {
+	source, _ := block["source"].(map[string]any)
+	title, _ := block["title"].(string)
+	mediaType, _ := source["media_type"].(string)
+	switch source["type"] {
+	case "base64":
+		data, _ := source["data"].(string)
+		if data == "" {
+			return nil, formatErrorf("a document's base64 source needs data")
+		}
+		return documentPart(title, mediaType, data, "", ""), nil
+	case "text":
+		data, _ := source["data"].(string)
+		return documentPart(title, "text/plain", "", data, ""), nil
+	case "url":
+		address, _ := source["url"].(string)
+		if !strings.HasPrefix(address, "https://") && !strings.HasPrefix(address, "http://") {
+			return nil, formatErrorf("a document's url source must be an http(s) address")
+		}
+		return documentPart(title, "", "", "", address), nil
+	case "content":
+		text, err := anthropicText(source["content"], "document")
+		if err != nil {
+			return nil, err
+		}
+		return documentPart(title, "text/plain", "", text, ""), nil
+	case "file":
+		return nil, formatErrorf("files kept in Anthropic's Files API are not reachable here: send the document itself (base64) or its URL")
+	}
+	return nil, formatErrorf("a document block needs a base64, text, url or content source")
 }
 
 // anthropicAssistantMessage is an assistant turn: its text and the tools it called; thinking blocks are the model's own and stay out.
@@ -532,8 +654,9 @@ func (s *anthropicStream) Abort(message string) []formatEvent {
 }
 
 // anthropicCountTokensEstimate is a size-based estimate of the prompt (about four characters a
-// token); the model's own count is in every answer's usage.
-func anthropicCountTokensEstimate(request map[string]any) (int64, error) {
+// token, an image at what the route's model counts one at most, a document's bytes at about a token per six
+// characters of its data); the model's own count is in every answer's usage.
+func anthropicCountTokensEstimate(request map[string]any, imageTokens int64) (int64, error) {
 	copied := make(map[string]any, len(request)+1)
 	for key, value := range request {
 		copied[key] = value
@@ -543,16 +666,54 @@ func anthropicCountTokensEstimate(request map[string]any) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	media := estimateMediaTokens(chat, imageTokens)
 	messages, _ := json.Marshal(chat["messages"])
 	tools, _ := json.Marshal(chat["tools"])
 	size := int64(len(messages) + len(tools))
 	if chat["tools"] == nil {
 		size = int64(len(messages)) + 2
 	}
-	if size/4 < 1 {
+	if size/4+media < 1 {
 		return 1, nil
 	}
-	return size / 4, nil
+	return size/4 + media, nil
+}
+
+// estimateMediaTokens counts a translated request's images and documents for an estimate and takes their data out
+// of it, so a picture's base64 is not read as text: an image at imageTokens (1,024 when the route names none),
+// a document by the size of its data.
+func estimateMediaTokens(chat map[string]any, imageTokens int64) int64 {
+	if imageTokens <= 0 {
+		imageTokens = 1024
+	}
+	messages, _ := chat["messages"].([]map[string]any)
+	var total int64
+	for _, message := range messages {
+		parts, ok := message["content"].([]any)
+		if !ok {
+			continue
+		}
+		kept := make([]any, 0, len(parts))
+		for _, part := range parts {
+			object, _ := part.(map[string]any)
+			switch object["type"] {
+			case "image_url":
+				total += imageTokens
+			case documentPartType:
+				if data, ok := object["data"].(string); ok {
+					total += int64(len(data))/6 + 1
+				} else if text, ok := object["text"].(string); ok {
+					total += int64(len(text))/4 + 1
+				} else {
+					total += 2048
+				}
+			default:
+				kept = append(kept, object)
+			}
+		}
+		message["content"] = kept
+	}
+	return total
 }
 
 var anthropicErrorKinds = map[int]string{400: "invalid_request_error", 401: "authentication_error", 403: "permission_error", 404: "not_found_error", 411: "invalid_request_error", 413: "invalid_request_error", 415: "invalid_request_error", 429: "rate_limit_error", 500: "api_error", 502: "api_error", 503: "overloaded_error", 504: "api_error"}

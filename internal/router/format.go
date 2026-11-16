@@ -165,7 +165,7 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 	// any model it does not know, which the edition's edge would refuse on every turn.
 	maxOutput := route.MaxOutputTokens
 	if count {
-		estimate, err := anthropicCountTokensEstimate(request)
+		estimate, err := anthropicCountTokensEstimate(request, route.ImageTokens)
 		if err != nil {
 			s.writeFormatError(w, format, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
@@ -178,13 +178,20 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 	if format == formatAnthropic {
 		chat, err = anthropicToChat(request, maxOutput)
 	} else {
-		// Without max_output_tokens, Codex gets the edition's limit as the proxy gave it; a routed model keeps
-		// the default any OpenAI client gets, never a hold at the route's maximum.
+		// Without max_output_tokens, Codex gets the edition's default output (DeepSeek's own, 32,768 of its
+		// 393,216); a routed model keeps the default any OpenAI client gets, never a hold at the route's maximum.
 		var fill int64
 		if route.Kind == routeKindEdition {
-			fill = maxOutput
+			fill = route.DefaultMaxOutputTokens
+			if fill <= 0 || fill > maxOutput {
+				fill = maxOutput
+			}
 		}
 		chat, err = responsesToChat(request, maxOutput, fill)
+	}
+	if err == nil {
+		// Images inline (fetched here when given by address) and documents as their text, as the route's model reads them.
+		err = s.resolveMedia(ctx, chat, route)
 	}
 	if err != nil {
 		var invalid *formatError

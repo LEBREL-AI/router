@@ -8,7 +8,10 @@
       "family": "deepseek-v4.1-flash",
       "kind": "edition",
       "max_context_tokens": 1048544,
-      "max_output_tokens": 8192,
+      "max_output_tokens": 393216,
+      "default_max_output_tokens": 32768,
+      "image_tokens": 1024,
+      "max_images": 64,
       "edition": {
         "origin": "https://api.lebrel.ai",
         "origin_env": "LEBREL_EDGE_ORIGIN",
@@ -32,6 +35,7 @@
           "model": "deepseek-v4.1-flash-1017",
           "api_key_env": "DASHSCOPE_API_KEY",
           "priority": 1,
+          "images": true,
           "usage_format": "openai",
           "dialect": "alibaba",
           "reasoning_efforts": [
@@ -89,7 +93,9 @@
       },
       "max_context_tokens": 1048576,
       "max_output_tokens": 393216,
-      "default_max_output_tokens": 32768
+      "default_max_output_tokens": 32768,
+      "image_tokens": 1024,
+      "max_images": 32
     },
     {
       "model_id": "deepseek/deepseek-v4-pro",
@@ -292,6 +298,7 @@
           "model": "kimi-k3",
           "api_key_env": "DASHSCOPE_API_KEY",
           "priority": 1,
+          "images": true,
           "usage_format": "openai",
           "dialect": "alibaba",
           "reasoning_efforts": [
@@ -323,7 +330,9 @@
       },
       "max_context_tokens": 1048576,
       "max_output_tokens": 131072,
-      "default_max_output_tokens": 32768
+      "default_max_output_tokens": 32768,
+      "image_tokens": 16384,
+      "max_images": 32
     },
     {
       "model_id": "moonshotai/kimi-k3.1-pro",
@@ -341,6 +350,7 @@
           "model": "kimi-k3.1-pro",
           "api_key_env": "DASHSCOPE_API_KEY",
           "priority": 1,
+          "images": true,
           "usage_format": "openai",
           "dialect": "alibaba",
           "reasoning_efforts": [
@@ -372,7 +382,9 @@
       },
       "max_context_tokens": 1048576,
       "max_output_tokens": 131072,
-      "default_max_output_tokens": 32768
+      "default_max_output_tokens": 32768,
+      "image_tokens": 16384,
+      "max_images": 32
     },
     {
       "model_id": "qwen/qwen4-max",
@@ -390,6 +402,7 @@
           "model": "qwen4-max",
           "api_key_env": "DASHSCOPE_API_KEY",
           "priority": 1,
+          "images": true,
           "usage_format": "openai",
           "dialect": "alibaba",
           "reasoning_efforts": [
@@ -416,7 +429,9 @@
       },
       "max_context_tokens": 1000000,
       "max_output_tokens": 131072,
-      "default_max_output_tokens": 32768
+      "default_max_output_tokens": 32768,
+      "image_tokens": 16384,
+      "max_images": 32
     },
     {
       "model_id": "qwen/qwen3.8-max",
@@ -434,6 +449,7 @@
           "model": "qwen3.8-max",
           "api_key_env": "DASHSCOPE_API_KEY",
           "priority": 1,
+          "images": true,
           "usage_format": "openai",
           "dialect": "alibaba",
           "reasoning_efforts": [
@@ -481,7 +497,9 @@
       },
       "max_context_tokens": 1000000,
       "max_output_tokens": 131072,
-      "default_max_output_tokens": 32768
+      "default_max_output_tokens": 32768,
+      "image_tokens": 4096,
+      "max_images": 32
     },
     {
       "model_id": "qwen/qwen3.8-flash",
@@ -499,6 +517,7 @@
           "model": "qwen3.8-flash",
           "api_key_env": "DASHSCOPE_API_KEY",
           "priority": 1,
+          "images": true,
           "usage_format": "openai",
           "dialect": "alibaba",
           "reasoning_efforts": [
@@ -545,7 +564,9 @@
       },
       "max_context_tokens": 1000000,
       "max_output_tokens": 131072,
-      "default_max_output_tokens": 32768
+      "default_max_output_tokens": 32768,
+      "image_tokens": 4096,
+      "max_images": 32
     }
   ]
 }

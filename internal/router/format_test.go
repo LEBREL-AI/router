@@ -104,7 +104,7 @@ func TestAnthropicMessagesBecomeOneChatCompletionAndBack(t *testing.T) {
 	if body := anthropicErrorBody(429, "rate_limit_exceeded", ""); body["error"].(map[string]any)["type"] != "rate_limit_error" {
 		t.Fatalf("error body: %v", body)
 	}
-	if estimate, err := anthropicCountTokensEstimate(decodeJSON(t, `{"messages":[{"role":"user","content":"four score and seven years ago"}]}`)); err != nil || estimate < 10 || estimate > 40 {
+	if estimate, err := anthropicCountTokensEstimate(decodeJSON(t, `{"messages":[{"role":"user","content":"four score and seven years ago"}]}`), 0); err != nil || estimate < 10 || estimate > 40 {
 		t.Fatalf("estimate %d %v", estimate, err)
 	}
 }

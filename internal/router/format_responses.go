@@ -1,8 +1,10 @@
 package router
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"path"
 	"strings"
 	"time"
 )
@@ -36,6 +38,143 @@ func responsesTextParts(content any, what string) (string, error) {
 		return strings.Join(parts, "\n"), nil
 	}
 	return "", formatErrorf("%s content must be text", what)
+}
+
+// responsesUserContent is a user message's content: its text, images and files, in order (its text alone when
+// that is all it carries, as before).
+func responsesUserContent(content any) (any, error) {
+	if text, ok := content.(string); ok {
+		return text, nil
+	}
+	list, ok := content.([]any)
+	if !ok {
+		return nil, formatErrorf("user content must be text")
+	}
+	parts := make([]any, 0, len(list))
+	for _, part := range list {
+		object, ok := part.(map[string]any)
+		kind, _ := object["type"].(string)
+		text, hasText := object["text"].(string)
+		switch {
+		case ok && (kind == "input_text" || kind == "output_text" || kind == "text") && hasText:
+			parts = append(parts, map[string]any{"type": "text", "text": text})
+		case ok && kind == "input_image":
+			image, err := responsesImagePart(object)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, image)
+		case ok && kind == "input_file":
+			file, err := responsesFilePart(object)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, file)
+		default:
+			return nil, formatErrorf("user content of type %q is not supported", kind)
+		}
+	}
+	return joinedIfText(parts), nil
+}
+
+// responsesImagePart is an input_image as a chat part: a data: URL checked now, an address fetched later.
+func responsesImagePart(object map[string]any) (map[string]any, error) {
+	if id, _ := object["file_id"].(string); id != "" {
+		return nil, formatErrorf("files kept in OpenAI's Files API are not reachable here: send the image itself (a data: URL) or its URL")
+	}
+	switch value := object["image_url"].(type) {
+	case string:
+		return imagePartFromURL(value)
+	case map[string]any:
+		address, _ := value["url"].(string)
+		return imagePartFromURL(address)
+	}
+	return nil, formatErrorf("input_image needs image_url")
+}
+
+// responsesFilePart is an input_file waiting to be read: a PDF or a text file, inline (file_data) or by address.
+func responsesFilePart(object map[string]any) (map[string]any, error) {
+	if id, _ := object["file_id"].(string); id != "" {
+		return nil, formatErrorf("files kept in OpenAI's Files API are not reachable here: send the file itself (file_data) or its URL")
+	}
+	filename, _ := object["filename"].(string)
+	if data, _ := object["file_data"].(string); data != "" {
+		if strings.HasPrefix(data, "data:") {
+			mediaType, decoded, err := parseDataURL(data)
+			if err != nil {
+				return nil, err
+			}
+			return documentPart(filename, mediaType, base64.StdEncoding.EncodeToString(decoded), "", ""), nil
+		}
+		return documentPart(filename, mediaTypeOfName(filename), data, "", ""), nil
+	}
+	if address, _ := object["file_url"].(string); address != "" {
+		if !strings.HasPrefix(address, "https://") && !strings.HasPrefix(address, "http://") {
+			return nil, formatErrorf("input_file's file_url must be an http(s) address")
+		}
+		return documentPart(filename, mediaTypeOfName(filename), "", "", address), nil
+	}
+	return nil, formatErrorf("input_file needs file_data or file_url")
+}
+
+// mediaTypeOfName is a document's media type by its file name: a PDF, or text; "" when the name says nothing.
+func mediaTypeOfName(name string) string {
+	switch strings.ToLower(path.Ext(name)) {
+	case ".pdf":
+		return "application/pdf"
+	case "":
+		return ""
+	}
+	return "text/plain"
+}
+
+// responsesToolOutput is what a function returned: its text (with files, its parts) for the tool message, and the
+// images it returned, which go to the model in a user message after the tool messages.
+func responsesToolOutput(output any) (any, []any, error) {
+	if text, ok := output.(string); ok {
+		return text, nil, nil
+	}
+	list, ok := output.([]any)
+	if !ok {
+		return nil, nil, formatErrorf("function_call_output's output must be text or a list of content")
+	}
+	var texts []string
+	var files, images []any
+	for _, part := range list {
+		object, ok := part.(map[string]any)
+		kind, _ := object["type"].(string)
+		text, hasText := object["text"].(string)
+		switch {
+		case ok && (kind == "input_text" || kind == "output_text" || kind == "text") && hasText:
+			texts = append(texts, text)
+		case ok && kind == "input_image":
+			image, err := responsesImagePart(object)
+			if err != nil {
+				return nil, nil, err
+			}
+			images = append(images, image)
+		case ok && kind == "input_file":
+			file, err := responsesFilePart(object)
+			if err != nil {
+				return nil, nil, err
+			}
+			files = append(files, file)
+		default:
+			return nil, nil, formatErrorf("function_call_output content of type %q is not supported", kind)
+		}
+	}
+	text := strings.Join(texts, "\n")
+	if text == "" && len(images) > 0 && len(files) == 0 {
+		text = "The function returned an image; it follows in the next message."
+	}
+	if len(files) == 0 {
+		return text, images, nil
+	}
+	parts := []any{}
+	if text != "" {
+		parts = append(parts, map[string]any{"type": "text", "text": text})
+	}
+	return append(parts, files...), images, nil
 }
 
 // responsesAppendAssistant: assistant text and the calls that followed it form one assistant message, as chat completions expect.
@@ -83,6 +222,17 @@ func responsesToChat(request map[string]any, maxOutputTokens, fillOutputTokens i
 	if len(items) == 0 {
 		return nil, formatErrorf("input must be a non-empty string or list")
 	}
+	// Images functions returned go to the model in a user message once the run of tool messages they came in is over:
+	// a tool message carries text alone in the chat format, and a user message may not come between tool messages.
+	var pendingImages []any
+	flushImages := func() {
+		if len(pendingImages) == 0 {
+			return
+		}
+		lead := map[string]any{"type": "text", "text": "The images returned by the function calls above:"}
+		messages = append(messages, map[string]any{"role": "user", "content": append([]any{lead}, pendingImages...)})
+		pendingImages = nil
+	}
 	for _, item := range items {
 		object, ok := item.(map[string]any)
 		if !ok {
@@ -92,19 +242,25 @@ func responsesToChat(request map[string]any, maxOutputTokens, fillOutputTokens i
 		if kind == "" {
 			kind = "message"
 		}
+		if kind != "function_call_output" {
+			flushImages()
+		}
 		switch kind {
 		case "message":
 			role, _ := object["role"].(string)
 			switch role {
-			case "user", "system", "developer":
+			case "user":
+				content, err := responsesUserContent(object["content"])
+				if err != nil {
+					return nil, err
+				}
+				messages = append(messages, map[string]any{"role": "user", "content": content})
+			case "system", "developer":
 				text, err := responsesTextParts(object["content"], role)
 				if err != nil {
 					return nil, err
 				}
-				if role == "developer" {
-					role = "system"
-				}
-				messages = append(messages, map[string]any{"role": role, "content": text})
+				messages = append(messages, map[string]any{"role": "system", "content": text})
 			case "assistant":
 				text, err := responsesTextParts(object["content"], "assistant")
 				if err != nil {
@@ -135,14 +291,12 @@ func responsesToChat(request map[string]any, maxOutputTokens, fillOutputTokens i
 			if !hasCall {
 				return nil, formatErrorf("function_call_output items need call_id")
 			}
-			output, isString := object["output"].(string)
-			if !isString {
-				var err error
-				if output, err = responsesTextParts(object["output"], "function_call_output"); err != nil {
-					return nil, err
-				}
+			output, images, err := responsesToolOutput(object["output"])
+			if err != nil {
+				return nil, err
 			}
 			messages = append(messages, map[string]any{"role": "tool", "tool_call_id": callID, "content": output})
+			pendingImages = append(pendingImages, images...)
 			if len(messages) > 1 && messages[len(messages)-2]["role"] == "assistant" {
 				messages[len(messages)-2]["_closed"] = true
 			}
@@ -152,6 +306,7 @@ func responsesToChat(request map[string]any, maxOutputTokens, fillOutputTokens i
 			return nil, formatErrorf("input item type %q is not supported", kind)
 		}
 	}
+	flushImages()
 	for _, message := range messages {
 		delete(message, "_closed")
 	}

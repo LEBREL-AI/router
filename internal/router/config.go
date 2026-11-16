@@ -199,8 +199,10 @@ type Upstream struct {
 	Unsupported []string `json:"unsupported,omitempty"`
 	// TimeoutSeconds is how long the upstream has to answer with headers (default 90) before the
 	// next one is tried; the body then streams for as long as the customer waits.
-	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
-	DataNote       string `json:"data_note,omitempty"`
+	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
+	// Images marks an endpoint measured to read images: a request carrying one is sent only to such endpoints.
+	Images   bool   `json:"images,omitempty"`
+	DataNote string `json:"data_note,omitempty"`
 }
 
 // routerSetFields are request fields the router writes itself (the model id on every request, a cap on
@@ -270,7 +272,21 @@ type Route struct {
 	MaxContextTokens       int64          `json:"max_context_tokens"`
 	MaxOutputTokens        int64          `json:"max_output_tokens"`
 	DefaultMaxOutputTokens int64          `json:"default_max_output_tokens"`
-	DataNote               string         `json:"data_note,omitempty"`
+	// ImageTokens is the most one image costs the route's model in prompt tokens (measured per model; the hold
+	// counts each image at it, the charge is the model's own count). Zero: the model reads no images, and a
+	// request with one is refused with that reason. MaxImages is how many one request may carry.
+	ImageTokens int64  `json:"image_tokens,omitempty"`
+	MaxImages   int    `json:"max_images,omitempty"`
+	DataNote    string `json:"data_note,omitempty"`
+}
+
+// inputModalities is what the route's model reads, as OpenRouter lists it: text, and images when it reads them.
+// Documents (PDF, text) are read as their text by every model.
+func (r *Route) inputModalities() []string {
+	if r.ImageTokens > 0 {
+		return []string{"text", "image", "file"}
+	}
+	return []string{"text", "file"}
 }
 
 type Config struct {
@@ -318,6 +334,10 @@ func (r *Route) validate() error {
 	}
 	if r.Level < 1 || r.Level > 3 {
 		return errors.New("level must be 1, 2 or 3")
+	}
+	// What images cost the model and how many it reads: both set, or neither (the model reads none).
+	if r.ImageTokens < 0 || r.ImageTokens > 65_536 || r.MaxImages < 0 || r.MaxImages > 256 || (r.ImageTokens > 0) != (r.MaxImages > 0) {
+		return errors.New("image_tokens (1-65536) and max_images (1-256) are set together, or neither")
 	}
 	switch r.Kind {
 	case "":
@@ -402,6 +422,15 @@ func (r *Route) validate() error {
 	if len(last.Unsupported) > 0 {
 		return fmt.Errorf("upstream %q: the last upstream of a route cannot list unsupported fields, nothing would be left to take the request", last.Name)
 	}
+	readers := 0
+	for i := range r.Upstreams {
+		if r.Upstreams[i].Images {
+			readers++
+		}
+	}
+	if (r.ImageTokens > 0) != (readers > 0) {
+		return errors.New("a route reads images (image_tokens) exactly when one of its upstreams is marked images")
+	}
 	if r.MaxContextTokens <= 0 || r.MaxOutputTokens <= 0 || r.DefaultMaxOutputTokens <= 0 || r.DefaultMaxOutputTokens > r.MaxOutputTokens {
 		return errors.New("max_context_tokens, max_output_tokens and default_max_output_tokens must be positive, default <= max")
 	}
@@ -445,6 +474,10 @@ func (r *Route) validateEdition() error {
 	// as the local proxy capped it, instead of refused by the edge on every turn.
 	if r.MaxContextTokens <= 0 || r.MaxOutputTokens <= 0 {
 		return errors.New("an edition route needs max_context_tokens and max_output_tokens, the edition's published limits")
+	}
+	// Its default output, when set, is what a client that names none is given (Codex): never above the limit.
+	if r.DefaultMaxOutputTokens < 0 || r.DefaultMaxOutputTokens > r.MaxOutputTokens {
+		return errors.New("an edition route's default_max_output_tokens is at most its max_output_tokens")
 	}
 	parsed, err := url.Parse(r.Edition.Origin)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || strings.TrimRight(parsed.Path, "/") != "" {

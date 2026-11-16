@@ -35,8 +35,9 @@ const (
 	routeKindEdition = "edition"
 	// editionMetadataMax bounds the runtime's signed encryption document.
 	editionMetadataMax = 64 << 10
-	// editionRequestMax is what the edge accepts as ciphertext.
-	editionRequestMax = 8 << 20
+	// editionRequestMax is what the edge accepts as ciphertext: 32 MB, the router's own request limit, for
+	// requests that carry images (Anthropic's API takes 32 MB too).
+	editionRequestMax = 32 << 20
 	// editionHeaderTime is how long the edge may hold a request in line before answering.
 	editionHeaderTime = 180 * time.Second
 	// editionKeyRefresh is how long before its expiry a cached key is fetched again.

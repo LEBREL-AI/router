@@ -19,6 +19,9 @@ type RequestInfo struct {
 	Stream                bool
 	EstimatedPromptTokens int64
 	MaxOutputTokens       int64
+	// Images is how many image_url parts the request carries; the estimate leaves their data out (a picture's
+	// base64 is no text), and the caller adds what one image costs its model.
+	Images int64
 }
 
 func (r RequestInfo) EstimatedTotalTokens() int64 {
@@ -118,6 +121,7 @@ func InspectAndRequireUsage(completionPath string, body []byte, defaultMaxOutput
 	}
 
 	estimate := estimateValueTokens(payload) + 8
+	images := countImageParts(payload)
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return nil, RequestInfo{}, fmt.Errorf("encode request: %w", err)
@@ -127,7 +131,30 @@ func InspectAndRequireUsage(completionPath string, body []byte, defaultMaxOutput
 		Stream:                stream,
 		EstimatedPromptTokens: estimate,
 		MaxOutputTokens:       maxOutput,
+		Images:                images,
 	}, nil
+}
+
+// countImageParts counts the image_url content parts of a request's messages.
+func countImageParts(value any) int64 {
+	switch typed := value.(type) {
+	case []any:
+		var total int64
+		for _, item := range typed {
+			total += countImageParts(item)
+		}
+		return total
+	case map[string]any:
+		if typed["type"] == "image_url" {
+			return 1
+		}
+		var total int64
+		for _, item := range typed {
+			total += countImageParts(item)
+		}
+		return total
+	}
+	return 0
 }
 
 func rejectDuplicateJSONKeys(body []byte) error {
@@ -483,6 +510,10 @@ func estimateValueTokens(value any) int64 {
 		}
 		return total
 	case map[string]any:
+		if typed["type"] == "image_url" {
+			// an image is counted apart (RequestInfo.Images): its data is no text
+			return 0
+		}
 		var total int64
 		for key, item := range typed {
 			if key == "max_tokens" || key == "max_completion_tokens" || key == "stream_options" {

@@ -176,6 +176,10 @@ type Server struct {
 	pauses map[string]*pause
 	// waiting counts, per route, the requests waiting to ask it again (Patience.Waiting); built once
 	waiting map[string]*atomic.Int64
+	// mediaClient fetches images and documents a request gives by address (media.go); mediaFetch, when set,
+	// stands in for it (tests)
+	mediaClient *http.Client
+	mediaFetch  func(ctx context.Context, address string) ([]byte, string, error)
 }
 
 type cachedManifest struct {
@@ -249,7 +253,7 @@ func New(settings Settings) (*Server, error) {
 	for i, host := range settings.DirectHosts {
 		settings.DirectHosts[i] = normaliseHost(host)
 	}
-	server := &Server{settings: settings, routes: map[string]*Route{}, slugs: map[string]*Route{}, hashes: map[string]string{}, alerts: map[string]alertState{}, manifests: map[string]cachedManifest{}, pauses: map[string]*pause{}, waiting: map[string]*atomic.Int64{}}
+	server := &Server{settings: settings, routes: map[string]*Route{}, slugs: map[string]*Route{}, hashes: map[string]string{}, alerts: map[string]alertState{}, manifests: map[string]cachedManifest{}, pauses: map[string]*pause{}, waiting: map[string]*atomic.Int64{}, mediaClient: newMediaClient()}
 	server.cutCtx, server.cutAll = context.WithCancel(context.Background())
 	for i := range settings.Routes.Routes {
 		route := &settings.Routes.Routes[i]
@@ -779,7 +783,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request, scoped *Ro
 	for _, route := range routes {
 		if route.Kind == routeKindEdition {
 			data = append(data, map[string]any{
-				"id": route.ModelID, "object": "model", "owned_by": "lebrel",
+				"id": route.ModelID, "object": "model", "owned_by": "lebrel", "input_modalities": route.inputModalities(),
 				"lebrel": map[string]any{"kind": routeKindEdition, "display_name": route.DisplayName, "base_model": route.BaseModel, "data_note": route.DataNote},
 			})
 			continue
@@ -790,7 +794,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request, scoped *Ro
 			upstreams = append(upstreams, map[string]any{"name": u.Name, "model": u.Model, "verification": status, "data_note": u.DataNote})
 		}
 		data = append(data, map[string]any{
-			"id": route.ModelID, "object": "model", "owned_by": "lebrel-router",
+			"id": route.ModelID, "object": "model", "owned_by": "lebrel-router", "input_modalities": route.inputModalities(),
 			"lebrel": map[string]any{"level": route.Level, "family": route.Family, "claimed_revision": route.ClaimedRevision,
 				"data_note": route.DataNote, "pricing": route.Pricing, "upstreams": upstreams},
 		})
@@ -887,6 +891,19 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 		s.writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	if info.Images > 0 {
+		// A model that reads no images is told so here, never sent one it would drop unseen (DeepSeek V4 Pro on
+		// Model Studio answers as if there were none); one that reads them is held for each at what it costs.
+		if route.ImageTokens <= 0 {
+			s.writeError(w, http.StatusBadRequest, "invalid_request_error", route.ModelID+" does not read images; send text, or use a model that reads them")
+			return
+		}
+		if info.Images > int64(route.MaxImages) {
+			s.writeError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("%s reads at most %d images in one request", route.ModelID, route.MaxImages))
+			return
+		}
+		info.EstimatedPromptTokens += info.Images * route.ImageTokens
+	}
 	if info.EstimatedTotalTokens() > route.MaxContextTokens {
 		s.writeError(w, http.StatusBadRequest, "context_length_exceeded", "prompt plus max output exceeds the model's context")
 		return
@@ -948,7 +965,7 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 	defer settle(0, model.Usage{}, model.SettlementUpstreamRejected)
 
 	waitingSince := time.Now()
-	result, lastErr := s.callUpstreams(ctx, route, normalized, requestID, r.Header.Get("Accept"))
+	result, lastErr := s.callUpstreams(ctx, route, normalized, requestID, r.Header.Get("Accept"), info.Images > 0)
 	if result == nil {
 		settle(0, model.Usage{}, model.SettlementUpstreamRejected)
 		if cutCaused(ctx, lastErr) {
@@ -1215,7 +1232,7 @@ func mayCarry(normalized []byte, fields []string) bool {
 // what they said may pass in a moment (a rate limit, an overload, a broken connection), the route is
 // asked again after a wait, for as long as the request's patience lasts: a provider's "not now" costs
 // the customer a moment, not the answer.
-func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []byte, requestID, accept string) (*upstreamResult, error) {
+func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []byte, requestID, accept string, images bool) (*upstreamResult, error) {
 	// What the request asks for, read once and only when it may carry a field some upstream of the route
 	// refuses: the normalized body is compact JSON and a quote inside a JSON string is always escaped, so
 	// `"name":` can only be a key, and every other request is spared the parsing.
@@ -1233,7 +1250,7 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 	bodies := make([][]byte, len(route.Upstreams))
 	room, waited := s.waiting[route.ModelID], false
 	for round := 1; ; round++ {
-		result, failed, wait, again, err := s.askUpstreams(ctx, route, fields, normalized, bodies, requestID, accept, round, began)
+		result, failed, wait, again, err := s.askUpstreams(ctx, route, fields, normalized, bodies, requestID, accept, round, began, images)
 		if err != nil || result != nil {
 			return result, err
 		}
@@ -1276,13 +1293,18 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 // askUpstreams is one round over the route's upstreams. It returns the answer (or the refusal that is
 // relayed to the customer), or else what each upstream said, with whether the route may be asked
 // again and after how long.
-func (s *Server) askUpstreams(ctx context.Context, route *Route, fields map[string]json.RawMessage, normalized []byte, bodies [][]byte, requestID, accept string, round int, began time.Time) (*upstreamResult, *attemptsError, time.Duration, bool, error) {
+func (s *Server) askUpstreams(ctx context.Context, route *Route, fields map[string]json.RawMessage, normalized []byte, bodies [][]byte, requestID, accept string, round int, began time.Time, images bool) (*upstreamResult, *attemptsError, time.Duration, bool, error) {
 	patience := s.settings.Patience
 	failed := &attemptsError{rounds: round}
 	var end roundEnd
 	for i := range route.Upstreams {
 		upstream := &route.Upstreams[i]
 		last := i == len(route.Upstreams)-1
+		if images && !upstream.Images {
+			// Images go only where they were measured to be read: an endpoint that drops them is never asked.
+			failed.skipped = append(failed.skipped, upstream.Name+" (no lee imágenes)")
+			continue
+		}
 		if field := upstream.refuses(fields); field != "" && !last {
 			// Not a failure and not a fallback: this endpoint does not take what the request asks
 			// for and the next one does, so the request goes where it can be served.
