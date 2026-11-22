@@ -17,6 +17,8 @@ services:
   router:
     image: ghcr.io/lebrel-ai/router@sha256:10a8ea4537ecc531a3121a1e58bf0efb510d7eebb13e6577b816e968581cf25b
     restart: unless-stopped
+    # DRAIN_SECONDS, then SHUTDOWN_SECONDS for the answers in flight, then what is owed goes out.
+    stop_grace_period: 670s
     ports:
       - "8080:8090"
       - "443:8443"
@@ -50,6 +52,15 @@ services:
       - SETTLEMENT_CONCURRENCY=8
       - SETTLEMENT_ALERT_SECONDS=5
       - SHUTDOWN_SECONDS=600
+      # Told to stop, the instance first answers the relay's check 410 for this long while it goes on
+      # serving, so the relay sends its new customers to the other instance before the listeners close.
+      - DRAIN_SECONDS=20
+      # The operator's switch is kept here across restarts, with the compose it was opened under. An
+      # instance that does not find its own there starts stepped aside: a new machine, or one back from
+      # an update, takes customers once it was tried and opened.
+      - RELAY_STATE_FILE=/var/lib/lebrel-router/relay-open
+      # One of a pair: an instance that was not told who its peer is says so, it does not work alone in silence.
+      - TLS_ACME_PAIRED=true
       # How long a request may wait for a route whose providers all refuse for the moment before the
       # customer is told (0: no waiting).
       - UPSTREAM_PATIENCE_SECONDS=8
@@ -62,6 +73,15 @@ services:
       - EDGE_PROXY_TOKEN=${EDGE_PROXY_TOKEN}
       - HEALTH_TOKEN=${HEALTH_TOKEN}
       - RECEIPT_PEERS=${RECEIPT_PEERS}
+      # Two instances of this app behind the relay (1.4.1), each with its own certificate: the base
+      # URL of the other's plaintext listener (its gateway hostname on port 8080), where an instance
+      # looks up the challenge of an order that is not its own, and the secret the two authenticate
+      # those with (the same on both). Each instance names the other, so they are passed per instance;
+      # a certificate's private key never travels.
+      - TLS_ACME_PEER=${TLS_ACME_PEER}
+      - TLS_ACME_PEER_SECRET=${TLS_ACME_PEER_SECRET}
+      # Opens the operator's switch (/healthz/relay/drain): step the instance aside, open it, see what is left on it.
+      - RELAY_SWITCH_TOKEN=${RELAY_SWITCH_TOKEN}
       - TLS_ACME_EMAIL=${TLS_ACME_EMAIL}
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL}
       - ALERT_TELEGRAM_CHAT_ID=${ALERT_TELEGRAM_CHAT_ID}

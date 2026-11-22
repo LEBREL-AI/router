@@ -48,6 +48,8 @@
             "max"
           ],
           "timeout_seconds": 90,
+          "long_timeout_seconds": 300,
+          "long_body_bytes": 524288,
           "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy. Its token probabilities (logprobs) are this copy's own and differ from those of DeepSeek's own API."
         },
         {
@@ -123,6 +125,8 @@
           ],
           "unsupported": ["logprobs", "top_logprobs"],
           "timeout_seconds": 90,
+          "long_timeout_seconds": 300,
+          "long_body_bytes": 524288,
           "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
         },
         {
@@ -256,6 +260,8 @@
             "max"
           ],
           "timeout_seconds": 90,
+          "long_timeout_seconds": 300,
+          "long_body_bytes": 524288,
           "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy. This endpoint always reasons: reasoning tokens are billed as output.",
           "reasoning_fixed": true
         },
@@ -307,6 +313,8 @@
             "max"
           ],
           "timeout_seconds": 90,
+          "long_timeout_seconds": 300,
+          "long_body_bytes": 524288,
           "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
         },
         {
@@ -359,6 +367,8 @@
             "max"
           ],
           "timeout_seconds": 90,
+          "long_timeout_seconds": 300,
+          "long_body_bytes": 524288,
           "data_note": "Served from Alibaba Cloud Model Studio's copy of the model (Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
         },
         {
@@ -415,6 +425,8 @@
             "max"
           ],
           "timeout_seconds": 90,
+          "long_timeout_seconds": 300,
+          "long_body_bytes": 524288,
           "data_note": "Served by Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy. Reasoning follows your switch (enable_thinking, as Alibaba documents) and reasoning_effort sets its depth."
         }
       ],
@@ -460,6 +472,8 @@
             "xhigh"
           ],
           "timeout_seconds": 90,
+          "long_timeout_seconds": 300,
+          "long_body_bytes": 524288,
           "data_note": "Served by Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy. Reasoning follows your switch (enable_thinking, as Alibaba documents) and reasoning_effort sets its depth."
         },
         {
@@ -528,6 +542,8 @@
             "xhigh"
           ],
           "timeout_seconds": 90,
+          "long_timeout_seconds": 300,
+          "long_body_bytes": 524288,
           "data_note": "Served by Alibaba Cloud's own Model Studio API (Qwen's lab, Singapore): Alibaba sees the prompt, not you, and keeps its own retention policy."
         },
         {

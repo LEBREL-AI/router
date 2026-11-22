@@ -1293,3 +1293,82 @@ func TestAnUpstreamThatDoesNotAnswerInItsTimeIsSkipped(t *testing.T) {
 		t.Fatalf("the silent upstream held the request %s; its time was 1s", waited)
 	}
 }
+
+// A long request gets the upstream's long time to start answering, an ordinary one its ordinary time:
+// the host that reads a very long context for minutes is waited for, and a host that has stalled does
+// not hold everyone that long.
+func TestALongRequestGivesTheUpstreamItsLongTimeAndAnOrdinaryOneDoesNot(t *testing.T) {
+	var mu sync.Mutex
+	delay := 1500 * time.Millisecond
+	slow := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		wait := delay
+		mu.Unlock()
+		select {
+		case <-time.After(wait):
+			okJSON(`{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15,"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":8}`)(w, r)
+		case <-r.Context().Done():
+		}
+	})
+	up := newFakeUpstream(t, okJSON(`{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15,"prompt_cache_hit_tokens":4,"prompt_cache_miss_tokens":8}`))
+	first := upstream("slow/api", slow.server.URL, 1)
+	first.TimeoutSeconds = 1
+	first.LongTimeoutSeconds = 5
+	first.LongBodyBytes = 4096
+	first.Images = true
+	second := upstream("deepseek/api", up.server.URL, 2)
+	second.Images = true
+	route := routeFor(first, second)
+	route.ImageTokens, route.MaxImages = 1024, 4
+	h := newHarness(t, route, board)
+	short := `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi there"}],"temperature":0}`
+	long := `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"` + strings.Repeat("long context ", 400) + `"}],"temperature":0}`
+	// an image makes the body long and the context no longer: its bytes are not text the host reads before answering
+	picture := `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":[{"type":"text","text":"what is it"},{"type":"image_url","image_url":{"url":"data:image/png;base64,` + strings.Repeat("AAAA", 4096) + `"}}]}],"temperature":0}`
+	for _, c := range []struct{ name, body, served string }{
+		{"an ordinary request leaves the slow host after its ordinary time", short, "deepseek/api"},
+		{"a long request waits for it", long, "slow/api"},
+		{"a short question about a large image leaves it after its ordinary time", picture, "deepseek/api"},
+	} {
+		response := h.post(t, c.body, testKey)
+		raw, _ := io.ReadAll(response.Body)
+		if response.StatusCode != 200 || response.Header.Get(upstreamHeader) != c.served {
+			t.Fatalf("%s: %d served by %q: %s", c.name, response.StatusCode, response.Header.Get(upstreamHeader), raw)
+		}
+	}
+}
+
+func TestTheLongTimeoutIsCheckedWhenTheRoutesAreRead(t *testing.T) {
+	base := upstream("deepseek/api", "https://api.deepseek.com/v1", 1)
+	if got := base.TimeoutFor(10 << 20); got != 90*time.Second {
+		t.Fatalf("no long timeout set: %s", got)
+	}
+	set := base
+	set.LongTimeoutSeconds, set.LongBodyBytes = 300, 524288
+	if got := set.TimeoutFor(524287); got != 90*time.Second {
+		t.Fatalf("below the size: %s", got)
+	}
+	if got := set.TimeoutFor(524288); got != 300*time.Second {
+		t.Fatalf("from the size on: %s", got)
+	}
+	for name, change := range map[string]func(*Upstream){
+		"a long timeout without its size":      func(u *Upstream) { u.LongTimeoutSeconds = 300 },
+		"a size without its long timeout":      func(u *Upstream) { u.LongBodyBytes = 1000 },
+		"a long timeout not above the timeout": func(u *Upstream) { u.LongTimeoutSeconds, u.LongBodyBytes = 90, 1000 },
+		"a long timeout above the shutdown":    func(u *Upstream) { u.LongTimeoutSeconds, u.LongBodyBytes = 601, 1000 },
+		"a negative size":                      func(u *Upstream) { u.LongTimeoutSeconds, u.LongBodyBytes = 300, -1 },
+		"a negative timeout":                   func(u *Upstream) { u.TimeoutSeconds = -1 },
+		"a timeout above the shutdown":         func(u *Upstream) { u.TimeoutSeconds = 601 },
+	} {
+		changed := base
+		change(&changed)
+		route := routeFor(changed)
+		if err := route.validate(); err == nil {
+			t.Fatalf("%s was accepted", name)
+		}
+	}
+	good := routeFor(set)
+	if err := good.validate(); err != nil {
+		t.Fatalf("a valid long timeout refused: %v", err)
+	}
+}

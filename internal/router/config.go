@@ -200,6 +200,13 @@ type Upstream struct {
 	// TimeoutSeconds is how long the upstream has to answer with headers (default 90) before the
 	// next one is tried; the body then streams for as long as the customer waits.
 	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
+	// LongTimeoutSeconds is the time it has instead for a request whose text is at least
+	// LongBodyBytes long (the request's body; with images, what its text was estimated at): a host
+	// reads a very long context for minutes before its first word, and giving every request that long
+	// would leave an ordinary one waiting as long on a host that has stalled. The two are set
+	// together, or neither.
+	LongTimeoutSeconds int `json:"long_timeout_seconds,omitempty"`
+	LongBodyBytes      int `json:"long_body_bytes,omitempty"`
 	// Images marks an endpoint measured to read images: a request carrying one is sent only to such endpoints.
 	Images   bool   `json:"images,omitempty"`
 	DataNote string `json:"data_note,omitempty"`
@@ -253,6 +260,19 @@ func (u Upstream) Timeout() time.Duration {
 		return 90 * time.Second
 	}
 	return time.Duration(u.TimeoutSeconds) * time.Second
+}
+
+// maxUpstreamTimeout is the longest an upstream may be given to start answering: a restart lets the
+// answers in flight finish within the same time (SHUTDOWN_SECONDS).
+const maxUpstreamTimeout = 600 * time.Second
+
+// TimeoutFor is how long the upstream has to answer a request that carries textBytes of text: its
+// long timeout from long_body_bytes on, its ordinary one below.
+func (u Upstream) TimeoutFor(textBytes int) time.Duration {
+	if u.LongTimeoutSeconds > 0 && u.LongBodyBytes > 0 && textBytes >= u.LongBodyBytes {
+		return time.Duration(u.LongTimeoutSeconds) * time.Second
+	}
+	return u.Timeout()
 }
 
 // Route is one public model id and everything the router needs to serve it. Kind "" is a routed
@@ -401,6 +421,18 @@ func (r *Route) validate() error {
 		}
 		if strings.TrimSpace(u.Model) == "" {
 			return fmt.Errorf("upstream %q: model is required", u.Name)
+		}
+		if u.TimeoutSeconds < 0 || u.Timeout() > maxUpstreamTimeout {
+			return fmt.Errorf("upstream %q: timeout_seconds must be from 1 to %d", u.Name, int(maxUpstreamTimeout/time.Second))
+		}
+		if (u.LongTimeoutSeconds != 0) != (u.LongBodyBytes != 0) {
+			return fmt.Errorf("upstream %q: long_timeout_seconds and long_body_bytes are set together, or neither", u.Name)
+		}
+		if u.LongTimeoutSeconds != 0 {
+			long := time.Duration(u.LongTimeoutSeconds) * time.Second
+			if u.LongBodyBytes < 1 || long <= u.Timeout() || long > maxUpstreamTimeout {
+				return fmt.Errorf("upstream %q: long_timeout_seconds must be longer than timeout_seconds, at most %d, and long_body_bytes above zero", u.Name, int(maxUpstreamTimeout/time.Second))
+			}
 		}
 		switch u.UsageFormat {
 		case "", "openai", "deepseek":

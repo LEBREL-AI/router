@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -250,18 +251,140 @@ func TestReceiptsAreFoundOnTheOtherInstances(t *testing.T) {
 	if calls := peerCalls.Load(); calls != 1 {
 		t.Fatalf("an invalid id reached a peer: %d calls", calls)
 	}
-	// a peer that signs with another key is not believed
-	stranger, err := NewSigner(bytes.Repeat([]byte{9}, 32), "stranger")
+	// A peer on another release signs with that release's key, which it publishes at its address: while
+	// a release is rolled out, one instance at a time, its receipts are handed over as it signed them.
+	const otherID = "req_0123456789abcdef0123456789abcdef"
+	other, err := NewSigner(bytes.Repeat([]byte{9}, 32), "other-release")
 	if err != nil {
 		t.Fatal(err)
 	}
-	strangerReceipts := NewReceiptStore(time.Hour, 10)
-	forged, _ := stranger.RouteReceipt(ReceiptInput{RequestID: "req_0123456789abcdef0123456789abcdef", ModelID: h.route.ModelID}, time.Unix(1_900_000_000, 0))
-	strangerReceipts.Put("req_0123456789abcdef0123456789abcdef", forged)
-	strangerServer := serverWith(t, &harness{route: h.route, auth: h.auth, signer: stranger}, h.ledger, runningQueue(t, h.ledger), func(s *Settings) { s.Receipts = strangerReceipts })
-	c := serverWith(t, h, h.ledger, runningQueue(t, h.ledger), func(s *Settings) { s.ReceiptPeers = []string{strangerServer.URL} })
-	if refused, _ := http.Get(c.URL + "/v1/receipts/req_0123456789abcdef0123456789abcdef"); refused.StatusCode != 404 {
-		t.Fatalf("a receipt signed with another key must not be served: %d", refused.StatusCode)
+	otherReceipts := NewReceiptStore(time.Hour, 10)
+	theirs, _ := other.RouteReceipt(ReceiptInput{RequestID: otherID, ModelID: h.route.ModelID}, time.Unix(1_900_000_000, 0))
+	otherReceipts.Put(otherID, theirs)
+	otherServer := serverWith(t, &harness{route: h.route, auth: h.auth, signer: other}, h.ledger, runningQueue(t, h.ledger), func(s *Settings) { s.Receipts = otherReceipts })
+	var keyReads atomic.Int64
+	var keyDown atomic.Bool
+	otherFront := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.well-known/proof-of-edition" {
+			keyReads.Add(1)
+			if keyDown.Load() {
+				w.WriteHeader(503)
+				return
+			}
+		}
+		proxy, _ := http.NewRequest(r.Method, otherServer.URL+r.URL.Path, nil)
+		proxy.Header = r.Header.Clone()
+		response, err := http.DefaultClient.Do(proxy)
+		if err != nil {
+			w.WriteHeader(502)
+			return
+		}
+		defer response.Body.Close()
+		w.WriteHeader(response.StatusCode)
+		_, _ = io.Copy(w, response.Body)
+	}))
+	defer otherFront.Close()
+	c := serverWith(t, h, h.ledger, runningQueue(t, h.ledger), func(s *Settings) { s.ReceiptPeers = []string{otherFront.URL} })
+	handed, err := http.Get(c.URL + "/v1/receipts/" + otherID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var handedOver SignedDocument
+	_ = json.NewDecoder(handed.Body).Decode(&handedOver)
+	handed.Body.Close()
+	if handed.StatusCode != 200 || handedOver.Signature != theirs.Signature || !Verify(handedOver, other.Public) || handedOver.Payload["signing_key_id"] != other.KeyID {
+		t.Fatalf("the receipt of a peer on another release: status %d, signed by %v", handed.StatusCode, handedOver.Payload["signing_key_id"])
+	}
+	// its key is read once and kept: a second receipt of its does not read it again
+	const secondID = "req_1123456789abcdef0123456789abcdef"
+	more, _ := other.RouteReceipt(ReceiptInput{RequestID: secondID, ModelID: h.route.ModelID}, time.Unix(1_900_000_000, 0))
+	otherReceipts.Put(secondID, more)
+	if again, _ := http.Get(c.URL + "/v1/receipts/" + secondID); again.StatusCode != 200 || keyReads.Load() != 1 {
+		t.Fatalf("a second receipt of the same peer: status %d after %d reads of its key", again.StatusCode, keyReads.Load())
+	}
+	// The key a peer published is kept while it cannot be read again: a peer that is slow for a moment
+	// takes no receipt away. And when it is due it is read once, however many ask at that moment.
+	var ahead atomic.Int64
+	f := serverWith(t, h, h.ledger, runningQueue(t, h.ledger), func(s *Settings) {
+		s.ReceiptPeers = []string{otherFront.URL}
+		s.Now = func() time.Time { return time.Now().Add(time.Duration(ahead.Load()) * time.Second) }
+	})
+	theirReceipt := func(n int) string {
+		id := fmt.Sprintf("req_%032x", 0xabc000+n)
+		document, _ := other.RouteReceipt(ReceiptInput{RequestID: id, ModelID: h.route.ModelID}, time.Unix(1_900_000_000, 0))
+		otherReceipts.Put(id, document)
+		return id
+	}
+	served := func(id string) int {
+		response, err := http.Get(f.URL + "/v1/receipts/" + id)
+		if err != nil {
+			return 0
+		}
+		response.Body.Close()
+		return response.StatusCode
+	}
+	keyReads.Store(0)
+	if status := served(theirReceipt(1)); status != 200 || keyReads.Load() != 1 {
+		t.Fatalf("the first receipt of the peer: status %d after %d reads of its key", status, keyReads.Load())
+	}
+	keyDown.Store(true)
+	ahead.Store(11 * 60) // its key is due to be read again, and cannot be
+	if status := served(theirReceipt(2)); status != 200 {
+		t.Fatalf("a receipt of the peer while its key could not be read again: status %d, the key held before was dropped", status)
+	}
+	keyDown.Store(false)
+	ahead.Store(22 * 60)
+	before := keyReads.Load()
+	var all sync.WaitGroup
+	var good atomic.Int64
+	for n := 10; n < 30; n++ {
+		id := theirReceipt(n)
+		all.Add(1)
+		go func() {
+			defer all.Done()
+			if served(id) == 200 {
+				good.Add(1)
+			}
+		}()
+	}
+	all.Wait()
+	if good.Load() != 20 || keyReads.Load()-before != 1 {
+		t.Fatalf("20 receipts of the peer asked at once when its key was due: %d served, %d reads of the key", good.Load(), keyReads.Load()-before)
+	}
+	// A peer that hands over what it did not sign is not believed: a receipt under a key that is not
+	// the one it publishes, a receipt for another request, a published key that is not what its id says.
+	stranger, err := NewSigner(bytes.Repeat([]byte{5}, 32), "stranger")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const forgedID = "req_2123456789abcdef0123456789abcdef"
+	forged, _ := stranger.RouteReceipt(ReceiptInput{RequestID: forgedID, ModelID: h.route.ModelID}, time.Unix(1_900_000_000, 0))
+	misfiled, _ := other.RouteReceipt(ReceiptInput{RequestID: otherID, ModelID: h.route.ModelID}, time.Unix(1_900_000_000, 0))
+	var published atomic.Value
+	published.Store(map[string]any{"public_key": hex.EncodeToString(other.Public), "signing_key_id": other.KeyID})
+	liar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/proof-of-edition":
+			_ = json.NewEncoder(w).Encode(published.Load())
+		case "/v1/receipts/" + forgedID:
+			_ = json.NewEncoder(w).Encode(forged)
+		case "/v1/receipts/req_3123456789abcdef0123456789abcdef":
+			_ = json.NewEncoder(w).Encode(misfiled)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer liar.Close()
+	d := serverWith(t, h, h.ledger, runningQueue(t, h.ledger), func(s *Settings) { s.ReceiptPeers = []string{liar.URL} })
+	for _, id := range []string{forgedID, "req_3123456789abcdef0123456789abcdef"} {
+		if refused, _ := http.Get(d.URL + "/v1/receipts/" + id); refused.StatusCode != 404 {
+			t.Fatalf("%s: a receipt its peer did not sign for that request must not be served: %d", id, refused.StatusCode)
+		}
+	}
+	published.Store(map[string]any{"public_key": hex.EncodeToString(stranger.Public), "signing_key_id": other.KeyID})
+	e := serverWith(t, h, h.ledger, runningQueue(t, h.ledger), func(s *Settings) { s.ReceiptPeers = []string{liar.URL} })
+	if refused, _ := http.Get(e.URL + "/v1/receipts/" + forgedID); refused.StatusCode != 404 {
+		t.Fatalf("a published key that is not what its id says must not be taken: %d", refused.StatusCode)
 	}
 	// two instances that list each other answer a missing receipt once, without a loop
 	y := httptest.NewUnstartedServer(nil)

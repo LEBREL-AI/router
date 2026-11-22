@@ -219,7 +219,8 @@ receipt from any instance verifies against the one manifest; the manifest identi
 in it), the routes file and `BOARD_URL` (the same manifests and billing contract hashes). What must
 differ: `INSTANCE_ID` (in every receipt) and the settlement directory (the queue refuses one another
 router holds). A receipt asked of the wrong instance is fetched from `RECEIPT_PEERS` and served only
-if it carries this router's signature. The per-key and per-account limits the router keeps in memory
+if it carries this router's signature, or that of the key the peer it came from publishes (an
+instance of another release, while one is rolled out). The per-key and per-account limits the router keeps in memory
 are per instance; the platform's account ceiling stays global.
 
 ## What to watch

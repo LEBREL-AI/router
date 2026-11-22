@@ -123,6 +123,45 @@ name is misdirected (421). Inside a dstack VM the name's DNS points at the provi
 which passes the TLS connection through by SNI; the cache lives on the machine's state volume.
 Browsers get CORS on the completion path, with the headers they ask for.
 
+Two instances may stand behind one name, a primary and its backup, a relay in front choosing by
+their health (`deploy/dstack/relay-config.py` writes the relay's compose). In a pair
+(`TLS_ACME_PAIRED=true`) each instance obtains and renews its own certificate, under its own ACME
+account, and no private key of the name leaves the machine that made it. Let's Encrypt's
+validation connection, which the relay hands to either of them, finds the challenge of the one
+that asked: an instance asked for a challenge it does not hold looks it up at its peer
+(`TLS_ACME_PEER`, the base URL of the other's plaintext listener; `/.well-known/lebrel-acme-challenge`,
+authenticated with `TLS_ACME_PEER_SECRET`, the same on both). A challenge certificate is no secret of
+the name: the instance shows it to whoever connects during a validation, and presenting it only
+lets the peer's own order be validated. A client is served the certificate the instance holds and
+never starts an order; the instance asks Let's Encrypt itself, at most every 20 minutes and only
+once it has seen that a validation of the name would find it (it calls the name as Let's Encrypt
+would, with a challenge of its own making), and goes on trying that every hour while it holds its
+certificate, so a renewal that could not be validated is told weeks before the certificate ends.
+
+The relay asks each instance `GET /healthz/relay` on its plaintext listener: 200, it may be sent
+customers; 503, it serves but asks to be left (the operator stepped it aside, or its certificate is
+about to end), and is sent customers only when no instance answers 200; 410, it is stopping; 409,
+it holds no certificate for the name. The operator's switch is `/healthz/relay/drain`
+(`RELAY_SWITCH_TOKEN`): `POST {"drain": true}` steps the instance aside (refused while the other
+one takes no customers, unless forced), its answers close their connections so that customers who
+keep one open come back through the relay, and `GET` tells what is left on it (answers in flight,
+connections open), its release, its certificates, its ACME account and why its peer could not be
+asked the last time it could not. The switch is kept on the state volume (`RELAY_STATE_FILE`) with
+the release it was opened under (the measured compose), and an instance that does not find its own
+release there starts stepped aside: a new machine, or one back from an update however it was
+updated, takes customers once it was tried and opened (`POST {"drain": false}`); one that was open
+and restarts by itself, on the same release, comes back open. `{"recycle": true}` only makes the
+answers close their connections, which empties a relay before it is touched, and ends by itself
+after fifteen minutes. A stop is told to the relay first: the instance answers the check 410 for
+`DRAIN_SECONDS` while it goes on serving, then closes its listeners and lets the answers in flight
+finish.
+
+While a release is rolled out, one instance at a time, the two sign receipts with different keys
+(each release derives its own). An instance asked for a receipt it does not hold fetches it from
+its peer (`RECEIPT_PEERS`) and hands it over as the peer signed it, with this router's key or with
+the key that peer publishes beside its manifests; it vouches for neither, and whoever reads a
+receipt checks it against the keys they pin.
+
 ## Production: Alibaba Model Studio first, the labs behind
 
 Since 6 November 2026 the routes Model Studio serves (the two DeepSeek, GLM-5.3, Kimi K3, Kimi K3.1 Pro
@@ -133,7 +172,10 @@ behind as fallback: OpenRouter pinned to the lab for DeepSeek and Qwen (`dialect
 `provider.order` = the lab, `allow_fallbacks: false`), then DeepSeek's own API; Z.ai's and
 Moonshot AI's own APIs for GLM-5.3 and the two Kimi. A fallback is taken on a transport error, a 5xx,
 or a refusal of Lebrel's credential or credit (401, 402 and 403 fail over like a 503); each
-upstream has `timeout_seconds` (default 90) to answer with headers. The receipt names the upstream
+upstream has `timeout_seconds` (default 90) to answer with headers, and `long_timeout_seconds`
+instead for a request whose body reaches `long_body_bytes` (a very long context takes its host
+minutes to start answering: Model Studio is given 300 seconds from 512 KiB on, and an ordinary
+request still leaves a stalled host after 90). The receipt names the upstream
 that served. The Alibaba dialect maps every lab's reasoning switch (`thinking: {"type"}`,
 `reasoning: {"enabled"}`, `enable_thinking`) onto `enable_thinking`, forwards `reasoning_effort`
 (or OpenRouter's `reasoning.effort`) within the endpoint's `reasoning_efforts` list (Model Studio
@@ -201,9 +243,10 @@ replayed after a restart; and done when the control plane holds them, delivered 
 the same way. Anything else it refuses, and anything that could never be sent, goes to `dead/` and
 raises an alert. A reservation's acceptance is delivered before its settlement. One router per
 directory: the queue locks it. A restart (SIGTERM) takes no new request and lets the answers in
-flight finish for up to `SHUTDOWN_SECONDS` (600); any still running after that (or at a second
-SIGTERM) is cut and settled for what it relayed, never left for the reconciler's maximum, and
-reported. The backlog, its alerts, restarts and the way to add capacity are in
+flight finish for up to `SHUTDOWN_SECONDS` (600); any still running after that (or at another
+SIGTERM during that time) is cut and settled for what it relayed, never left for the reconciler's
+maximum, and reported. Behind a relay the listeners stay open for `DRAIN_SECONDS` first, the relay's
+check answering 410, so no new customer finds a closed door (a SIGTERM during that wait only ends it). The backlog, its alerts, restarts and the way to add capacity are in
 [docs/scaling.md](docs/scaling.md).
 
 ## Control plane

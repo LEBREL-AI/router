@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -26,6 +28,7 @@ import (
 
 	"crypto/ed25519"
 
+	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 
 	"lebrel-router/internal/alert"
@@ -98,6 +101,9 @@ func run(logger *log.Logger) error {
 	// compose signs with the same key, and nothing outside can obtain it. An explicit
 	// RECEIPT_SIGNING_SEED still wins (the non-attested deployment).
 	var attester dstack.Attester
+	// What this instance runs, for the relay's switch (relayhealth.go): the measured compose inside
+	// an attested VM, whatever RELAY_RELEASE names elsewhere.
+	release := strings.TrimSpace(env("RELAY_RELEASE", ""))
 	keySource := "env"
 	encryptInside := false
 	seedText := env("RECEIPT_SIGNING_SEED", "")
@@ -134,6 +140,7 @@ func run(logger *log.Logger) error {
 			seed = derived[:32]
 			keySource = "vm-kms"
 			logger.Printf("receipt signing seed derived inside the attested VM for compose %s", info.ComposeHash)
+			release = "compose " + info.ComposeHash
 			// The HPKE key clients encrypt to is born at random in this VM's memory, per boot and per
 			// UTC day, never derived from the key service: that service derives per app, so a key it
 			// handed out could be derived again by any compose registered under the app.
@@ -314,15 +321,78 @@ func run(logger *log.Logger) error {
 	if tlsConfig == nil && strings.TrimSpace(env("LISTEN_TLS_ADDR", "")) != "" {
 		return errors.New("LISTEN_TLS_ADDR is set but no TLS source is configured (TLS_CERT_FILE and TLS_KEY_FILE, or TLS_ACME_HOSTS)")
 	}
+	// Two routers behind one name (tlspair.go): each obtains and renews its own certificate, and looks
+	// up at its peer (TLS_ACME_PEER, with the pair's TLS_ACME_PEER_SECRET) the challenge of an order
+	// that is not its own; a client is served the certificate the instance holds and never starts an
+	// order; until it holds one for every name its customers call, it tells the relay it takes
+	// nobody. TLS_ACME_PAIRED says the deployment is a pair even where the peer's address is missing,
+	// so an instance that lost it says so instead of quietly working alone. Neither set, a router
+	// obtains its certificate at a client's first handshake, as it always did.
+	var pair *tlsPair
+	peerURL := strings.TrimSpace(env("TLS_ACME_PEER", ""))
+	if peerURL != "" || strings.EqualFold(strings.TrimSpace(env("TLS_ACME_PAIRED", "")), "true") {
+		if strings.TrimSpace(env("TLS_CERT_FILE", "")) != "" {
+			return errors.New("a pair obtains Let's Encrypt certificates (TLS_ACME_HOSTS): it excludes TLS_CERT_FILE")
+		}
+		// A rehearsal's own certificate authority (a test ACME server): never in production, where
+		// the certificates are Let's Encrypt's.
+		var authority *acme.Client
+		if directory := strings.TrimSpace(env("TLS_ACME_DIRECTORY", "")); directory != "" {
+			if production {
+				return errors.New("TLS_ACME_DIRECTORY is for rehearsals: in production the certificates are Let's Encrypt's")
+			}
+			if authority, err = rehearsalAuthority(directory, strings.TrimSpace(env("TLS_ACME_DIRECTORY_CA", ""))); err != nil {
+				return err
+			}
+			logger.Printf("tls pair: REHEARSAL, certificates from %s, not from Let's Encrypt", directory)
+		}
+		hosts := listed(env("TLS_ACME_HOSTS", ""), strings.ToLower)
+		pair, err = newTLSPair(hosts, servedNames(hosts, directHosts), strings.TrimSpace(env("TLS_ACME_CACHE", "")), strings.TrimSpace(env("TLS_ACME_EMAIL", "")),
+			peerURL, env("TLS_ACME_PEER_SECRET", ""), authority, logger, notifier.Notify)
+		if err != nil {
+			return err
+		}
+		tlsConfig, tlsSource = pair.TLSConfig(), "Let's Encrypt in-process, one of a pair, for "+strings.Join(hosts, ", ")
+		pair.Start(ctx)
+	}
+	// What the relay in front asks before it sends a customer here, and the operator's switch
+	// (relayhealth.go), on the plaintext listener. DRAIN_SECONDS is how long the relay is given to
+	// notice a stop before the listeners close (0: they close at once, as before); RELAY_STATE_FILE
+	// keeps the switch across restarts, and an instance that has none starts stepped aside.
+	drainSeconds, err := strconv.Atoi(env("DRAIN_SECONDS", "0"))
+	if err != nil || drainSeconds < 0 || drainSeconds > 60 {
+		return errors.New("DRAIN_SECONDS must be a whole number of seconds from 0 to 60")
+	}
+	var certificateReady func() bool
+	if pair != nil {
+		certificateReady = pair.Ready
+	}
+	health, err := newRelayHealth(certificateReady, env("RELAY_SWITCH_TOKEN", ""), env("RELAY_STATE_FILE", ""), release, server.InFlight, logger)
+	if err != nil {
+		return fmt.Errorf("RELAY_STATE_FILE: %w", err)
+	}
+	if pair != nil {
+		health.serves = pair.Serving
+		health.detail = pair.Detail
+		if pair.peer != nil {
+			health.peerTakes = pair.peer.takes
+		}
+	}
 	// Where TLS ends in this process, a direct client is served over that listener only: a plaintext
 	// call under the published name (through a gateway that ended TLS elsewhere) is misdirected.
 	server.DirectOnlyTLS(tlsConfig != nil)
 	var servers []*http.Server
 	if addr := env("LISTEN_ADDR", ":8090"); !strings.EqualFold(strings.TrimSpace(addr), "off") {
-		servers = append(servers, &http.Server{Addr: addr, Handler: server, ErrorLog: logger, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second})
+		var plain http.Handler = server
+		if pair != nil {
+			plain = pair.Handler(plain)
+		}
+		servers = append(servers, &http.Server{Addr: addr, Handler: health.Handler(plain), ErrorLog: logger, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second})
 	}
 	if tlsConfig != nil {
-		servers = append(servers, &http.Server{Addr: env("LISTEN_TLS_ADDR", ":8443"), Handler: server, TLSConfig: tlsConfig, ErrorLog: logger, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second})
+		// While the instance steps aside its answers close their connections, and the connections
+		// open are counted: the operator knows when nobody is left on it.
+		servers = append(servers, &http.Server{Addr: env("LISTEN_TLS_ADDR", ":8443"), Handler: health.Closing(server), ConnState: health.ConnState, TLSConfig: tlsConfig, ErrorLog: logger, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second})
 	}
 	if len(servers) == 0 {
 		return errors.New("nothing to listen on: LISTEN_ADDR is off and no TLS source is configured")
@@ -345,11 +415,15 @@ func run(logger *log.Logger) error {
 		return err
 	case <-ctx.Done():
 	}
-	// No new request from here; the answers in flight have the budget to finish. A second stop
-	// signal cuts them at once instead of leaving SIGKILL to strand their holds.
 	again := make(chan os.Signal, 1)
 	signal.Notify(again, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(again)
+	// First the relay in front is told: this instance answers its check 503 and goes on serving for
+	// DRAIN_SECONDS, so the relay sends its new customers elsewhere before the listeners close and
+	// none of them finds a closed door. An instance the operator had already drained does not wait.
+	tellRelay(health, time.Duration(drainSeconds)*time.Second, again, logger)
+	// No new request from here; the answers in flight have the budget to finish. A second stop
+	// signal cuts them at once instead of leaving SIGKILL to strand their holds.
 	budget := time.Duration(shutdownSeconds) * time.Second
 	logger.Printf("stopping: no new requests; %d answers in flight have up to %s to finish (a second stop signal cuts them now)", server.InFlight(), budget)
 	stopping := time.Now()
@@ -452,6 +526,25 @@ func prefixes(spec string) ([]netip.Prefix, error) {
 	return result, nil
 }
 
+// tellRelay makes the instance answer the relay's check "stopping" and waits, still serving, for the
+// relay to notice: wait is longer than the relay takes to drop a server from its lists. The whole
+// wait, also for an instance that had stepped aside: when no router is open the relay still sends
+// customers to one that only stepped aside, and it must have left that list too before the
+// listeners close. A second stop signal ends the wait (it cuts nothing: the answers in flight still
+// have their time once the listeners close).
+func tellRelay(health *relayHealth, wait time.Duration, again <-chan os.Signal, logger *log.Logger) {
+	health.Stop()
+	if wait <= 0 {
+		return
+	}
+	logger.Printf("stopping: the relay is told for %s before the listeners close (a second stop signal skips the wait)", wait.Round(time.Second))
+	select {
+	case <-time.After(wait):
+	case <-again:
+		logger.Printf("stopping: a second stop signal, the listeners close now")
+	}
+}
+
 // shutdownAll stops every listener at once and waits for their answers in flight, until ctx ends;
 // the first error (ctx's, when the wait ran out) is returned.
 func shutdownAll(ctx context.Context, servers []*http.Server) error {
@@ -520,6 +613,28 @@ func acmeTLS(hosts []string, cacheDir, email string) (*tls.Config, error) {
 	config := manager.TLSConfig()
 	config.MinVersion = tls.VersionTLS12
 	return config, nil
+}
+
+// rehearsalAuthority is a test ACME server's client: its directory, and the file of the
+// certificate authority its own HTTPS is signed by (none: the system's).
+func rehearsalAuthority(directory, caFile string) (*acme.Client, error) {
+	parsed, err := url.Parse(directory)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return nil, errors.New("TLS_ACME_DIRECTORY must be an https URL")
+	}
+	transport := &http.Transport{Proxy: nil, TLSHandshakeTimeout: 10 * time.Second}
+	if caFile != "" {
+		data, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("TLS_ACME_DIRECTORY_CA: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(data) {
+			return nil, errors.New("TLS_ACME_DIRECTORY_CA holds no certificate")
+		}
+		transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	}
+	return &acme.Client{DirectoryURL: directory, HTTPClient: &http.Client{Transport: transport, Timeout: 60 * time.Second}}, nil
 }
 
 // certificates serves TLS_CERT_FILE/TLS_KEY_FILE and reads them again when the certificate file

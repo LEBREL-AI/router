@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -35,18 +36,21 @@ import (
 )
 
 const (
-	completionPath          = "/v1/chat/completions"
-	settlementHealthPath    = "/healthz/settlements"
-	defaultMaxRequestBytes  = 32 << 20
-	maxUpstreamBodyBytes    = 64 << 20
-	maxErrorBodyBytes       = 1 << 20
-	maxReceiptBytes         = 1 << 20
-	streamBufferBytes       = 32 << 10
-	defaultManifestWindow   = time.Hour
-	defaultAcceptTimeout    = 3 * time.Second
-	defaultAlertAge         = 5 * time.Second
-	defaultAbandonAfter     = 10 * time.Second
-	peerReceiptTimeout      = 2 * time.Second
+	completionPath         = "/v1/chat/completions"
+	settlementHealthPath   = "/healthz/settlements"
+	defaultMaxRequestBytes = 32 << 20
+	maxUpstreamBodyBytes   = 64 << 20
+	maxErrorBodyBytes      = 1 << 20
+	maxReceiptBytes        = 1 << 20
+	streamBufferBytes      = 32 << 10
+	defaultManifestWindow  = time.Hour
+	defaultAcceptTimeout   = 3 * time.Second
+	defaultAlertAge        = 5 * time.Second
+	defaultAbandonAfter    = 10 * time.Second
+	peerReceiptTimeout     = 2 * time.Second
+	// a peer's published key is taken as read for this long, and read again at most this often
+	peerKeyFor              = 10 * time.Minute
+	peerKeyAgain            = 5 * time.Second
 	userAgent               = "lebrel-router/0.1"
 	receiptHeader           = "Proof-Of-Edition-Receipt"
 	verificationHeader      = "X-Lebrel-Verification"
@@ -148,6 +152,14 @@ type Settings struct {
 	Encryption *Encryption
 }
 
+// peerKeyRead is a peer's published receipt key and when it was last asked for; no key: it has
+// never been read. mu makes it one read at a time.
+type peerKeyRead struct {
+	mu   sync.Mutex
+	key  ed25519.PublicKey
+	read time.Time
+}
+
 type Server struct {
 	settings  Settings
 	routes    map[string]*Route
@@ -171,6 +183,9 @@ type Server struct {
 	alerts  map[string]alertState
 	// editions holds each edition route's verified encryption key (edition.go)
 	editions editionKeys
+	// peerKeys holds the receipt key each peer publishes, as last read (signedByPeer)
+	peerMu   sync.Mutex
+	peerKeys map[string]*peerKeyRead
 	// pauses holds what each upstream of each route said about its limit (patience.go); the map is
 	// built once and only read afterwards
 	pauses map[string]*pause
@@ -703,7 +718,7 @@ func (s *Server) handleReceipt(w http.ResponseWriter, r *http.Request, id string
 
 // receiptFromPeers asks the other instances for a receipt this one does not hold: behind a load
 // balancer the request may have been answered by any of them. Only a receipt for this request id
-// signed with this router's key is served (every instance signs with the same key).
+// that carries the signature of the instance it came from is served (signedByPeer).
 func (s *Server) receiptFromPeers(ctx context.Context, id string) (SignedDocument, bool) {
 	if len(s.settings.ReceiptPeers) == 0 || !validRequestID(id) {
 		return SignedDocument{}, false
@@ -734,8 +749,8 @@ func (s *Server) receiptFromPeers(ctx context.Context, id string) (SignedDocumen
 			if err := json.NewDecoder(io.LimitReader(response.Body, maxReceiptBytes)).Decode(&document); err != nil {
 				return
 			}
-			if document.Payload["request_id"] != id || !Verify(document, s.settings.Signer.Public) {
-				s.settings.Logger.Printf("receipt %s from peer %s refused: not this router's signature for this request", id, peer)
+			if document.Payload["request_id"] != id || !s.signedByPeer(peer, document) {
+				s.settings.Logger.Printf("receipt %s from peer %s refused: not this request's receipt under this router's key or the key that peer publishes", id, peer)
 				return
 			}
 			found <- document
@@ -750,6 +765,79 @@ func (s *Server) receiptFromPeers(ctx context.Context, id string) (SignedDocumen
 		return document, true
 	}
 	return SignedDocument{}, false
+}
+
+// signedByPeer says whether a receipt carries the signature of the instance it was fetched from.
+// The instances of one release sign with the same key, this router's. While a release is rolled
+// out, one instance at a time, the other signs with its own release's key (the measured compose
+// is in the key's derivation), which it publishes at its address beside its manifests. This
+// router vouches for neither: it hands over what the instance it was told to ask signed, and
+// whoever reads a receipt checks it against the keys they pin.
+func (s *Server) signedByPeer(peer string, document SignedDocument) bool {
+	if Verify(document, s.settings.Signer.Public) {
+		return true
+	}
+	named, _ := document.Payload["signing_key_id"].(string)
+	if named == "" || named == s.settings.Signer.KeyID {
+		return false
+	}
+	// the key read before, then once more from the peer: it may have been updated since
+	for _, fresh := range []bool{false, true} {
+		key, ok := s.peerKey(peer, fresh)
+		if ok && SHA256Hex(key) == named && Verify(document, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// peerKey is the receipt key a peer publishes (/.well-known/proof-of-edition), kept for a while;
+// fresh reads it again, though not more than every few seconds. One read at a time for a peer,
+// with its own time (whoever asked for the receipt may have left), and a read that fails takes
+// nothing away: the key held before is still the peer's until it publishes another.
+func (s *Server) peerKey(peer string, fresh bool) (ed25519.PublicKey, bool) {
+	s.peerMu.Lock()
+	if s.peerKeys == nil {
+		s.peerKeys = map[string]*peerKeyRead{}
+	}
+	known := s.peerKeys[peer]
+	if known == nil {
+		known = &peerKeyRead{}
+		s.peerKeys[peer] = known
+	}
+	s.peerMu.Unlock()
+
+	known.mu.Lock()
+	defer known.mu.Unlock()
+	age := s.settings.Now().Sub(known.read)
+	if !known.read.IsZero() && ((!fresh && age < peerKeyFor) || age < peerKeyAgain) {
+		return known.key, known.key != nil
+	}
+	known.read = s.settings.Now()
+	reading, cancel := context.WithTimeout(context.Background(), peerReceiptTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(reading, http.MethodGet, strings.TrimRight(peer, "/")+"/.well-known/proof-of-edition", nil)
+	if err != nil {
+		return known.key, known.key != nil
+	}
+	request.Header.Set(receiptPeerHeader, "1")
+	request.Header.Set("User-Agent", userAgent)
+	response, err := s.settings.PeerClient.Do(request)
+	if err != nil {
+		return known.key, known.key != nil
+	}
+	defer response.Body.Close()
+	var published struct {
+		PublicKey    string `json:"public_key"`
+		SigningKeyID string `json:"signing_key_id"`
+	}
+	if response.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(response.Body, maxReceiptBytes)).Decode(&published) != nil {
+		return known.key, known.key != nil
+	}
+	if key, err := hex.DecodeString(published.PublicKey); err == nil && len(key) == ed25519.PublicKeySize && SHA256Hex(key) == published.SigningKeyID {
+		known.key = key
+	}
+	return known.key, known.key != nil
 }
 
 // validRequestID is the shape newRequestID gives: "req_" and 32 lowercase hex digits.
@@ -965,7 +1053,15 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 	defer settle(0, model.Usage{}, model.SettlementUpstreamRejected)
 
 	waitingSince := time.Now()
-	result, lastErr := s.callUpstreams(ctx, route, normalized, requestID, r.Header.Get("Accept"), info.Images > 0)
+	// How much text the request carries, for an upstream's long timeout: an image's bytes are no
+	// context for the host to read, so with images it is what the text was estimated at.
+	textBytes := len(normalized)
+	if info.Images > 0 {
+		if text := (promptEstimate - info.Images*route.ImageTokens) * 4; text < int64(textBytes) {
+			textBytes = int(max(text, 0))
+		}
+	}
+	result, lastErr := s.callUpstreams(ctx, route, normalized, requestID, r.Header.Get("Accept"), info.Images > 0, textBytes)
 	if result == nil {
 		settle(0, model.Usage{}, model.SettlementUpstreamRejected)
 		if cutCaused(ctx, lastErr) {
@@ -1232,7 +1328,7 @@ func mayCarry(normalized []byte, fields []string) bool {
 // what they said may pass in a moment (a rate limit, an overload, a broken connection), the route is
 // asked again after a wait, for as long as the request's patience lasts: a provider's "not now" costs
 // the customer a moment, not the answer.
-func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []byte, requestID, accept string, images bool) (*upstreamResult, error) {
+func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []byte, requestID, accept string, images bool, textBytes int) (*upstreamResult, error) {
 	// What the request asks for, read once and only when it may carry a field some upstream of the route
 	// refuses: the normalized body is compact JSON and a quote inside a JSON string is always escaped, so
 	// `"name":` can only be a key, and every other request is spared the parsing.
@@ -1250,7 +1346,7 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 	bodies := make([][]byte, len(route.Upstreams))
 	room, waited := s.waiting[route.ModelID], false
 	for round := 1; ; round++ {
-		result, failed, wait, again, err := s.askUpstreams(ctx, route, fields, normalized, bodies, requestID, accept, round, began, images)
+		result, failed, wait, again, err := s.askUpstreams(ctx, route, fields, normalized, bodies, requestID, accept, round, began, images, textBytes)
 		if err != nil || result != nil {
 			return result, err
 		}
@@ -1293,7 +1389,7 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 // askUpstreams is one round over the route's upstreams. It returns the answer (or the refusal that is
 // relayed to the customer), or else what each upstream said, with whether the route may be asked
 // again and after how long.
-func (s *Server) askUpstreams(ctx context.Context, route *Route, fields map[string]json.RawMessage, normalized []byte, bodies [][]byte, requestID, accept string, round int, began time.Time, images bool) (*upstreamResult, *attemptsError, time.Duration, bool, error) {
+func (s *Server) askUpstreams(ctx context.Context, route *Route, fields map[string]json.RawMessage, normalized []byte, bodies [][]byte, requestID, accept string, round int, began time.Time, images bool, textBytes int) (*upstreamResult, *attemptsError, time.Duration, bool, error) {
 	patience := s.settings.Patience
 	failed := &attemptsError{rounds: round}
 	var end roundEnd
@@ -1343,7 +1439,8 @@ func (s *Server) askUpstreams(ctx context.Context, route *Route, fields map[stri
 		callCtx, endCall := context.WithCancelCause(ctx)
 		var callMu sync.Mutex
 		answered := false
-		silence := time.AfterFunc(upstream.Timeout(), func() {
+		allowed := upstream.TimeoutFor(textBytes)
+		silence := time.AfterFunc(allowed, func() {
 			callMu.Lock()
 			defer callMu.Unlock()
 			if !answered {
@@ -1388,7 +1485,7 @@ func (s *Server) askUpstreams(ctx context.Context, route *Route, fields map[stri
 			reason := "transport error"
 			if errors.Is(err, errUpstreamSilent) || errors.Is(context.Cause(callCtx), errUpstreamSilent) {
 				// it had its whole time and said nothing: this request does not ask it again
-				reason = fmt.Sprintf("no answer within %s", upstream.Timeout())
+				reason = fmt.Sprintf("no answer within %s", allowed)
 			} else {
 				// a connection that broke may hold the next time
 				end.note(patience.wait(round), false)
