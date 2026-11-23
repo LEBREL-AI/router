@@ -5,7 +5,8 @@ check that the running machine is this code:
 
 | Version | Git tag | Image digest | dstack compose hash | Receipt key id | Since |
 |---|---|---|---|---|---|
-| 1.4.0 (attested endpoint, instance A2, app `40b35a05…`, Phala KMS 2026-11) | `v1.4.0` | `sha256:10a8ea4537ecc531a3121a1e58bf0efb510d7eebb13e6577b816e968581cf25b` (linux/amd64, Go 1.26, BuildKit v0.27.1, OCI media types; two builds identical; `deploy/dstack/docker-compose.attested.yml`, reached through the relay described below; images and documents for Claude Code and Codex, image inputs on the models that read them, the edition's own output limit) | `a3adaa9e2bb1c45bb3f4eea3a6fa1945265b50646552833db5fbc3ab30a5d69d` | receipt key id `5d10b710887827859376d1c36a07964e466ae1835c39cc3bad9f2d8aa5bcb448`, public key `abdf46003beee2f595f44371c5659c83799f5c8543af609b232c38450586bd8c` | 16 Nov 2026 20:17 UTC |
+| 1.4.1 (attested endpoint, instances B2 and A2, app `40b35a05…`, Phala KMS 2026-11) | `v1.4.1` | `sha256:9eff8ce89042e4287c908cc27e213b6ef3a325423e880b3da19c72081e94c91e` (linux/amd64, Go 1.26, BuildKit v0.27.1, OCI media types; two builds identical; `deploy/dstack/docker-compose.attested.yml`, reached through the relay described below; two instances behind the name, one that serves and one that stands by, each with its own certificate; Alibaba Cloud Model Studio is given five minutes to start answering a request of 512 KiB or more) | `e394ed2dfdf2337e960c2c34e87028950084140335d8ca5794dc638ce7097612` (both instances) | receipt key id `9246adfb6e899800d38c87aa3ed46f6af0a5cbe40157d48eb837e35829faf0d3`, public key `6d14b06daa514d8ab7e4800fa341a7af41a584cb7a0cc088e5935f051b79491a` (the same on both instances: one app, one compose) | 23 Nov 2026 02:23 UTC (instance B2; instance A2 from 02:44 UTC) |
+| 1.4.0 (attested endpoint, instance A2, app `40b35a05…`, Phala KMS 2026-11) | `v1.4.0` | `sha256:10a8ea4537ecc531a3121a1e58bf0efb510d7eebb13e6577b816e968581cf25b` (linux/amd64, Go 1.26, BuildKit v0.27.1, OCI media types; two builds identical; `deploy/dstack/docker-compose.attested.yml`, reached through the relay described below; images and documents for Claude Code and Codex, image inputs on the models that read them, the edition's own output limit) | `a3adaa9e2bb1c45bb3f4eea3a6fa1945265b50646552833db5fbc3ab30a5d69d` | receipt key id `5d10b710887827859376d1c36a07964e466ae1835c39cc3bad9f2d8aa5bcb448`, public key `abdf46003beee2f595f44371c5659c83799f5c8543af609b232c38450586bd8c` | 16 Nov 2026 20:17 UTC to 23 Nov 2026 02:43 UTC |
 | 1.3.9 (attested endpoint, instance A2, app `40b35a05…`, Phala KMS 2026-11) | `v1.3.9` | `sha256:bd9994440edf81ec303008d0c33137e2ba64da0d59fcefcfafcc2c6209d9818b` (linux/amd64, Go 1.26, BuildKit v0.27.1, OCI media types; two builds identical; `deploy/dstack/docker-compose.attested.yml`, reached through the relay described below; Qwen4 Max, and a route whose providers all refuse for the moment is asked again before the customer is told) | `4830ccd86b255d53227ddfa49ea94875e46c711d355ca80564809a25936952df` | receipt key id `ccaf046e6110390973a8570d80a5d551ce47425bb1c33dbf087bed2f285be532`, public key `2b4121e3f702dfac3f842c6fd2a24341af48ed44ec8a37458ac90c0c94fa6e7d` | 16 Nov 2026 03:23 UTC |
 | 1.3.8 (attested endpoint, instance A2, app `40b35a05…`, Phala KMS 2026-11) | `v1.3.8` | `sha256:de1cfaa9fe6218af1748bf5de38289b245f92099aba096e574c1f71cd7a40540` (linux/amd64, Go 1.26, BuildKit v0.27.1, OCI media types; two builds identical; `deploy/dstack/docker-compose.attested.yml`, reached through the relay described below) | `b7a8b290d061e36d6f92ee461acf094d87bafdcc90e65abd6e3f4d5d72012ded` | receipt key id `f97cc982d215a317660f9fd3eeb0b51a9ff3dbef2f76ccc5ceb8303b4623bbfa`, public key `135db754b2792320df1e73d2f4b742bf079f3cb4ecff0b2f48474832653e7763` | 11 Nov 2026 02:09 UTC |
 | 1.3.7 (attested endpoint, instance A2, app `40b35a05…`, Phala KMS 2026-11) | `v1.3.7` | `sha256:ad3f533f0b7fd67b8df9cbf407a9cfb54c90f10c67fa8bd9a01c458bec52bd35` (`deploy/dstack/docker-compose.attested.yml`: TLS ends in the router, Let's Encrypt in-process, attested.lebrel.ai; reached through the relay described below) | `2bcd6faeb21e6c6edb805f923107bca8f3a210a04049361ecce355d2f9316465` | receipt key id `ecfe903e9da3fcee15ee0758ce5d716ce77617d2c0d5840c1330e518d372297c`, public key `59a65997e76163c6e97bed374cbfde543958899e1623c24c7e4ff1166b994342` | 10 Nov 2026 21:19 UTC to 11 Nov 2026 02:08 UTC |
@@ -42,8 +43,8 @@ derives.
 How anyone checks a running router: `scripts/verify-attestation.py <router> --compose-hash <row>
 --app-id <the row's app> --key-id <row> --reference deploy/dstack/reference-measurements/<the app's file>
 --compose-file deploy/dstack/<the row's compose>`. The machine that serves today (first row):
-`scripts/verify-attestation.py https://attested.lebrel.ai --compose-hash a3adaa9e2bb1c45bb3f4eea3a6fa1945265b50646552833db5fbc3ab30a5d69d
---app-id 40b35a054d2eff752b1b5c3e4dee7253ab941f68 --key-id 5d10b710887827859376d1c36a07964e466ae1835c39cc3bad9f2d8aa5bcb448
+`scripts/verify-attestation.py https://attested.lebrel.ai --compose-hash e394ed2dfdf2337e960c2c34e87028950084140335d8ca5794dc638ce7097612
+--app-id 40b35a054d2eff752b1b5c3e4dee7253ab941f68 --key-id 9246adfb6e899800d38c87aa3ed46f6af0a5cbe40157d48eb837e35829faf0d3
 --reference deploy/dstack/reference-measurements/dstack-0.6.1-phala-kms-2026-11.json --compose-file deploy/dstack/docker-compose.attested.yml`.
 The rows below it belong to the earlier app (`4d72eae647c67ad42c972d24175d7c32ce9c871a`, reference file `dstack-0.6.1.json`), which no longer runs the router.
 It asks the machine for a quote with a fresh nonce, verifies Intel's chain (dcap-qvl), recomputes
@@ -105,15 +106,28 @@ signed after 10 Nov 2026 21:17 UTC.
 The gateway of the new KMS's zone does not connect custom names to its apps yet, so the name is still
 connected to the earlier app, whose two instances now run only a relay
 (`deploy/dstack/docker-compose.relay.yml`, the official haproxy image pinned by digest, its whole
-configuration in that file; manifest hashes `fe259a1cea4cc683125bbfc7d56e3194385a5cb2eb4bb2dc526912a5d4ec6955`
-on prod9, the one in the name's path, and `c2f3e534ce5ef037874a939b147960bf7587e47ea1e02641b422ccc51ad28775` on
-prod5). The relay passes each connection, unread, inside its own verified TLS to the new app's gateway
+configuration in that file; manifest hashes until 23 Nov 2026 `fe259a1cea4cc683125bbfc7d56e3194385a5cb2eb4bb2dc526912a5d4ec6955`
+on prod9, then the one in the name's path, and `c2f3e534ce5ef037874a939b147960bf7587e47ea1e02641b422ccc51ad28775` on
+prod5; the ones since are in the paragraph on the two instances below). The relay passes each connection, unread, inside its own verified TLS to the new app's gateway
 hostname, which hands it to the router's TLS listener: the client's TLS session ends in the router of the new
 app, and neither gateway nor the relay holds a key of it. What the relay does not change is who decides which
 machine receives the name's connections: the earlier zone's gateway, which knows the earlier app by
 certificates of the earlier KMS. Until the name is connected to the new app directly, the issuance of its
 certificate is to be pinned in DNS to the router's own ACME account (a CAA record), which a later row
 records. The Python client verifies this machine from 0.5.3.
+
+**Two instances, 23 Nov 2026.** From 1.4.1 the name is served by two instances of the app: B2 on prod5, which
+serves since 23 Nov 2026 02:23 UTC, and A2 on prod9, which stands by since 02:48 UTC (it ran 1.4.0 until 02:43 UTC
+and was the only instance until 02:23 UTC). Both run the first row's compose, so both sign receipts with the first row's key, and a receipt
+of an answer one of them gave is handed over by the other. Each holds its own certificate for the name, obtained
+with its own ACME account (B2: `https://acme-v02.api.letsencrypt.org/acme/acct/4031246402`; A2:
+`https://acme-v02.api.letsencrypt.org/acme/acct/3982221542`), and its own request-encryption key, born in its
+memory: an attestation names the instance it was made for, and a client encrypts to the instance it verified.
+The relay's two instances carry one configuration since that day (`deploy/dstack/docker-compose.relay.yml`, written
+by `deploy/dstack/relay-config.py`; manifest hashes `86e3b6685374bc4449ef24cff3eace9f517e35e762532942aa55c5d8d760c3bb`
+on prod9 and `5433e3c3d53f7a8ef467d2275b182795828c62eb552bf68bb77524f07fb5d3a6` on prod5, the one in the name's
+path since the name's DNS record points there): a connection goes to the first router whose check says it may
+take customers, B2 and then A2, as the file's header tells. The Python client verifies these machines from 0.5.6.
 
 `router-tee.lebrel.ai` is not served any more: `attested.lebrel.ai` is the one name, for clients and for the
 platform's edge alike.
