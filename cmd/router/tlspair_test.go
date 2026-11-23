@@ -148,6 +148,23 @@ func pairIn(t *testing.T, dir, peerURL string, notify func(string)) *tlsPair {
 	return pair
 }
 
+// pairDir is a directory for an instance of a pair. Its loop may be writing a certificate at the moment a
+// test ends (stopping it does not wait for it), so the directory is removed once that write is over
+// rather than by the test's own temporary directory, which fails the test when it finds a file arriving.
+func pairDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "pair")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		for tries := 0; tries < 200 && os.RemoveAll(dir) != nil; tries++ {
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+	return dir
+}
+
 // handedTo is a validation the relay hands to the given instance: what it would present.
 func handedTo(pair *tlsPair) func(context.Context, string) ([]byte, error) {
 	return func(_ context.Context, host string) ([]byte, error) {
@@ -185,7 +202,7 @@ func peerAt(t *testing.T, url, secret string) *peer {
 
 func TestAChallengeThisInstanceLacksIsLookedUpAtItsPeer(t *testing.T) {
 	ctx := context.Background()
-	theirDir := t.TempDir()
+	theirDir := pairDir(t)
 	theirs := pairIn(t, theirDir, "http://127.0.0.1:1", nil)
 	challenge := challengePEM(t, pairName, "token-of-the-peer")
 	disk := autocert.DirCache(theirDir)
@@ -194,7 +211,7 @@ func TestAChallengeThisInstanceLacksIsLookedUpAtItsPeer(t *testing.T) {
 	_ = disk.Put(ctx, pairName, certPEM(t, pairName, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour)))
 	plain, lookups := plainOf(t, theirs)
 
-	mine := pairIn(t, t.TempDir(), plain.URL, nil)
+	mine := pairIn(t, pairDir(t), plain.URL, nil)
 	presented, err := handedTo(mine)(ctx, pairName)
 	if err != nil || !bytes.Equal(presented, leafOf(challenge)) {
 		t.Fatalf("a validation handed to this instance was not answered with the peer's challenge: %v", err)
@@ -217,7 +234,7 @@ func TestAChallengeThisInstanceLacksIsLookedUpAtItsPeer(t *testing.T) {
 
 func TestThePeerAnswersOnlyAChallengeOfItsOwnMaking(t *testing.T) {
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir := pairDir(t)
 	pair := pairIn(t, dir, "http://127.0.0.1:1", nil)
 	disk := autocert.DirCache(dir)
 	real := certPEM(t, pairName, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
@@ -424,23 +441,23 @@ func TestThePeersAddressAndThePairsSecretAreCheckedAtStart(t *testing.T) {
 		t.Fatal("the same secret must give the same key, another secret another")
 	}
 	hosts := []string{pairName}
-	if _, err := newTLSPair(hosts, hosts, t.TempDir(), "", "https://peer.example.com", "short", nil, quietLogger(), nil); err == nil {
+	if _, err := newTLSPair(hosts, hosts, pairDir(t), "", "https://peer.example.com", "short", nil, quietLogger(), nil); err == nil {
 		t.Fatal("a peer without the pair's secret was accepted")
 	}
-	if _, err := newTLSPair(hosts, hosts, t.TempDir(), "", "http://peer.example.com", pairSecret, nil, quietLogger(), nil); err == nil {
+	if _, err := newTLSPair(hosts, hosts, pairDir(t), "", "http://peer.example.com", pairSecret, nil, quietLogger(), nil); err == nil {
 		t.Fatal("a peer over plain http was accepted")
 	}
-	if _, err := newTLSPair(hosts, nil, t.TempDir(), "", "https://peer.example.com", pairSecret, nil, quietLogger(), nil); err == nil {
+	if _, err := newTLSPair(hosts, nil, pairDir(t), "", "https://peer.example.com", pairSecret, nil, quietLogger(), nil); err == nil {
 		t.Fatal("a pair whose customers' names it cannot obtain was accepted")
 	}
-	if _, err := newTLSPair(nil, nil, t.TempDir(), "", "https://peer.example.com", pairSecret, nil, quietLogger(), nil); err == nil {
+	if _, err := newTLSPair(nil, nil, pairDir(t), "", "https://peer.example.com", pairSecret, nil, quietLogger(), nil); err == nil {
 		t.Fatal("a pair without names was accepted")
 	}
 }
 
 func TestAnInstanceIsReadyWithACertificateForTheNamesItsCustomersCallAndNoOther(t *testing.T) {
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir := pairDir(t)
 	pair := pairIn(t, dir, "https://peer.example.com", nil)
 	if pair.look() || pair.Ready() {
 		t.Fatal("ready without a certificate")
@@ -494,7 +511,7 @@ func (d *failingDisk) Get(ctx context.Context, key string) ([]byte, error) {
 }
 
 func TestADiskThatCannotBeReadForAMomentTakesNoCertificateAway(t *testing.T) {
-	dir := t.TempDir()
+	dir := pairDir(t)
 	now := time.Now()
 	_ = autocert.DirCache(dir).Put(context.Background(), pairName, certPEM(t, pairName, now.Add(-time.Hour), now.Add(24*time.Hour)))
 	pair := pairIn(t, dir, "https://peer.example.com", nil)
@@ -565,13 +582,13 @@ func ordersCounted(t *testing.T, pair *tlsPair) *atomic.Int64 {
 func TestOverRealTLSAValidationIsAnsweredWithThePeersChallengeAndAClientOnlyWithACertificateHeld(t *testing.T) {
 	ctx := context.Background()
 	// the peer: an order pending, its challenge on its own disk
-	peerDir := t.TempDir()
+	peerDir := pairDir(t)
 	challenge := challengePEM(t, pairName, "token-of-the-peer")
 	_ = autocert.DirCache(peerDir).Put(ctx, pairName+challengeKeySuffix, challenge)
 	plain, _ := plainOf(t, pairIn(t, peerDir, "http://127.0.0.1:1", nil))
 
 	// this instance: nothing on disk yet
-	dir := t.TempDir()
+	dir := pairDir(t)
 	pair := pairIn(t, dir, plain.URL, nil)
 	orders := ordersCounted(t, pair)
 	pair.look()
@@ -661,7 +678,7 @@ func (a *alerts) all() []string {
 }
 
 func TestAnInstanceWithoutACertificateAsksAtItsOwnPaceTellsTheOperatorOnceAndBecomesReady(t *testing.T) {
-	dir := t.TempDir()
+	dir := pairDir(t)
 	told := &alerts{}
 	pair := pairIn(t, dir, "https://peer.example.com", told.notify)
 	pair.pace.ask, pair.pace.check, pair.pace.probe, pair.pace.verify, pair.pace.alert = 120*time.Millisecond, 5*time.Millisecond, 5*time.Millisecond, time.Hour, time.Hour
@@ -712,7 +729,7 @@ func TestAnInstanceWithoutACertificateAsksAtItsOwnPaceTellsTheOperatorOnceAndBec
 }
 
 func TestAChallengeLeftOnDiskByAProcessThatDiedDoesNotHoldTheNextOne(t *testing.T) {
-	dir := t.TempDir()
+	dir := pairDir(t)
 	disk := autocert.DirCache(dir)
 	stale := challengePEM(t, pairName, "of an order nobody waits for")
 	_ = disk.Put(context.Background(), pairName+challengeKeySuffix, stale)
@@ -746,7 +763,7 @@ func TestAChallengeLeftOnDiskByAProcessThatDiedDoesNotHoldTheNextOne(t *testing.
 func TestAReadyInstanceLoadsTheCertificatesItServesForRenewalAndOrdersNothing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	dir := t.TempDir()
+	dir := pairDir(t)
 	now := time.Now()
 	disk := autocert.DirCache(dir)
 	_ = disk.Put(ctx, pairName, certPEM(t, pairName, now.Add(-time.Minute), now.Add(90*24*time.Hour)))
@@ -784,7 +801,7 @@ func TestAReadyInstanceLoadsTheCertificatesItServesForRenewalAndOrdersNothing(t 
 
 func TestACertificateThatShouldHaveBeenRenewedIsToldAndNotAtEveryLook(t *testing.T) {
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir := pairDir(t)
 	told := &alerts{}
 	pair := pairIn(t, dir, "https://peer.example.com", told.notify)
 	issued := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
@@ -820,7 +837,7 @@ func TestACertificateThatShouldHaveBeenRenewedIsToldAndNotAtEveryLook(t *testing
 
 func TestAnInstanceTriesWhetherAValidationWouldFindItWithAChallengeOfItsOwnMaking(t *testing.T) {
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir := pairDir(t)
 	disk := autocert.DirCache(dir)
 	pair := pairIn(t, dir, "https://peer.example.com", nil)
 	key := pairName + challengeKeySuffix
@@ -879,7 +896,7 @@ func TestAnInstanceTriesWhetherAValidationWouldFindItWithAChallengeOfItsOwnMakin
 }
 
 func TestAnInstanceTheRelayDoesNotKnowYetWaitsWithoutAskingAndTellsOnlyWhenItLasts(t *testing.T) {
-	dir := t.TempDir()
+	dir := pairDir(t)
 	told := &alerts{}
 	pair := pairIn(t, dir, "https://peer.example.com", told.notify)
 	pair.pace.check, pair.pace.probe, pair.pace.ask, pair.pace.patience, pair.pace.alert, pair.pace.verify = 5*time.Millisecond, 20*time.Millisecond, 20*time.Millisecond, 250*time.Millisecond, time.Hour, time.Hour
@@ -938,7 +955,7 @@ func TestAnInstanceTheRelayDoesNotKnowYetWaitsWithoutAskingAndTellsOnlyWhenItLas
 }
 
 func TestAnInstanceThatHoldsItsCertificateGoesOnTryingThatItsRenewalCouldBeValidated(t *testing.T) {
-	dir := t.TempDir()
+	dir := pairDir(t)
 	now := time.Now()
 	_ = autocert.DirCache(dir).Put(context.Background(), pairName, certPEM(t, pairName, now.Add(-time.Minute), now.Add(60*24*time.Hour)))
 	told := &alerts{}
@@ -995,10 +1012,10 @@ func TestAnInstanceThatHoldsItsCertificateGoesOnTryingThatItsRenewalCouldBeValid
 func TestOverRealTLSAnInstanceFindsItsOwnProbeThroughItsPeer(t *testing.T) {
 	ctx := context.Background()
 	// the new instance: its plaintext listener is where the first looks its challenges up
-	second := pairIn(t, t.TempDir(), "http://127.0.0.1:1", nil)
+	second := pairIn(t, pairDir(t), "http://127.0.0.1:1", nil)
 	plain, lookups := plainOf(t, second)
 	// the instance the relay hands validations to: it holds nothing for the name, and its peer is elsewhere
-	first := pairIn(t, t.TempDir(), "http://127.0.0.1:1", nil)
+	first := pairIn(t, pairDir(t), "http://127.0.0.1:1", nil)
 	addr := listening(t, first.TLSConfig())
 	second.validation = func(ctx context.Context, host string) ([]byte, error) { return validationAt(ctx, addr, host) }
 	if err := second.reaches(ctx, pairName); err == nil {
@@ -1022,7 +1039,7 @@ func TestOverRealTLSAnInstanceFindsItsOwnProbeThroughItsPeer(t *testing.T) {
 }
 
 func TestAnInstanceThatDoesNotKnowItsPeerSaysSoAndServesOn(t *testing.T) {
-	dir := t.TempDir()
+	dir := pairDir(t)
 	now := time.Now()
 	_ = autocert.DirCache(dir).Put(context.Background(), pairName, certPEM(t, pairName, now.Add(-time.Minute), now.Add(60*24*time.Hour)))
 	told := &alerts{}
@@ -1049,7 +1066,7 @@ func TestAnInstanceThatDoesNotKnowItsPeerSaysSoAndServesOn(t *testing.T) {
 }
 
 func TestTheAccountsAddressIsLearnedAtStartAndToldToTheOperator(t *testing.T) {
-	dir := t.TempDir()
+	dir := pairDir(t)
 	pair := pairIn(t, dir, "https://peer.example.com", nil)
 	pair.pace.check, pair.pace.account = 5*time.Millisecond, 40*time.Millisecond
 	pair.validation = func(context.Context, string) ([]byte, error) { return nil, errors.New("not yet") }
@@ -1109,7 +1126,7 @@ func TestTheServedNamesAreThoseCustomersCall(t *testing.T) {
 func TestATryThatFailsIsMadeOnceMoreSoTwoInstancesTryingAtOnceDoNotFailEachOther(t *testing.T) {
 	// The peer is trying at the same moment: a validation of the name is answered with ITS probe, so
 	// this instance's first try sees a challenge that is not its own. A moment later the peer is done.
-	pair := pairIn(t, t.TempDir(), "https://peer.example.com", nil)
+	pair := pairIn(t, pairDir(t), "https://peer.example.com", nil)
 	pair.pace.again = 5 * time.Millisecond
 	itself := handedTo(pair)
 	var tries atomic.Int64
@@ -1175,7 +1192,7 @@ func TestWhyThePeerCouldNotBeAskedIsToldOnTheSwitch(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(challengeAnswer{Version: acmeChallengeVersion, Name: pairName, PEM: base64.StdEncoding.EncodeToString(data), MAC: hex.EncodeToString(signChallenge(other, pairName, data))})
 	}))
 	defer peerServer.Close()
-	pair := pairIn(t, t.TempDir(), "https://peer.example.com", nil)
+	pair := pairIn(t, pairDir(t), "https://peer.example.com", nil)
 	pair.peer.base, pair.peer.client = peerServer.URL, peerServer.Client()
 	pair.peer.missFor = time.Millisecond
 	if _, err := pair.peer.challenge(context.Background(), pairName); err == nil {

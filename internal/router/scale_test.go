@@ -258,7 +258,7 @@ func TestReceiptsAreFoundOnTheOtherInstances(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	otherReceipts := NewReceiptStore(time.Hour, 10)
+	otherReceipts := NewReceiptStore(time.Hour, 100) // holds every receipt this test files, the twenty asked at once included
 	theirs, _ := other.RouteReceipt(ReceiptInput{RequestID: otherID, ModelID: h.route.ModelID}, time.Unix(1_900_000_000, 0))
 	otherReceipts.Put(otherID, theirs)
 	otherServer := serverWith(t, &harness{route: h.route, auth: h.auth, signer: other}, h.ledger, runningQueue(t, h.ledger), func(s *Settings) { s.Receipts = otherReceipts })
