@@ -1,11 +1,16 @@
 package router
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // What a request may carry upstream, and the cap every host is given (27 November 2026).
@@ -222,6 +227,184 @@ func TestAPictureGoesUpstreamAsItsAddressAndNothingElse(t *testing.T) {
 		inner, _ := part["image_url"].(map[string]any)
 		if len(part) != 2 || part["type"] != "image_url" || len(inner) != 1 || inner["url"] != want {
 			t.Errorf("image part %d reached the host as %v", i, part)
+		}
+	}
+}
+
+func TestAStreamIsChargedByItsLargestCountAndAHostBeyondTheHoldIsTold(t *testing.T) {
+	var mu sync.Mutex
+	var alerts []string
+	// a host that sends its count, then a block of zeros
+	twice := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, chunk := range []string{
+			`{"id":"s","model":"deepseek-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"}}]}`,
+			`{"id":"s","model":"deepseek-flash","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}`,
+			`{"id":"s","model":"deepseek-flash","choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`,
+		} {
+			fmt.Fprintf(w, "data: %s\n\n", chunk)
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+	h := newHarnessWith(t, routeFor(upstream("deepseek/api", twice.server.URL, 1)), "", func(s *Settings) {
+		s.Alert = func(text string) { mu.Lock(); alerts = append(alerts, text); mu.Unlock() }
+	})
+	before := h.balance(t)
+	response, raw := postJSON(t, h, chat(map[string]any{"stream": true}))
+	if response.StatusCode != http.StatusOK || !strings.Contains(raw, "[DONE]") {
+		t.Fatalf("status %d: %s", response.StatusCode, raw)
+	}
+	// 12 prompt * 0.1575 + 3 output * 0.63 microUSD = 3.78, rounded up
+	if charged := before - h.balance(t); charged != 4 {
+		t.Fatalf("a stream whose last usage block is zeros was charged %d, want 4", charged)
+	}
+	// a host that writes past the cap it was given: the customer pays the reserved maximum, and the operator is told once
+	past := newFakeUpstream(t, okJSON(`{"prompt_tokens":12,"completion_tokens":900,"total_tokens":912}`))
+	h = newHarnessWith(t, routeFor(upstream("deepseek/api", past.server.URL, 1)), "", func(s *Settings) {
+		s.Alert = func(text string) { mu.Lock(); alerts = append(alerts, text); mu.Unlock() }
+	})
+	for i := 0; i < 3; i++ {
+		if response, raw := postJSON(t, h, chat(map[string]any{"max_tokens": 16})); response.StatusCode != http.StatusOK {
+			t.Fatalf("status %d: %s", response.StatusCode, raw)
+		}
+	}
+	flushed(t, h.settlements)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(alerts) != 1 || !strings.Contains(alerts[0], "contó más de lo reservado") || !strings.Contains(alerts[0], "salida 900 de 16") || strings.Contains(alerts[0], "hi") && strings.Contains(alerts[0], "content") {
+		t.Fatalf("alerts %q", alerts)
+	}
+}
+
+func TestAKeysTurnsAreTakenBeforeATranslatedRequestIsRead(t *testing.T) {
+	release := make(chan struct{})
+	up := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		okJSON(`{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}`)(w, r)
+	})
+	var fetches atomic.Int64
+	h := newHarnessWith(t, routeFor(upstream("deepseek/api", up.server.URL, 1)), "", func(s *Settings) {
+		s.EdgeProxySecret = "edge-secret"
+		s.DirectClients = true
+	})
+	h.router.mediaFetch = func(context.Context, string) ([]byte, string, error) {
+		fetches.Add(1)
+		return tinyPDF("hello"), "application/pdf", nil
+	}
+	post := func(path, body string) *http.Response {
+		request, _ := http.NewRequest(http.MethodPost, h.server.URL+path, strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+testKey)
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	// the key's four turns are taken by four answers still on their way
+	done := make(chan int, 4)
+	for i := 0; i < 4; i++ {
+		go func() {
+			response := post("/v1/chat/completions", `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`)
+			response.Body.Close()
+			done <- response.StatusCode
+		}()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		up.mu.Lock()
+		reached := len(up.requests)
+		up.mu.Unlock()
+		if reached == 4 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of 4 requests reached the host", reached)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// a fifth, in each translated format and naming documents to fetch, is turned away before any of them is fetched
+	document := `{"type":"document","source":{"type":"url","url":"https://example.com/a.pdf"}}`
+	for path, body := range map[string]string{
+		anthropicMessagesPath:                   `{"model":"deepseek/deepseek-v4.1-flash","max_tokens":64,"messages":[{"role":"user","content":[` + document + `,` + document + `]}]}`,
+		anthropicMessagesPath + "/count_tokens": `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`,
+		responsesPath:                           `{"model":"deepseek/deepseek-v4.1-flash","input":[{"role":"user","content":[{"type":"input_file","file_url":"https://example.com/a.pdf"}]}]}`,
+	} {
+		response := post(path, body)
+		raw, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		if response.StatusCode != http.StatusTooManyRequests {
+			t.Errorf("%s with every turn taken: status %d: %.200s", path, response.StatusCode, raw)
+		}
+	}
+	if fetches.Load() != 0 {
+		t.Errorf("%d files were fetched for requests that had no turn", fetches.Load())
+	}
+	close(release)
+	for i := 0; i < 4; i++ {
+		if status := <-done; status != http.StatusOK {
+			t.Errorf("a request that held a turn ended %d", status)
+		}
+	}
+	// with a turn free the same request is read, and it takes one turn, not two
+	response := post(anthropicMessagesPath, `{"model":"deepseek/deepseek-v4.1-flash","max_tokens":64,"messages":[{"role":"user","content":[`+document+`,{"type":"text","text":"what does it say?"}]}]}`)
+	raw, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || fetches.Load() != 1 {
+		t.Fatalf("with a turn free: status %d after %d fetches: %.200s", response.StatusCode, fetches.Load(), raw)
+	}
+}
+
+func TestARequestsFilesAreBounded(t *testing.T) {
+	megabyte := strings.Repeat("palabra ", 131_072)
+	files := map[string][]byte{"https://example.com/a.png": append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 600_000)...), "https://example.com/a.txt": []byte(megabyte)}
+	message := func(parts ...any) map[string]any {
+		return map[string]any{"messages": []map[string]any{{"role": "user", "content": parts}}}
+	}
+	repeat := func(count int, part func(int) any) []any {
+		parts := make([]any, count)
+		for i := range parts {
+			parts[i] = part(i)
+		}
+		return parts
+	}
+	route := visionRoute()
+	route.MaxImages = 64
+	for name, test := range map[string]struct {
+		chat   map[string]any
+		budget int64
+		want   string
+	}{
+		"more files by address than a request may name": {chat: message(repeat(mediaMaxFetches+1, func(int) any { return imagePart("https://example.com/a.png") })...), want: "at most 32 files by address"},
+		"more fetched than a request may carry":         {chat: message(repeat(4, func(int) any { return imagePart("https://example.com/a.png") })...), budget: 2 << 20, want: "at most 2 MB together"},
+		"more documents than a request may carry":       {chat: message(repeat(documentsMax+1, func(int) any { return documentPart("", "text/plain", "", "hello", "") })...), want: "at most 32 documents"},
+		"more document text than a request may carry":   {chat: message(repeat(9, func(int) any { return documentPart("", "text/plain", "", "", "https://example.com/a.txt") })...), want: "at most 8 MB of text together"},
+	} {
+		server := mediaServer(files)
+		server.settings.MaxRequestBytes = test.budget
+		err := server.resolveMedia(context.Background(), test.chat, route)
+		var refused *formatError
+		if !asFormatError(err, &refused) || !strings.Contains(refused.message, test.want) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	// what fits is read as before
+	server := mediaServer(files)
+	if err := server.resolveMedia(context.Background(), message(imagePart("https://example.com/a.png"), documentPart("notes", "text/plain", "", "", "https://example.com/a.txt")), route); err != nil {
+		t.Fatalf("an image and a document by address: %v", err)
+	}
+}
+
+func TestOnlyThePublicWebIsFetched(t *testing.T) {
+	for address, public := range map[string]bool{
+		"93.184.216.34:443": true, "93.184.216.34:80": true, "93.184.216.34:8080": true, "[2606:2800:220:1:248:1893:25c8:1946]:443": true,
+		"93.184.216.34:22": false, "93.184.216.34:25": false, "93.184.216.34:6379": false, "93.184.216.34:8090": false,
+		"127.0.0.1:443": false, "10.0.0.1:443": false, "169.254.169.254:80": false, "100.64.0.1:443": false, "192.88.99.1:443": false,
+		"[::1]:443": false, "[::ffff:10.0.0.1]:443": false, "[::10.0.0.1]:443": false, "[64:ff9b:1::a00:1]:443": false, "[2001::1]:443": false,
+		"[2001:db8::1]:443": false, "[fec0::1]:443": false, "[fe80::1]:443": false, "[fd00::1]:443": false, "[3fff::1]:443": false, "[5f00::1]:443": false,
+	} {
+		if err := publicOnly("tcp", address, nil); (err == nil) != public {
+			t.Errorf("%s: fetched %v, want %v", address, err == nil, public)
 		}
 	}
 }

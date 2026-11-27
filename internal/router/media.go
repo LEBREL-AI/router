@@ -42,6 +42,14 @@ const (
 	// documentMaxPages and documentMaxBytes bound what is read of one document.
 	documentMaxPages = 1000
 	documentMaxBytes = 4 << 20
+	// mediaMaxFetches is how many files one request may name by address, and mediaResolveTimeout the time that
+	// fetching and reading all the files of one request may take.
+	mediaMaxFetches     = 32
+	mediaResolveTimeout = 60 * time.Second
+	// documentsMax and documentsMaxBytes bound the documents of one request, and their text together (a model's
+	// whole context is about half of that).
+	documentsMax      = 32
+	documentsMaxBytes = 8 << 20
 	// documentPartType marks a document part between the translation of a request and the reading of its text.
 	documentPartType = "_lebrel_document"
 	// mediaUserAgent names the fetcher to the sites it fetches from.
@@ -173,11 +181,12 @@ func documentPart(title, mediaType, data, text, address string) map[string]any {
 }
 
 // documentText is what a model reads of a document: a PDF's text layer, or a text file as it is.
-func documentText(mediaType string, data []byte) (string, error) {
+func documentText(ctx context.Context, mediaType string, data []byte) (string, error) {
 	kind := strings.ToLower(strings.TrimSpace(strings.Split(mediaType, ";")[0]))
 	switch {
 	case kind == "application/pdf" || bytes.HasPrefix(data, []byte("%PDF-")):
-		return pdfText(data)
+		// in a process of its own: a PDF written to hurt its reader ends that process, never the router
+		return isolatedPDFText(ctx, data)
 	case strings.HasPrefix(kind, "text/") || kind == "application/json" || kind == "application/xml" || kind == "application/yaml" ||
 		kind == "application/x-yaml" || kind == "application/javascript" || kind == "application/x-ndjson" || kind == "" || kind == "application/octet-stream":
 		if !utf8.Valid(data) {
@@ -192,7 +201,8 @@ func documentText(mediaType string, data []byte) (string, error) {
 }
 
 // pdfText is a PDF's text layer, page by page. A damaged PDF is refused (a parser panic included), and so is one
-// with no text at all (a scan), with the way round it.
+// with no text at all (a scan), with the way round it. It runs in the reader's process (pdfworker.go), never in
+// the router's: a file can end the process that reads it.
 func pdfText(data []byte) (text string, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -258,7 +268,20 @@ var nonPublicPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("100::/64"),
 	netip.MustParsePrefix("2001:db8::/32"),
 	netip.MustParsePrefix("2002::/16"),
+	// space that is global unicast by its bits and reaches something else: addresses that carry an IPv4 one inside
+	// (the old compatible form, local translation), protocol assignments (Teredo among them), the old site-local
+	// range, the retired 6to4 relays, and documentation and routing-header space
+	netip.MustParsePrefix("::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("fec0::/10"),
+	netip.MustParsePrefix("3fff::/20"),
+	netip.MustParsePrefix("5f00::/16"),
+	netip.MustParsePrefix("192.88.99.0/24"),
 }
+
+// fetchPorts are the ports a file is fetched from: where the web is served, and nothing else a machine listens on.
+var fetchPorts = map[string]bool{"80": true, "443": true, "8080": true, "8443": true}
 
 // publicAddress is whether an address is one a fetch may reach: global unicast, never loopback, private, link-local
 // (the cloud's metadata service), shared or reserved.
@@ -278,12 +301,12 @@ func publicAddress(address netip.Addr) bool {
 // publicOnly checks the address a connection is about to be made to, after the name was resolved: a name that
 // resolves to a private address, or one that changes its answer between two lookups, reaches nothing private.
 func publicOnly(_, address string, _ syscall.RawConn) error {
-	host, _, err := net.SplitHostPort(address)
+	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return err
 	}
 	parsed, err := netip.ParseAddr(host)
-	if err != nil || !publicAddress(parsed) {
+	if err != nil || !publicAddress(parsed) || !fetchPorts[port] {
 		return errNotPublic
 	}
 	return nil
@@ -359,8 +382,25 @@ func (s *Server) fetchMedia(ctx context.Context, address string) ([]byte, string
 // (fetched by address here), counted and refused where the route reads none or more than it takes; documents
 // their text. A message whose parts are all text again is its text alone, as a request without media always was.
 func (s *Server) resolveMedia(ctx context.Context, chat map[string]any, route *Route) error {
+	// One deadline for all of a request's files, and a ceiling on how many it names, how much is fetched for it and
+	// how much text its documents hold together: a request is never worth more work than a request may carry.
+	ctx, stop := context.WithTimeout(ctx, mediaResolveTimeout)
+	defer stop()
 	messages, _ := chat["messages"].([]map[string]any)
-	images := 0
+	images, fetches, documents, text := 0, 0, 0, 0
+	fetched := int64(0)
+	budget := s.settings.MaxRequestBytes
+	byAddress := func(size int) error {
+		fetches++
+		fetched += int64(size)
+		if fetches > mediaMaxFetches {
+			return formatErrorf("a request may name at most %d files by address", mediaMaxFetches)
+		}
+		if budget > 0 && fetched > budget {
+			return formatErrorf("the files a request names by address may be at most %d MB together", budget>>20)
+		}
+		return nil
+	}
 	for _, message := range messages {
 		parts, ok := message["content"].([]any)
 		if !ok {
@@ -381,10 +421,17 @@ func (s *Server) resolveMedia(ctx context.Context, chat map[string]any, route *R
 				inner, _ := object["image_url"].(map[string]any)
 				address, _ := inner["url"].(string)
 				if !strings.HasPrefix(address, "data:") {
+					if err := byAddress(0); err != nil {
+						return err
+					}
 					data, _, err := s.fetchMedia(ctx, address)
 					if err != nil {
 						return err
 					}
+					if err := byAddress(len(data)); err != nil {
+						return err
+					}
+					fetches--
 					inline, err := imageDataURL(data)
 					if err != nil {
 						return err
@@ -393,12 +440,25 @@ func (s *Server) resolveMedia(ctx context.Context, chat map[string]any, route *R
 				}
 				resolved = append(resolved, object)
 			case documentPartType:
-				text, err := s.documentPartText(ctx, object)
+				documents++
+				if documents > documentsMax {
+					return formatErrorf("a request may carry at most %d documents", documentsMax)
+				}
+				if _, named := object["url"].(string); named {
+					if err := byAddress(0); err != nil {
+						return err
+					}
+				}
+				read, err := s.documentPartText(ctx, object)
 				if err != nil {
 					return err
 				}
+				text += len(read)
+				if text > documentsMaxBytes {
+					return formatErrorf("the documents of a request may hold at most %d MB of text together", documentsMaxBytes>>20)
+				}
 				title, _ := object["title"].(string)
-				resolved = append(resolved, map[string]any{"type": "text", "text": documentBlock(title, text)})
+				resolved = append(resolved, map[string]any{"type": "text", "text": documentBlock(title, read)})
 			default:
 				resolved = append(resolved, object)
 			}
@@ -419,7 +479,7 @@ func (s *Server) documentPartText(ctx context.Context, part map[string]any) (str
 		if err != nil {
 			return "", err
 		}
-		return documentText(mediaType, decoded)
+		return documentText(ctx, mediaType, decoded)
 	}
 	address, _ := part["url"].(string)
 	data, served, err := s.fetchMedia(ctx, address)
@@ -429,7 +489,7 @@ func (s *Server) documentPartText(ctx context.Context, part map[string]any) (str
 	if mediaType == "" {
 		mediaType = served
 	}
-	return documentText(mediaType, data)
+	return documentText(ctx, mediaType, data)
 }
 
 // joinedIfText is a message's content: its text alone when every part is text, its parts otherwise.

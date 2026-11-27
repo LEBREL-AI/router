@@ -48,6 +48,10 @@ func env(name, fallback string) string {
 }
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == router.PDFWorkerArg {
+		// started by the router itself to read one PDF (internal/router/pdfworker.go): nothing else runs
+		os.Exit(router.RunPDFWorker(os.Stdin, os.Stdout))
+	}
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.LUTC)
 	if err := run(logger); err != nil {
 		logger.Fatalf("router: %v", err)

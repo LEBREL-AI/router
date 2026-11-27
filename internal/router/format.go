@@ -145,6 +145,23 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 		}
 		return
 	}
+	// The key's and the account's turns are taken before the body is read. Translating a request, fetching the
+	// files it names and reading its documents is work, and nothing works for a key beyond its turns: the
+	// completion handler finds them taken and takes none of its own.
+	releaseKey, err := s.settings.Limiter.Acquire(ctx, "key:"+principal.APIKeyID, principal.Concurrency)
+	if err != nil {
+		w.Header().Set("Retry-After", "1")
+		s.writeFormatError(w, format, http.StatusTooManyRequests, "rate_limit_exceeded", "too many concurrent requests for this key")
+		return
+	}
+	defer releaseKey()
+	releaseAccount, err := s.settings.Limiter.Acquire(ctx, "account:"+principal.AccountID, principal.AccountConcurrency)
+	if err != nil {
+		w.Header().Set("Retry-After", "1")
+		s.writeFormatError(w, format, http.StatusTooManyRequests, "rate_limit_exceeded", "too many concurrent requests for this account")
+		return
+	}
+	defer releaseAccount()
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.settings.MaxRequestBytes))
 	if err != nil {
 		s.writeFormatError(w, format, http.StatusRequestEntityTooLarge, "request_too_large", "request body is too large")
@@ -227,8 +244,9 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 		s.writeFormatError(w, format, http.StatusBadRequest, "invalid_request_error", "the request could not be encoded")
 		return
 	}
-	// The inner request carries the principal already checked, so the completion handler checks nothing again.
-	inner, err := http.NewRequestWithContext(context.WithValue(ctx, principalKey{}, principal), http.MethodPost, completionPath, bytes.NewReader(body.Bytes()))
+	// The inner request carries the principal already checked and the turns already taken, so the completion
+	// handler checks and takes nothing again.
+	inner, err := http.NewRequestWithContext(context.WithValue(context.WithValue(ctx, principalKey{}, principal), limitsKey{}, true), http.MethodPost, completionPath, bytes.NewReader(body.Bytes()))
 	if err != nil {
 		s.writeFormatError(w, format, http.StatusInternalServerError, "internal_error", "the request could not be built")
 		return
