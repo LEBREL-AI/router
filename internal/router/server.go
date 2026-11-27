@@ -1085,10 +1085,32 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 			textBytes = int(max(text, 0))
 		}
 	}
-	result, lastErr := s.callUpstreams(ctx, route, normalized, requestID, r.Header.Get("Accept"), info.Images > 0, textBytes)
+	// The call to the host outlives the customer. A host that has been sent a request reads its prompt and writes
+	// its answer whether or not anybody waits for it, and bills both: a call that was cancelled when the customer
+	// left settled at nothing while the host went on. So a call once made is seen to its answer (within the time
+	// every call has, and a shutdown's cut), and what the host counted is what is charged. Nothing more is begun
+	// for a customer who has left: no next upstream, no second round.
+	owed, endCall := context.WithCancelCause(context.WithValue(context.WithoutCancel(ctx), customerKey{}, ctx))
+	defer endCall(nil)
+	defer context.AfterFunc(s.cutCtx, func() { endCall(errShutdownCut) })()
+	// A customer who leaves after a long wait with no upstream answering is told to the operator when they leave,
+	// not when the call they left behind ends.
+	answered := make(chan struct{})
+	var abandoned atomic.Bool
+	go func() {
+		select {
+		case <-ctx.Done():
+			if s.cutCtx.Err() == nil && time.Since(waitingSince) >= s.settings.AbandonAfter && abandoned.CompareAndSwap(false, true) {
+				s.noteAbandoned(route)
+			}
+		case <-answered:
+		}
+	}()
+	result, lastErr := s.callUpstreams(owed, route, normalized, requestID, r.Header.Get("Accept"), info.Images > 0, textBytes)
+	close(answered)
 	if result == nil {
 		settle(0, model.Usage{}, model.SettlementUpstreamRejected)
-		if cutCaused(ctx, lastErr) {
+		if cutCaused(ctx, lastErr) || cutCaused(owed, lastErr) {
 			// a shutdown cut it while the lab had not answered yet: never accepted, nothing charged
 			s.noteCut(reservation.ID)
 			s.settings.Logger.Printf("request=%s model=%s cut at shutdown before the upstream answered, charged 0", requestID, route.ModelID)
@@ -1100,7 +1122,7 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 		if ctx.Err() == nil {
 			// the customer is still there and gets a 502; a customer who hung up is no outage
 			s.noteOutage(route, lastErr)
-		} else if time.Since(waitingSince) >= s.settings.AbandonAfter {
+		} else if time.Since(waitingSince) >= s.settings.AbandonAfter && abandoned.CompareAndSwap(false, true) {
 			// the customer left after a long wait with no upstream answering: many of those are an
 			// outage the outage alert never sees (every customer leaves before the upstream's time)
 			s.noteAbandoned(route)
@@ -1134,7 +1156,7 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 	}
 	// The upstream accepted the request. The control plane learns it before the customer sees a
 	// byte, so the hold can never be closed as unanswered while its answer is on the way.
-	if err := s.acceptUpstream(ctx, reservation.ID, requestID); err != nil {
+	if err := s.acceptUpstream(owed, reservation.ID, requestID); err != nil {
 		s.settings.Logger.Printf("request=%s model=%s upstream=%s the control plane refused the acceptance, answer withheld: %v", requestID, route.ModelID, upstream.Name, err)
 		s.writeError(w, http.StatusServiceUnavailable, "billing_unavailable", "billing could not record this request")
 		return
@@ -1153,6 +1175,20 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 	}
 	receipt.PromptSHA256 = receipt.Digest(original)
 	started := s.settings.Now()
+	if info.Stream && ctx.Err() != nil && s.cutCtx.Err() == nil {
+		// The customer left before the host began to answer, and the host has now taken the request: it has read
+		// the prompt, and a stream nobody reads is closed here before it writes more. The prompt is charged, as
+		// estimated (the receipt says so), and no output.
+		usage := model.Usage{PromptTokens: max(promptEstimate, 1), TotalTokens: max(promptEstimate, 1)}
+		actual, billed, outcome, _ := s.charge(pricing, queue, info, percent, usage, true, amount)
+		settle(actual, billed, outcome)
+		receipt.PromptTokens, receipt.UsageExact, receipt.PriceMicrousd = usage.PromptTokens, false, actual
+		if document, err := s.settings.Signer.RouteReceipt(receipt, s.settings.Now()); err == nil {
+			s.settings.Receipts.Put(requestID, document)
+		}
+		s.settings.Logger.Printf("request=%s model=%s upstream=%s the customer left before the answer began; the stream was closed and the prompt charged as estimated: prompt=%d charge=%d", requestID, route.ModelID, upstream.Name, usage.PromptTokens, actual)
+		return
+	}
 	var cut bool
 	if info.Stream {
 		cut = s.finishStream(w, response, upstream, route, pricing, queue, info, percent, promptEstimate, receipt, settle, requestID, started, principal.AccountID, amount)
@@ -1398,8 +1434,16 @@ func (s *Server) callUpstreams(ctx context.Context, route *Route, normalized []b
 			if room != nil {
 				room.Add(-1)
 			}
+		case <-customerOf(ctx).Done():
+			// the customer left, or a shutdown cut the wait (the cause says which): nothing more is asked
+			timer.Stop()
+			if room != nil {
+				room.Add(-1)
+			}
+			failed.last = fmt.Errorf("waiting to ask the route again: %w", context.Cause(customerOf(ctx)))
+			return nil, failed
 		case <-ctx.Done():
-			// the customer left, or a shutdown cut the wait: nothing more is asked
+			// a shutdown cut the wait: nothing more is asked
 			timer.Stop()
 			if room != nil {
 				room.Add(-1)
@@ -1420,6 +1464,14 @@ func (s *Server) askUpstreams(ctx context.Context, route *Route, fields map[stri
 	for i := range route.Upstreams {
 		upstream := &route.Upstreams[i]
 		last := i == len(route.Upstreams)-1
+		if left(ctx) {
+			// the customer left (or a shutdown cut the request) before this upstream was asked: it is not asked
+			if failed.last == nil {
+				failed.last = fmt.Errorf("%s: not asked: %w", upstream.Name, context.Canceled)
+			}
+			failed.waited = time.Since(began)
+			return nil, failed, 0, false, nil
+		}
 		if images && !upstream.Images {
 			// Images go only where they were measured to be read: an endpoint that drops them is never asked.
 			failed.skipped = append(failed.skipped, upstream.Name+" (no lee imágenes)")
@@ -1517,7 +1569,7 @@ func (s *Server) askUpstreams(ctx context.Context, route *Route, fields map[stri
 			failed.attempts = append(failed.attempts, upstream.Name+" ("+reason+")")
 			failed.last = fmt.Errorf("%s: %s: %w", upstream.Name, reason, err)
 			s.settings.Logger.Printf("request=%s upstream=%s %s, trying next", requestID, upstream.Name, reason)
-			if ctx.Err() != nil {
+			if left(ctx) {
 				failed.waited = time.Since(began)
 				return nil, failed, 0, false, nil
 			}
@@ -1555,6 +1607,11 @@ func (s *Server) askUpstreams(ctx context.Context, route *Route, fields map[stri
 			endCall(nil)
 			failed.attempts = append(failed.attempts, upstream.Name+" ("+reason+")")
 			failed.last = fmt.Errorf("%s: %s", upstream.Name, reason)
+			if left(ctx) {
+				// nobody waits for the answer any more: the next upstream is not asked
+				failed.waited = time.Since(began)
+				return nil, failed, 0, false, nil
+			}
 			s.settings.Logger.Printf("request=%s upstream=%s %s, trying next", requestID, upstream.Name, reason)
 			continue
 		}
@@ -1622,7 +1679,7 @@ func statusReason(status int, code string) string {
 // request's patience.
 func (s *Server) another(ctx context.Context, began time.Time, end roundEnd) (time.Duration, bool) {
 	patience := s.settings.Patience
-	if patience.Budget < 0 || !end.passing || ctx.Err() != nil {
+	if patience.Budget < 0 || !end.passing || left(ctx) {
 		return 0, false
 	}
 	// Whether the wait fits is decided on the wait itself; the jitter then spreads it within what is
@@ -2190,4 +2247,20 @@ func (h *heldWhole) is(account string, now time.Time) bool {
 		return false
 	}
 	return held
+}
+
+// customerKey carries, in the context a call to a host runs under, the context of the customer who asked.
+type customerKey struct{}
+
+// customerOf is the customer's own context: it ends when the customer leaves. A context that carries none is its own.
+func customerOf(ctx context.Context) context.Context {
+	if customer, ok := ctx.Value(customerKey{}).(context.Context); ok {
+		return customer
+	}
+	return ctx
+}
+
+// left is true once nobody waits for the request any more: its customer left, or its context ended.
+func left(ctx context.Context) bool {
+	return ctx.Err() != nil || customerOf(ctx).Err() != nil
 }

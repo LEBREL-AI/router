@@ -1214,7 +1214,7 @@ func TestCustomersLeavingUnansweredAfterALongWaitAlertTheOperator(t *testing.T) 
 	slow := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() })
 	var mu sync.Mutex
 	var alerts []string
-	h := newHarnessWith(t, routeFor(upstream("alibaba/model-studio", slow.server.URL, 1)), board, func(s *Settings) {
+	h := newHarnessWith(t, routeFor(quick(upstream("alibaba/model-studio", slow.server.URL, 1))), board, func(s *Settings) {
 		s.Alert = func(text string) { mu.Lock(); alerts = append(alerts, text); mu.Unlock() }
 		s.AbandonAfter = 100 * time.Millisecond
 	})
@@ -1240,7 +1240,7 @@ func TestACustomerWhoHangsUpBeforeTheAnswerIsNoOutage(t *testing.T) {
 	slow := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() })
 	var mu sync.Mutex
 	var alerts []string
-	h := newHarnessWith(t, routeFor(upstream("alibaba/model-studio", slow.server.URL, 1)), board, func(s *Settings) {
+	h := newHarnessWith(t, routeFor(quick(upstream("alibaba/model-studio", slow.server.URL, 1))), board, func(s *Settings) {
 		s.Alert = func(text string) { mu.Lock(); alerts = append(alerts, text); mu.Unlock() }
 	})
 	body := `{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi there"}],"temperature":0}`
@@ -1385,4 +1385,11 @@ func TestTheLongTimeoutIsCheckedWhenTheRoutesAreRead(t *testing.T) {
 	if err := good.validate(); err != nil {
 		t.Fatalf("a valid long timeout refused: %v", err)
 	}
+}
+
+// quick gives an upstream one second to answer: a call to a host is seen to its end even when the customer has
+// left, so a test whose host never answers waits for the host's own time.
+func quick(u Upstream) Upstream {
+	u.TimeoutSeconds = 1
+	return u
 }

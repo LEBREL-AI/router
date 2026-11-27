@@ -252,7 +252,11 @@ A chat completion goes to its host as the route allows, not as it came (release 
 - **A host's count is read in full.** What it reports past the prompt beyond `completion_tokens` is billed as
   output, and of several usage blocks in one stream the larger counts stand. An answer whose host counted more
   than the request's envelope is charged what the host counted, up to the amount held for the request and never
-  above it; when the hold did not cover it, the operator is told. A count that cannot
+  above it; when the hold did not cover it, the operator is told.
+- **A call to a host outlives the customer who asked.** A host that was sent a request reads its prompt and writes
+  its answer whether or not anybody waits. A whole (non-streamed) answer the customer did not wait for is read to
+  its end and charged as the host counted it; a stream the customer left before it began is closed as soon as the
+  host takes it, and its prompt is charged. No other upstream is asked for a customer who has left. A count that cannot
   be one (no prompt tokens, a trillion of them) is no count. An account whose prompt a host counted beyond its hold
   is held for a day at the most a prompt can be counted at, a token a byte.
 
