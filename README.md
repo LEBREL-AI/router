@@ -226,6 +226,32 @@ public holidays listed. `python3 scripts/platform_config.py routes.production.js
 https://<router origin>` prints the three platform variables whose hashes match the
 router's (`TestPrintBillingHashes`).
 
+## What a request carries upstream
+
+A chat completion goes to its host as the route allows, not as it came (release 1.4.3, 27 November 2026).
+
+- **The output cap bounds everything a host writes.** The cap (`max_tokens` or `max_completion_tokens`, or the
+  route's default when a request names neither) is sent under both names. Measured on every production upstream:
+  together they are one cap on reasoning and answer alike; alone, Z.ai's API ignores `max_completion_tokens` and
+  Alibaba's Qwen3.8 counts its reasoning outside `max_tokens`. DeepSeek's own API, the one upstream that could not
+  be measured with both, is sent `max_tokens`, which it documents as covering both. A request with a small cap and
+  reasoning on may therefore end inside its reasoning (`finish_reason: length`), as it does on the labs' own APIs.
+- **Listed fields are forwarded** (`internal/router/fields.go`: sampling, tools, the shape of the answer, the labs'
+  reasoning switches). **A feature the routes do not offer is refused** when a request asks for it: web search
+  (`enable_search`, `web_search_options`, `plugins`), a code interpreter, audio, predicted outputs, tools that are
+  not functions. **Any other field is left out**, and the answer says which in `X-Lebrel-Ignored-Fields`.
+- **A message's content is text and images.** A part of another type (video, audio, a file) is refused: no route
+  has a price for it. An image part goes on as its address or its inline data and nothing else; options that
+  change what a picture costs stay behind.
+- **A PDF is read in a process of its own**, with a ceiling on its memory, its stack and its processor time and a
+  deadline. A file written to hurt its reader ends that process, and the request is told the PDF could not be read.
+- **A key's turns are taken before a request is read**, in the Messages and Responses formats too, and the files
+  one request names are bounded: 32 by address, 32 documents, 8 MB of document text, 60 seconds for all of them.
+  Files are fetched from public addresses, on the ports the web is served from.
+- **A host's count is read in full.** What it reports past the prompt beyond `completion_tokens` is billed as
+  output, and of several usage blocks in one stream the larger counts stand. An answer whose host counted more
+  than the request was held for is charged the reserved maximum, and the operator is told.
+
 ## Settlement is owed, never waited for
 
 The money of a request is decided when the upstream answers; telling the control plane is
