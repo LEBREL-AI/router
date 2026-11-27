@@ -251,7 +251,8 @@ A chat completion goes to its host as the route allows, not as it came (release 
   an allowance per account, and one PDF is read at a time for an account.
 - **A host's count is read in full.** What it reports past the prompt beyond `completion_tokens` is billed as
   output, and of several usage blocks in one stream the larger counts stand. An answer whose host counted more
-  than the request was held for is charged the reserved maximum, and the operator is told. A count that cannot
+  than the request's envelope is charged what the host counted, up to the amount held for the request and never
+  above it; when the hold did not cover it, the operator is told. A count that cannot
   be one (no prompt tokens, a trillion of them) is no count. An account whose prompt a host counted beyond its hold
   is held for a day at the most a prompt can be counted at, a token a byte.
 

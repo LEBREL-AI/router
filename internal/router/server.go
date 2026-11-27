@@ -1155,9 +1155,9 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 	started := s.settings.Now()
 	var cut bool
 	if info.Stream {
-		cut = s.finishStream(w, response, upstream, route, pricing, queue, info, percent, promptEstimate, receipt, settle, requestID, started, principal.AccountID)
+		cut = s.finishStream(w, response, upstream, route, pricing, queue, info, percent, promptEstimate, receipt, settle, requestID, started, principal.AccountID, amount)
 	} else {
-		cut = s.finishBuffered(w, response, upstream, route, pricing, queue, info, percent, receipt, settle, requestID, started, principal.AccountID)
+		cut = s.finishBuffered(w, response, upstream, route, pricing, queue, info, percent, receipt, settle, requestID, started, principal.AccountID, amount)
 	}
 	if cut {
 		s.noteCut(reservation.ID)
@@ -1689,18 +1689,22 @@ func (s *Server) noteFallback(route *Route, upstream *Upstream, skipped []string
 	})
 }
 
-// noteBeyondHold records an answer whose host counted more than the request was held for: more output than
-// the cap it was given, or more prompt than the estimate with its margin. The customer is charged the reserved
-// maximum and the rest is Lebrel's, so each one is worth the operator's look: a host that stopped honouring the
-// cap, a kind of text the estimate reads short, or somebody trying. Counts only, never content.
-func (s *Server) noteBeyondHold(route *Route, upstream *Upstream, info meter.RequestInfo, usage model.Usage, requestID, account string) {
+// noteBeyondHold records an answer whose host counted more than the request's envelope: more output than the cap
+// it was given, or more prompt than the estimate with its margin. The customer is charged what the host counted,
+// up to the amount held; what the hold did not cover is Lebrel's, and only then is the operator told: a host that
+// stopped honouring the cap, a kind of text the estimate reads short, or somebody trying. Counts only, never content.
+func (s *Server) noteBeyondHold(route *Route, upstream *Upstream, pricing meter.Pricing, queue model.QueueClass, percent int64, info meter.RequestInfo, usage model.Usage, charged int64, requestID, account string) {
 	if usage.PromptTokens > info.EstimatedPromptTokens {
 		s.heldWhole.set(account, s.settings.Now().Add(heldWholeFor))
 	}
-	s.settings.Logger.Printf("request=%s model=%s upstream=%s counted beyond the hold: prompt=%d of %d held, completion=%d of %d held", requestID, route.ModelID, upstream.Name,
-		usage.PromptTokens, info.EstimatedPromptTokens, usage.CompletionTokens, info.MaxOutputTokens)
+	priced, _ := pricing.ActualScaled(usage, queue, percent)
+	s.settings.Logger.Printf("request=%s model=%s upstream=%s counted beyond the envelope: prompt=%d of %d, completion=%d of %d, charged=%d of %d", requestID, route.ModelID, upstream.Name,
+		usage.PromptTokens, info.EstimatedPromptTokens, usage.CompletionTokens, info.MaxOutputTokens, charged, priced)
+	if priced <= charged {
+		return
+	}
 	s.alertThrottled("beyond-hold:"+route.ModelID, func(count int) string {
-		return fmt.Sprintf("%s: %s contó más de lo reservado (prompt %d de %d reservados, salida %d de %d). %d respuestas así en esta ruta desde el último aviso (avisa como mucho cada 10 min): al cliente se le cobra el máximo reservado y la diferencia la paga Lebrel. 👉 Si se repite, mira si el proveedor respeta el tope o si alguien lo está buscando.",
+		return fmt.Sprintf("%s: %s contó más de lo retenido (prompt %d de %d reservados, salida %d de %d). %d respuestas así en esta ruta desde el último aviso (avisa como mucho cada 10 min): al cliente se le cobra lo retenido y la diferencia la paga Lebrel. 👉 Si se repite, mira si el proveedor respeta el tope o si alguien lo está buscando.",
 			route.Name(), upstream.Name, usage.PromptTokens, info.EstimatedPromptTokens, usage.CompletionTokens, info.MaxOutputTokens, count)
 	})
 }
@@ -1921,7 +1925,7 @@ func extractAssistant(body []byte) assistantContent {
 
 // finishBuffered relays a whole answer at once; true when a shutdown cut it before it was read.
 func (s *Server) finishBuffered(w http.ResponseWriter, response *http.Response, upstream *Upstream, route *Route, pricing meter.Pricing,
-	queue model.QueueClass, info meter.RequestInfo, percent int64, receipt ReceiptInput, settle func(int64, model.Usage, model.SettlementOutcome), requestID string, started time.Time, account string) bool {
+	queue model.QueueClass, info meter.RequestInfo, percent int64, receipt ReceiptInput, settle func(int64, model.Usage, model.SettlementOutcome), requestID string, started time.Time, account string, held int64) bool {
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxUpstreamBodyBytes))
 	if err != nil {
 		if s.cutCtx.Err() != nil {
@@ -1937,9 +1941,9 @@ func (s *Server) finishBuffered(w http.ResponseWriter, response *http.Response, 
 		return false
 	}
 	usage, exact := ParseUsage(upstream.UsageFormat, body)
-	actual, billed, outcome := s.charge(pricing, queue, info, percent, usage, exact)
-	if exact && outcome != model.SettlementSucceeded {
-		s.noteBeyondHold(route, upstream, info, usage, requestID, account)
+	actual, billed, outcome, beyond := s.charge(pricing, queue, info, percent, usage, exact, held)
+	if beyond {
+		s.noteBeyondHold(route, upstream, pricing, queue, percent, info, usage, actual, requestID, account)
 	}
 	exact = outcome == model.SettlementSucceeded
 	settle(actual, billed, outcome)
@@ -1964,28 +1968,30 @@ func (s *Server) finishBuffered(w http.ResponseWriter, response *http.Response, 
 	return false
 }
 
-// charge mirrors the control plane's envelope rule: inside the reserved envelope the exact
-// usage is billed, never more than the reserved maximum; usage that does not fit the envelope
-// (a provider counting far more prompt tokens than our estimate) is settled as usage_missing,
-// which charges the maximum under the "reserved" policy. Either way the client never pays
-// more than the envelope it was quoted.
-func (s *Server) charge(pricing meter.Pricing, queue model.QueueClass, info meter.RequestInfo, percent int64, usage model.Usage, exact bool) (int64, model.Usage, model.SettlementOutcome) {
+// charge mirrors the control plane's rule for a routed model. Inside the reserved envelope the exact usage is
+// billed, never more than the reserved maximum. Past it (the provider counted more prompt than the estimate with
+// its margin, or wrote more than the cap it was given) the exact usage is billed too, up to the amount held for
+// the request: what the customer set aside, and never more. An answer with no usage to go by is charged the
+// reserved maximum (the contract's "reserved" policy). beyond says the usage was past the envelope.
+func (s *Server) charge(pricing meter.Pricing, queue model.QueueClass, info meter.RequestInfo, percent int64, usage model.Usage, exact bool, held int64) (actual int64, billed model.Usage, outcome model.SettlementOutcome, beyond bool) {
 	maximum, _ := pricing.MaximumScaled(info, queue, percent)
-	if exact && usage.CompletionTokens <= info.MaxOutputTokens && usage.PromptTokens+usage.CompletionTokens <= info.EstimatedPromptTokens+info.MaxOutputTokens {
-		if actual, err := pricing.ActualScaled(usage, queue, percent); err == nil {
-			if actual > maximum {
-				actual = maximum
+	if exact {
+		if priced, err := pricing.ActualScaled(usage, queue, percent); err == nil {
+			inside := usage.CompletionTokens <= info.MaxOutputTokens && usage.PromptTokens+usage.CompletionTokens <= info.EstimatedPromptTokens+info.MaxOutputTokens
+			limit := maximum
+			if !inside {
+				limit = held
 			}
-			return actual, usage, model.SettlementSucceeded
+			return min(priced, limit), usage, model.SettlementSucceeded, !inside
 		}
 	}
-	return maximum, model.Usage{}, model.SettlementUsageMissing
+	return maximum, model.Usage{}, model.SettlementUsageMissing, false
 }
 
 // finishStream relays an answer event by event; true when a shutdown cut it before its end.
 func (s *Server) finishStream(w http.ResponseWriter, response *http.Response, upstream *Upstream, route *Route, pricing meter.Pricing,
 	queue model.QueueClass, info meter.RequestInfo, percent int64, promptEstimate int64, receipt ReceiptInput, settle func(int64, model.Usage, model.SettlementOutcome),
-	requestID string, started time.Time, account string) bool {
+	requestID string, started time.Time, account string, held int64) bool {
 	flusher, _ := w.(http.Flusher)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -2105,9 +2111,10 @@ func (s *Server) finishStream(w http.ResponseWriter, response *http.Response, up
 		var billed model.Usage
 		var outcome model.SettlementOutcome
 		exact = sawUsage && sawDone && !clientGone
-		actual, billed, outcome = s.charge(pricing, queue, info, percent, usage, exact)
-		if exact && outcome != model.SettlementSucceeded {
-			s.noteBeyondHold(route, upstream, info, usage, requestID, account)
+		var beyond bool
+		actual, billed, outcome, beyond = s.charge(pricing, queue, info, percent, usage, exact, held)
+		if beyond {
+			s.noteBeyondHold(route, upstream, pricing, queue, percent, info, usage, actual, requestID, account)
 		}
 		exact = outcome == model.SettlementSucceeded
 		settle(actual, billed, outcome)

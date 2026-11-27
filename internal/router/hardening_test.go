@@ -272,7 +272,7 @@ func TestAStreamIsChargedByItsLargestCountAndAHostBeyondTheHoldIsTold(t *testing
 	flushed(t, h.settlements)
 	mu.Lock()
 	defer mu.Unlock()
-	if len(alerts) != 1 || !strings.Contains(alerts[0], "contó más de lo reservado") || !strings.Contains(alerts[0], "salida 900 de 16") || strings.Contains(alerts[0], "hi") && strings.Contains(alerts[0], "content") {
+	if len(alerts) != 1 || !strings.Contains(alerts[0], "contó más de lo retenido") || !strings.Contains(alerts[0], "salida 900 de 16") || strings.Contains(alerts[0], "hi") && strings.Contains(alerts[0], "content") {
 		t.Fatalf("alerts %q", alerts)
 	}
 }
@@ -528,12 +528,13 @@ func TestAnAccountWhosePromptWasCountedBeyondItsHoldIsHeldWholeAfterwards(t *tes
 		receipt, _ := h.receipts.Get(response.Header.Get("X-Request-ID"))
 		return before - h.balance(t), receipt.Payload["usage_exact"] == true
 	}
+	// 60,000-odd tokens at 0.1575 microUSD are about 9,470; the first request was held for 22,500 of them and half as
+	// much again, and is charged all of that hold and no more
 	first, exact := ask()
-	if exact {
-		t.Fatalf("the first dense prompt fitted its hold: charged %d", first)
+	if !exact || first >= 9_400 || first < 5_000 {
+		t.Fatalf("the first dense prompt: charged %d, exact %v: it pays what was held for it", first, exact)
 	}
 	second, exact := ask()
-	// 60,000-odd tokens at 0.1575 microUSD: about 9,470, where the first paid for 22,500 of them
 	if !exact || second < 9_400 || second <= first {
 		t.Fatalf("the second dense prompt: charged %d (the first %d), exact %v: it is held whole and pays what the host counted", second, first, exact)
 	}
@@ -561,5 +562,45 @@ func TestTheEditionDoesNotReasonForAClientThatSaidNo(t *testing.T) {
 		if got := clientTurnedThinkingOff(test.format, test.request); got != test.off {
 			t.Errorf("%s: thinking off %v, want %v", name, got, test.off)
 		}
+	}
+}
+
+func TestUsagePastTheEnvelopeIsChargedAsCountedUpToTheHold(t *testing.T) {
+	var mu sync.Mutex
+	var alerts []string
+	ask := func(usage string, cap int) (int64, bool) {
+		up := newFakeUpstream(t, okJSON(usage))
+		h := newHarnessWith(t, routeFor(upstream("deepseek/api", up.server.URL, 1)), "", func(s *Settings) {
+			s.Alert = func(text string) { mu.Lock(); alerts = append(alerts, text); mu.Unlock() }
+		})
+		before := h.balance(t)
+		response, raw := postJSON(t, h, chat(map[string]any{"max_tokens": cap}))
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("status %d: %s", response.StatusCode, raw)
+		}
+		receipt, _ := h.receipts.Get(response.Header.Get("X-Request-ID"))
+		return before - h.balance(t), receipt.Payload["usage_exact"] == true
+	}
+	// A little more output than the cap: what the host wrote is charged, not the reserved maximum, and nobody is told.
+	// 12 prompt * 0.1575 + 20 output * 0.63 = 14.49 microUSD
+	if charged, exact := ask(`{"prompt_tokens":12,"completion_tokens":20,"total_tokens":32}`, 16); charged != 15 || !exact {
+		t.Fatalf("20 tokens written for a cap of 16: charged %d, exact %v, want 15 as counted", charged, exact)
+	}
+	mu.Lock()
+	quiet := len(alerts) == 0
+	mu.Unlock()
+	if !quiet {
+		t.Fatalf("an answer paid in full told the operator: %q", alerts)
+	}
+	// Far more than the hold: the hold is charged, all of it and nothing above it, and the operator is told.
+	// held: (125 prompt * 0.1575 + 16 output * 0.63) * 1.5 = 44.65, rounded up
+	charged, exact := ask(`{"prompt_tokens":12,"completion_tokens":9000,"total_tokens":9012}`, 16)
+	if charged != 45 || !exact {
+		t.Fatalf("9,000 tokens written for a cap of 16: charged %d, exact %v, want the 45 held", charged, exact)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(alerts) != 1 || !strings.Contains(alerts[0], "salida 9000 de 16") {
+		t.Fatalf("alerts %q", alerts)
 	}
 }
