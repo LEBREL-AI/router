@@ -9,7 +9,6 @@ import (
 	"math"
 	"math/bits"
 	"strings"
-	"unicode/utf8"
 
 	"lebrel-router/internal/model"
 )
@@ -19,8 +18,8 @@ type RequestInfo struct {
 	Stream                bool
 	EstimatedPromptTokens int64
 	MaxOutputTokens       int64
-	// Images is how many image_url parts the request carries; the estimate leaves their data out (a picture's
-	// base64 is no text), and the caller adds what one image costs its model.
+	// Images is how many image_url parts the request's messages carry; the estimate leaves a picture's data
+	// out (its base64 is no text) and nothing else, and the caller adds what one image costs its model.
 	Images int64
 }
 
@@ -120,8 +119,8 @@ func InspectAndRequireUsage(completionPath string, body []byte, defaultMaxOutput
 		payload["stream_options"] = options
 	}
 
-	estimate := estimateValueTokens(payload) + 8
-	images := countImageParts(payload)
+	text, images := promptText(payload)
+	estimate := (text+3)/4 + 8
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return nil, RequestInfo{}, fmt.Errorf("encode request: %w", err)
@@ -135,26 +134,101 @@ func InspectAndRequireUsage(completionPath string, body []byte, defaultMaxOutput
 	}, nil
 }
 
-// countImageParts counts the image_url content parts of a request's messages.
-func countImageParts(value any) int64 {
+// promptText measures what of a request a model can be given to read, in bytes, and counts its images.
+//
+// Every byte of the request counts, wherever it sits: a field's name as much as its value, a number, an
+// object nested in a tool's parameters, a field no API documents. The request goes upstream as it came, and
+// a host writes into the prompt far more than the text of the messages (a tool's parameter names, a response
+// schema), so no place in a request holds text for free. The measure is the request as compact JSON with its
+// strings as they are.
+//
+// Only an image's own data is left out, and only where an image is one: the base64 of a data: URL in the
+// image_url of a part of a message's content. Each such part is an image (RequestInfo.Images), held for at
+// what one costs its model. "type": "image_url" anywhere else is a field like any other.
+func promptText(payload map[string]any) (int64, int64) {
+	text := jsonTextBytes(payload)
+	var images int64
+	messages, _ := payload["messages"].([]any)
+	for _, entry := range messages {
+		message, _ := entry.(map[string]any)
+		parts, _ := message["content"].([]any)
+		for _, entry := range parts {
+			part, _ := entry.(map[string]any)
+			if part["type"] != "image_url" {
+				continue
+			}
+			images++
+			text -= imageDataBytes(part["image_url"])
+		}
+	}
+	return text, images
+}
+
+// imageDataBytes is how many bytes of an image_url are a picture's data: what follows the comma of a
+// "data:image/...;base64," URL, when it is nothing but base64 (line breaks and blanks allowed, as the hosts
+// read it). An address, another media type (SVG is text), any other character: no picture, and it counts as text.
+func imageDataBytes(value any) int64 {
+	var address string
 	switch typed := value.(type) {
+	case map[string]any:
+		address, _ = typed["url"].(string)
+	case string:
+		address = typed
+	}
+	header, data, found := strings.Cut(address, ",")
+	if !found || len(header) > 64 {
+		return 0
+	}
+	header = strings.ToLower(header)
+	if !strings.HasPrefix(header, "data:image/") || !strings.HasSuffix(header, ";base64") || strings.HasPrefix(header, "data:image/svg") {
+		return 0
+	}
+	for i := 0; i < len(data); i++ {
+		switch c := data[i]; {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case c == '+', c == '/', c == '=', c == '-', c == '_':
+		case c == '\n', c == '\r', c == ' ', c == '\t':
+		default:
+			return 0
+		}
+	}
+	return int64(len(data))
+}
+
+// jsonTextBytes is the length of a decoded JSON value written compactly, its strings as they are.
+func jsonTextBytes(value any) int64 {
+	switch typed := value.(type) {
+	case nil:
+		return 4
+	case bool:
+		if typed {
+			return 4
+		}
+		return 5
+	case string:
+		return int64(len(typed)) + 2
+	case json.Number:
+		return int64(len(typed))
 	case []any:
-		var total int64
+		total := int64(2)
 		for _, item := range typed {
-			total += countImageParts(item)
+			total += jsonTextBytes(item) + 1
 		}
 		return total
 	case map[string]any:
-		if typed["type"] == "image_url" {
-			return 1
-		}
-		var total int64
-		for _, item := range typed {
-			total += countImageParts(item)
+		total := int64(2)
+		for key, item := range typed {
+			total += int64(len(key)) + 4 + jsonTextBytes(item)
 		}
 		return total
+	default:
+		// a value the router wrote itself (the output cap it made explicit): as the encoder writes it
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return 0
+		}
+		return int64(len(encoded))
 	}
-	return 0
 }
 
 func rejectDuplicateJSONKeys(body []byte) error {
@@ -493,38 +567,6 @@ func UsageFromJSON(data []byte) (model.Usage, bool) {
 		return model.Usage{}, false
 	}
 	return usage, true
-}
-
-func estimateValueTokens(value any) int64 {
-	switch typed := value.(type) {
-	case string:
-		runes := int64(utf8.RuneCountInString(typed))
-		if runes == 0 {
-			return 0
-		}
-		return (runes + 3) / 4
-	case []any:
-		var total int64
-		for _, item := range typed {
-			total += estimateValueTokens(item) + 1
-		}
-		return total
-	case map[string]any:
-		if typed["type"] == "image_url" {
-			// an image is counted apart (RequestInfo.Images): its data is no text
-			return 0
-		}
-		var total int64
-		for key, item := range typed {
-			if key == "max_tokens" || key == "max_completion_tokens" || key == "stream_options" {
-				continue
-			}
-			total += estimateValueTokens(item)
-		}
-		return total
-	default:
-		return 0
-	}
 }
 
 func jsonNumberToInt64(value any) (int64, error) {
