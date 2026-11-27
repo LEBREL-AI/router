@@ -15,7 +15,7 @@
 # Image digest: 1.3.7 (RELEASES.md), the first image that knows these settings.
 services:
   router:
-    image: ghcr.io/lebrel-ai/router@sha256:9eff8ce89042e4287c908cc27e213b6ef3a325423e880b3da19c72081e94c91e
+    image: ghcr.io/lebrel-ai/router@sha256:68095f3972e77610443785557e03a6c6388facfa9d909f70a0d6a268a09d8d9b
     restart: unless-stopped
     # DRAIN_SECONDS, then SHUTDOWN_SECONDS for the answers in flight, then what is owed goes out.
     stop_grace_period: 670s
