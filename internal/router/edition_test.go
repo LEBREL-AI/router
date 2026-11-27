@@ -68,6 +68,9 @@ func newFakeEdge(t *testing.T, modelID string, now func() time.Time) *fakeEdge {
 		case r.URL.Path == "/.well-known/proof-of-edition":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"payload":{"kind":"serving","model_id":"` + modelID + `"},"signature":"c2ln"}`))
+		case r.URL.Path == imageManifestPath:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"payload":{"edition":{"id":"lebrel/chroma1-hd"}},"signature":"c2ln"}`))
 		case strings.HasPrefix(r.URL.Path, "/v1/receipts/"):
 			id := strings.TrimPrefix(r.URL.Path, "/v1/receipts/")
 			w.Header().Set("Content-Type", "application/json")
@@ -132,6 +135,49 @@ func newFakeEdge(t *testing.T, modelID string, now func() time.Time) *fakeEdge {
 			ew.Header().Set("Content-Type", "application/json")
 			ew.WriteHeader(200)
 			_, _ = ew.Write([]byte(`{"id":"up-1","object":"chat.completion","model":"deepseek-v41","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"hello world"}}],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}`))
+		case r.URL.Path == imageGenerationPath:
+			// An image: the edge cannot read it; it holds its price by the key and the request's name, and the
+			// runtime behind it opens the request, draws and signs.
+			e.mu.Lock()
+			refuse, body := e.refuseOnce, e.refuseBody
+			e.refuseOnce = 0
+			e.mu.Unlock()
+			w.Header().Set("X-Request-ID", "img_hold_0001")
+			if refuse != 0 {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Retry-After", "2")
+				w.WriteHeader(refuse)
+				_, _ = w.Write([]byte(body))
+				return
+			}
+			current, _ := encryption.keys()
+			if r.Header.Get(editionKeyIDHeader) != current.keyID || !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(r.Header.Get(imageAskedHeader)) {
+				http.Error(w, `{"error":{"code":"encryption_required","message":"use the encrypted client"}}`, 400)
+				return
+			}
+			ciphertext, _ := io.ReadAll(r.Body)
+			r.Body = io.NopCloser(bytes.NewReader(ciphertext))
+			responseContext, err := current.identity.DecryptRequestWithContext(r)
+			if err != nil {
+				http.Error(w, `{"error":{"code":"invalid_ciphertext","message":"bad"}}`, 400)
+				return
+			}
+			plaintext, _ := io.ReadAll(r.Body)
+			var payload map[string]any
+			_ = json.Unmarshal(plaintext, &payload)
+			e.mu.Lock()
+			e.seen = append(e.seen, fakeEdgeRequest{headers: r.Header.Clone(), body: payload, raw: plaintext})
+			e.mu.Unlock()
+			ew, err := current.identity.SetupDerivedResponseEncryption(w, responseContext)
+			if err != nil {
+				http.Error(w, "encryption failed", 500)
+				return
+			}
+			ew.Header().Set(editionKeyIDHeader, current.keyID)
+			ew.Header().Set(receiptHeader, base64.StdEncoding.EncodeToString([]byte(`{"payload":{"kind":"receipt","of":"image"},"signature":"c2ln"}`)))
+			ew.Header().Set("Content-Type", "application/json")
+			ew.WriteHeader(200)
+			_, _ = ew.Write([]byte(`{"created":1900000000,"model":"lebrel/chroma1-hd","data":[{"b64_json":"QUJDRA=="}],"output_format":"webp","size":"1536x1024","quality":"hd","seed":7}`))
 		default:
 			http.NotFound(w, r)
 		}

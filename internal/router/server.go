@@ -367,7 +367,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	_, _, formatted := formatPath(path)
-	if (path == completionPath || formatted) && s.settings.DirectClients {
+	if (path == completionPath || path == imageGenerationPath || formatted) && s.settings.DirectClients {
 		// Browsers and tools call the machine directly: the same CORS the platform's edge offers.
 		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", "*")
@@ -390,6 +390,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleEncryptedCompletion(w, r, scoped)
 	case path == completionPath:
 		s.handleCompletion(w, r, scoped)
+	case path == imageGenerationPath && scoped == nil:
+		s.handleEditionImage(w, r)
+	case path == imageManifestPath && scoped == nil:
+		s.handleImageManifest(w, r)
 	case path == "/readyz":
 		s.handleReady(w, r, scoped)
 	case path == settlementHealthPath && scoped == nil:
@@ -2200,7 +2204,7 @@ func textOf(raw json.RawMessage) string {
 
 // publicDocumentPath is true for the signed documents anyone may read from any origin.
 func publicDocumentPath(path string) bool {
-	return path == "/.well-known/proof-of-edition" || path == AttestationPath || path == EncryptionMetadataPath || path == "/v1/models" || strings.HasPrefix(path, "/v1/receipts/")
+	return path == "/.well-known/proof-of-edition" || path == imageManifestPath || path == AttestationPath || path == EncryptionMetadataPath || path == "/v1/models" || strings.HasPrefix(path, "/v1/receipts/")
 }
 
 // boundedID keeps an upstream identifier printable and short enough for a receipt.
