@@ -186,6 +186,8 @@ type Server struct {
 	// peerKeys holds the receipt key each peer publishes, as last read (signedByPeer)
 	peerMu   sync.Mutex
 	peerKeys map[string]*peerKeyRead
+	// leftOut counts the request fields that were not forwarded (fields.go).
+	leftOut leftOutFields
 	// pauses holds what each upstream of each route said about its limit (patience.go); the map is
 	// built once and only read afterwards
 	pauses map[string]*pause
@@ -626,7 +628,7 @@ func (s *Server) handleSettlementHealth(w http.ResponseWriter, r *http.Request) 
 	if health.Status != "ok" {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"instance_id": s.settings.Signer.InstanceID, "signing_key_id": s.settings.Signer.KeyID, "settlements": health})
+	_ = json.NewEncoder(w).Encode(map[string]any{"instance_id": s.settings.Signer.InstanceID, "signing_key_id": s.settings.Signer.KeyID, "settlements": health, "fields_left_out": s.leftOut.snapshot()})
 }
 
 func (s *Server) manifest(route *Route) (SignedDocument, string, error) {
@@ -974,10 +976,20 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 		s.handleEditionCompletion(ctx, w, r, route, original, requestID)
 		return
 	}
-	normalized, info, err := meter.InspectAndRequireUsage(completionPath, original, route.DefaultMaxOutputTokens, route.MaxOutputTokens)
+	var leftOut []string
+	normalized, info, err := meter.Inspect(completionPath, original, route.DefaultMaxOutputTokens, route.MaxOutputTokens, func(payload map[string]any) error {
+		var err error
+		leftOut, err = chatPolicy(payload)
+		return err
+	})
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
+	}
+	if len(leftOut) > 0 {
+		// said to the customer, and counted for the operator by the names other APIs document (never a made-up one)
+		w.Header().Set(ignoredFieldsHeader, ignoredFieldsValue(leftOut))
+		s.leftOut.note(leftOut)
 	}
 	if info.Images > 0 {
 		// A model that reads no images is told so here, never sent one it would drop unseen (DeepSeek V4 Pro on
@@ -1665,6 +1677,19 @@ func (s *Server) noteFallback(route *Route, upstream *Upstream, skipped []string
 	})
 }
 
+// noteBeyondHold records an answer whose host counted more than the request was held for: more output than
+// the cap it was given, or more prompt than the estimate with its margin. The customer is charged the reserved
+// maximum and the rest is Lebrel's, so each one is worth the operator's look: a host that stopped honouring the
+// cap, a kind of text the estimate reads short, or somebody trying. Counts only, never content.
+func (s *Server) noteBeyondHold(route *Route, upstream *Upstream, info meter.RequestInfo, usage model.Usage, requestID string) {
+	s.settings.Logger.Printf("request=%s model=%s upstream=%s counted beyond the hold: prompt=%d of %d held, completion=%d of %d held", requestID, route.ModelID, upstream.Name,
+		usage.PromptTokens, info.EstimatedPromptTokens, usage.CompletionTokens, info.MaxOutputTokens)
+	s.alertThrottled("beyond-hold:"+route.ModelID, func(count int) string {
+		return fmt.Sprintf("%s: %s contó más de lo reservado (prompt %d de %d reservados, salida %d de %d). %d respuestas así en esta ruta desde el último aviso (avisa como mucho cada 10 min): al cliente se le cobra el máximo reservado y la diferencia la paga Lebrel. 👉 Si se repite, mira si el proveedor respeta el tope o si alguien lo está buscando.",
+			route.Name(), upstream.Name, usage.PromptTokens, info.EstimatedPromptTokens, usage.CompletionTokens, info.MaxOutputTokens, count)
+	})
+}
+
 // noteAbandoned records a customer who left after waiting AbandonAfter with no upstream answering.
 func (s *Server) noteAbandoned(route *Route) {
 	s.alertThrottled("abandoned:"+route.ModelID, func(count int) string {
@@ -1698,6 +1723,14 @@ func upstreamBody(normalized []byte, upstream *Upstream) ([]byte, error) {
 		return nil, err
 	}
 	payload["model"] = upstream.Model
+	if len(upstream.CapFields) == 1 {
+		// this endpoint is sent the cap under the one name it was measured, or is documented, to read
+		for _, name := range capFieldNames {
+			if name != upstream.CapFields[0] {
+				delete(payload, name)
+			}
+		}
+	}
 	translateDialect(payload, upstream.Dialect, upstream.ReasoningFixed, upstream.ReasoningEfforts)
 	for key, value := range upstream.Defaults {
 		if _, present := payload[key]; !present {
@@ -1890,6 +1923,9 @@ func (s *Server) finishBuffered(w http.ResponseWriter, response *http.Response, 
 	}
 	usage, exact := ParseUsage(upstream.UsageFormat, body)
 	actual, billed, outcome := s.charge(pricing, queue, info, percent, usage, exact)
+	if exact && outcome != model.SettlementSucceeded {
+		s.noteBeyondHold(route, upstream, info, usage, requestID)
+	}
 	exact = outcome == model.SettlementSucceeded
 	settle(actual, billed, outcome)
 	assistant := extractAssistant(body)
@@ -1966,6 +2002,9 @@ func (s *Server) finishStream(w http.ResponseWriter, response *http.Response, up
 					sawDone = true
 				} else if len(payload) > 0 {
 					if parsed, ok := ParseUsage(upstream.UsageFormat, payload); ok {
+						if sawUsage {
+							parsed = widerUsage(usage, parsed)
+						}
 						usage, sawUsage = parsed, true
 					}
 					var event struct {
@@ -2041,6 +2080,9 @@ func (s *Server) finishStream(w http.ResponseWriter, response *http.Response, up
 		var outcome model.SettlementOutcome
 		exact = sawUsage && sawDone && !clientGone
 		actual, billed, outcome = s.charge(pricing, queue, info, percent, usage, exact)
+		if exact && outcome != model.SettlementSucceeded {
+			s.noteBeyondHold(route, upstream, info, usage, requestID)
+		}
 		exact = outcome == model.SettlementSucceeded
 		settle(actual, billed, outcome)
 	}

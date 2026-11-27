@@ -207,6 +207,10 @@ type Upstream struct {
 	// together, or neither.
 	LongTimeoutSeconds int `json:"long_timeout_seconds,omitempty"`
 	LongBodyBytes      int `json:"long_body_bytes,omitempty"`
+	// CapFields names what this endpoint is sent of the output cap. A request carries the cap under both of its
+	// names (max_tokens and max_completion_tokens), which every endpoint measured takes together as one cap on all
+	// it writes; an endpoint that could not be measured with both is sent the one its lab documents. Empty: both.
+	CapFields []string `json:"cap_fields,omitempty"`
 	// Images marks an endpoint measured to read images: a request carrying one is sent only to such endpoints.
 	Images   bool   `json:"images,omitempty"`
 	DataNote string `json:"data_note,omitempty"`
@@ -215,7 +219,10 @@ type Upstream struct {
 // routerSetFields are request fields the router writes itself (the model id on every request, a cap on
 // the output and the usage option of a stream when the client names none) or every request carries (the
 // messages): an upstream that listed one as unsupported would be asked almost never, or never.
-var routerSetFields = map[string]bool{"model": true, "messages": true, "max_tokens": true, "stream_options": true}
+var routerSetFields = map[string]bool{"model": true, "messages": true, "max_tokens": true, "max_completion_tokens": true, "stream_options": true}
+
+// capFieldNames are the two names of the output cap.
+var capFieldNames = []string{"max_tokens", "max_completion_tokens"}
 
 // unsupportedName is what a refused field may be called: a plain identifier, written in the normalized
 // request exactly as listed (the JSON encoder escapes nothing in it), so the request can be searched for it.
@@ -398,6 +405,11 @@ func (r *Route) validate() error {
 				if serviceDomain(moved.Hostname()) != serviceDomain(parsed.Hostname()) {
 					return fmt.Errorf("upstream %q: %s must stay within %s", u.Name, u.BaseURLEnv, serviceDomain(parsed.Hostname()))
 				}
+			}
+		}
+		for i, field := range u.CapFields {
+			if (field != capFieldNames[0] && field != capFieldNames[1]) || (i > 0 && field == u.CapFields[0]) || i > 1 {
+				return fmt.Errorf("upstream %q: cap_fields names max_tokens, max_completion_tokens or both, each once", u.Name)
 			}
 		}
 		for _, effort := range u.ReasoningEfforts {

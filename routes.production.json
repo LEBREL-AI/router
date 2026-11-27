@@ -81,6 +81,7 @@
           "api_key_env": "DEEPSEEK_API_KEY",
           "priority": 3,
           "usage_format": "deepseek",
+          "cap_fields": ["max_tokens"],
           "data_note": "DeepSeek's own API, reached directly when neither Model Studio nor OpenRouter can answer; forwarded as-is (reasoning on by default, effort high)"
         }
       ],
@@ -158,6 +159,7 @@
           "api_key_env": "DEEPSEEK_API_KEY",
           "priority": 3,
           "usage_format": "deepseek",
+          "cap_fields": ["max_tokens"],
           "data_note": "DeepSeek's own API, reached directly when neither Model Studio nor OpenRouter can answer; forwarded as-is (reasoning on by default, effort high)"
         }
       ],

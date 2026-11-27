@@ -508,8 +508,22 @@ func TestParseUsageFormats(t *testing.T) {
 		t.Fatalf("openai format must ignore deepseek cache fields: %v", usage)
 	}
 	openai := []byte(`{"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":999,"prompt_tokens_details":{"cached_tokens":30}}}`)
-	if usage, ok := ParseUsage("openai", openai); !ok || usage.CachedTokens != 30 || usage.TotalTokens != 110 {
+	// what a host counts past the prompt beyond completion_tokens (reasoning it reports apart) is output all the same
+	if usage, ok := ParseUsage("openai", openai); !ok || usage.CachedTokens != 30 || usage.CompletionTokens != 899 || usage.TotalTokens != 999 {
 		t.Fatalf("openai usage %v", usage)
+	}
+	// a total that says less than its parts changes nothing
+	if usage, ok := ParseUsage("openai", []byte(`{"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":50}}`)); !ok || usage.CompletionTokens != 10 || usage.TotalTokens != 110 {
+		t.Fatalf("a short total: %v", usage)
+	}
+	// two blocks in one answer: the larger count of each kind stands, the cached share of the block that counted the prompt
+	wider := widerUsage(model.Usage{PromptTokens: 100, CompletionTokens: 40, CachedTokens: 60}, model.Usage{PromptTokens: 0, CompletionTokens: 0})
+	if wider.PromptTokens != 100 || wider.CompletionTokens != 40 || wider.CachedTokens != 60 || wider.TotalTokens != 140 {
+		t.Fatalf("a later block of zeros lowered the count: %v", wider)
+	}
+	wider = widerUsage(model.Usage{PromptTokens: 100, CompletionTokens: 5, CachedTokens: 60}, model.Usage{PromptTokens: 100, CompletionTokens: 40, CachedTokens: 0})
+	if wider.PromptTokens != 100 || wider.CompletionTokens != 40 || wider.CachedTokens != 0 || wider.TotalTokens != 140 {
+		t.Fatalf("the later of two equal prompt counts decides the cached share: %v", wider)
 	}
 	if _, ok := ParseUsage("openai", []byte(`{"usage":{"prompt_tokens":1}}`)); ok {
 		t.Fatal("incomplete usage must not parse")

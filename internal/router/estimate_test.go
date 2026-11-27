@@ -77,7 +77,7 @@ func TestARequestIsChargedInFullWhereverItsTextSits(t *testing.T) {
 		{name: "in a tool's parameter names", payload: base(map[string]any{"messages": message("hi"), "tools": lookup(names)})},
 		{name: "in a tool's parameter names, streamed", payload: base(map[string]any{"messages": message("hi"), "tools": lookup(names), "stream": true})},
 		{name: "in one parameter name", payload: base(map[string]any{"messages": message("hi"), "tools": lookup(map[string]any{document: map[string]any{}})})},
-		{name: "in a field nobody documents", payload: base(map[string]any{"messages": message("hi"), "notes": map[string]any{document: []any{document[:1000]}}})},
+		{name: "in a response schema's field names", payload: base(map[string]any{"messages": message("hi"), "response_format": map[string]any{"type": "json_schema", "json_schema": map[string]any{"name": "answer", "schema": map[string]any{"type": "object", "properties": names}}}})},
 		{name: "in a request marked as an image", payload: base(map[string]any{"messages": message(document), "type": "image_url"})},
 		{name: "in a message marked as an image", payload: base(map[string]any{"messages": []any{map[string]any{"role": "user", "type": "image_url", "content": document}}})},
 		{name: "in a request marked as an image, on a route that reads images", payload: base(map[string]any{"messages": message(document), "type": "image_url"}), images: true},
@@ -153,7 +153,7 @@ func TestAPictureIsHeldAsAPictureAndItsTextAsText(t *testing.T) {
 	// the same data where no picture is read is text, and the request no longer fits the model
 	h := newHarness(t, route, "")
 	hidden, _ := json.Marshal(map[string]any{"model": route.ModelID, "max_tokens": 1, "messages": []any{map[string]any{"role": "user", "content": "hi"}},
-		"tools": []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": strings.Repeat(picture, 3)}}}})
+		"tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": "lookup", "parameters": map[string]any{"type": "image_url", "image_url": map[string]any{"url": strings.Repeat(picture, 3)}}}}}})
 	response := h.post(t, string(hidden), testKey)
 	raw, _ := io.ReadAll(response.Body)
 	response.Body.Close()

@@ -66,6 +66,12 @@ func (p Pricing) Validate() error {
 }
 
 func InspectAndRequireUsage(completionPath string, body []byte, defaultMaxOutput, maxOutputTokens int64) ([]byte, RequestInfo, error) {
+	return Inspect(completionPath, body, defaultMaxOutput, maxOutputTokens, nil)
+}
+
+// Inspect reads a request, lets the caller settle what of it goes upstream (check may refuse the request or take
+// fields out of it), and measures what is left: the body it returns is the one the estimate was made of.
+func Inspect(completionPath string, body []byte, defaultMaxOutput, maxOutputTokens int64, check func(payload map[string]any) error) ([]byte, RequestInfo, error) {
 	if err := rejectDuplicateJSONKeys(body); err != nil {
 		return nil, RequestInfo{}, err
 	}
@@ -106,9 +112,23 @@ func InspectAndRequireUsage(completionPath string, body []byte, defaultMaxOutput
 			return nil, RequestInfo{}, errors.New("batched completion prompts are not supported")
 		}
 	}
+	if check != nil {
+		if err := check(payload); err != nil {
+			return nil, RequestInfo{}, err
+		}
+	}
 	maxOutput, err := effectiveMaxOutputTokens(completionPath, payload, defaultMaxOutput, maxOutputTokens)
 	if err != nil {
 		return nil, RequestInfo{}, err
+	}
+	if completionPath == "/v1/chat/completions" {
+		// The cap goes upstream under both of its names, whichever the client wrote. A host reads one, the other
+		// or both, and only together do they bound everything a host writes, its reasoning as much as its answer
+		// (measured on every production upstream, 27 November 2026: Z.ai's API ignores max_completion_tokens when
+		// it comes alone, and Alibaba's Qwen3.8 counts its reasoning outside max_tokens when that comes alone).
+		// An upstream measured to need one name is given that one (Upstream.CapFields).
+		payload["max_tokens"] = maxOutput
+		payload["max_completion_tokens"] = maxOutput
 	}
 	if stream {
 		options, _ := payload["stream_options"].(map[string]any)
