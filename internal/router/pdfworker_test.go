@@ -97,22 +97,34 @@ func TestThePDFReaderSaysWhyAPDFHasNoText(t *testing.T) {
 	}
 }
 
-func TestOnlyAFewPDFsAreReadAtATime(t *testing.T) {
-	oldWait := pdfWorkerWait
-	pdfWorkerWait = 300 * time.Millisecond
-	t.Cleanup(func() { pdfWorkerWait = oldWait })
-	for i := 0; i < pdfWorkersAtOnce; i++ {
-		pdfWorkerSlots <- struct{}{}
+func TestOnlyAFewPDFsAreReadAtATimeAndOnePerAccount(t *testing.T) {
+	oldWait, oldReaders := pdfWorkerWait, pdfReaders
+	pdfWorkerWait, pdfReaders = 300*time.Millisecond, newPDFTurns(2)
+	t.Cleanup(func() { pdfWorkerWait, pdfReaders = oldWait, oldReaders })
+	as := func(account string) context.Context {
+		return context.WithValue(context.Background(), mediaAccountKey{}, account)
 	}
-	_, err := isolatedPDFText(context.Background(), tinyPDF("hello"))
-	for i := 0; i < pdfWorkersAtOnce; i++ {
-		<-pdfWorkerSlots
+	// one account holds a reader: its second document waits and is told, another account's is read meanwhile
+	release, ok := pdfReaders.take(context.Background(), "acct_one")
+	if !ok {
+		t.Fatal("no reader for the first document")
 	}
+	_, err := isolatedPDFText(as("acct_one"), tinyPDF("hello"))
 	var refused *formatError
 	if !asFormatError(err, &refused) || !strings.Contains(refused.message, "send it again") {
+		t.Fatalf("an account's second document at once: %v", err)
+	}
+	if text, err := isolatedPDFText(as("acct_two"), tinyPDF("hello two")); err != nil || !strings.Contains(text, "hello two") {
+		t.Fatalf("another account's document meanwhile: %q, %v", text, err)
+	}
+	// every reader of the machine busy: a third account waits and is told
+	releaseTwo, _ := pdfReaders.take(context.Background(), "acct_two")
+	if _, err := isolatedPDFText(as("acct_three"), tinyPDF("hello")); !asFormatError(err, &refused) || !strings.Contains(refused.message, "send it again") {
 		t.Fatalf("with every reader busy: %v", err)
 	}
-	if text, err := isolatedPDFText(context.Background(), tinyPDF("hello again")); err != nil || !strings.Contains(text, "hello again") {
+	release()
+	releaseTwo()
+	if text, err := isolatedPDFText(as("acct_one"), tinyPDF("hello again")); err != nil || !strings.Contains(text, "hello again") {
 		t.Fatalf("once a reader is free: %q, %v", text, err)
 	}
 }

@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"runtime/debug"
+	"sync"
 	"time"
 )
 
@@ -30,17 +32,17 @@ const (
 	pdfWorkerStack  = 64 << 20
 	// pdfWorkerCPUSeconds bounds the reader's processor time (the kernel ends it past that).
 	pdfWorkerCPUSeconds = 10
-	// pdfWorkersAtOnce is how many readers run at a time on a machine; a document past that waits its turn.
-	pdfWorkersAtOnce = 2
-	pdfWorkerText    = 'T'
-	pdfWorkerRefusal = 'E'
+	pdfWorkerText       = 'T'
+	pdfWorkerRefusal    = 'E'
 )
 
 var (
 	// pdfWorkerTimeout is how long one PDF has, and pdfWorkerWait how long a document waits for a reader.
 	pdfWorkerTimeout = 15 * time.Second
 	pdfWorkerWait    = 30 * time.Second
-	pdfWorkerSlots   = make(chan struct{}, pdfWorkersAtOnce)
+	// pdfReaders are the readers of a machine: as many as it has processors, two at least, and one per account at
+	// a time, so that no account keeps the others' documents waiting.
+	pdfReaders = newPDFTurns(max(2, runtime.NumCPU()))
 	// pdfWorkerBinary is the binary started as a reader: the router's own.
 	pdfWorkerBinary = os.Executable
 )
@@ -87,12 +89,12 @@ func (c *cappedOutput) Write(p []byte) (int, error) {
 func isolatedPDFText(ctx context.Context, data []byte) (string, error) {
 	wait, stopWaiting := context.WithTimeout(ctx, pdfWorkerWait)
 	defer stopWaiting()
-	select {
-	case pdfWorkerSlots <- struct{}{}:
-		defer func() { <-pdfWorkerSlots }()
-	case <-wait.Done():
+	account, _ := ctx.Value(mediaAccountKey{}).(string)
+	release, ok := pdfReaders.take(wait, account)
+	if !ok {
 		return "", formatErrorf("the PDF could not be read now (too many documents are being read): send it again in a moment")
 	}
+	defer release()
 	binary, err := pdfWorkerBinary()
 	if err != nil {
 		return "", errors.New("pdf reader: " + err.Error())
@@ -119,4 +121,46 @@ func isolatedPDFText(ctx context.Context, data []byte) (string, error) {
 		return "", formatErrorf("%s", read[1:])
 	}
 	return "", formatErrorf("the PDF could not be read (it may be damaged)")
+}
+
+// pdfTurns gives out the machine's readers: at most limit at a time, and one per account.
+type pdfTurns struct {
+	mu      sync.Mutex
+	limit   int
+	running int
+	busy    map[string]bool
+	changed chan struct{}
+}
+
+func newPDFTurns(limit int) *pdfTurns {
+	return &pdfTurns{limit: limit, busy: make(map[string]bool), changed: make(chan struct{})}
+}
+
+// take waits for a reader until ctx ends. With no account (a test) only the machine's limit applies.
+func (p *pdfTurns) take(ctx context.Context, account string) (func(), bool) {
+	for {
+		p.mu.Lock()
+		if p.running < p.limit && (account == "" || !p.busy[account]) {
+			p.running++
+			if account != "" {
+				p.busy[account] = true
+			}
+			p.mu.Unlock()
+			return func() {
+				p.mu.Lock()
+				p.running--
+				delete(p.busy, account)
+				close(p.changed)
+				p.changed = make(chan struct{})
+				p.mu.Unlock()
+			}, true
+		}
+		changed := p.changed
+		p.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return nil, false
+		}
+	}
 }

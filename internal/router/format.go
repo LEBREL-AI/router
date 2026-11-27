@@ -110,6 +110,17 @@ func namesThinking(chat map[string]any) bool {
 	return false
 }
 
+// clientTurnedThinkingOff is whether a request says, as its format says it, that the model is not to reason:
+// Anthropic's thinking of type "disabled", or a Responses reasoning effort of "none".
+func clientTurnedThinkingOff(format formatKind, request map[string]any) bool {
+	if format == formatAnthropic {
+		thinking, _ := request["thinking"].(map[string]any)
+		return thinking["type"] == "disabled"
+	}
+	reasoning, _ := request["reasoning"].(map[string]any)
+	return reasoning["effort"] == "none"
+}
+
 // handleFormatted serves a Messages or Responses request: translated to a chat completion, run through
 // the ordinary completion handler, translated back. The key is checked before the body is read, as
 // the completion handler checks it, so an unauthenticated body costs nothing.
@@ -208,7 +219,7 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 	}
 	if err == nil {
 		// Images inline (fetched here when given by address) and documents as their text, as the route's model reads them.
-		err = s.resolveMedia(ctx, chat, route)
+		err = s.resolveMedia(context.WithValue(ctx, mediaAccountKey{}, principal.AccountID), chat, route)
 	}
 	if err != nil {
 		var invalid *formatError
@@ -224,7 +235,10 @@ func (s *Server) handleFormatted(w http.ResponseWriter, r *http.Request, scoped 
 		// The edition thinks only when asked, and coding agents never ask: unless the request names a
 		// thinking switch, it is turned on, as the local proxy turned it on. The priority tier is asked
 		// for with the header a tool can add.
-		if !namesThinking(chat) {
+		// A request that says no thinking in its own format's words gets none: it is billed as output.
+		if off := clientTurnedThinkingOff(format, request); off {
+			chat["thinking"] = false
+		} else if !namesThinking(chat) {
 			chat["thinking"] = true
 		}
 		if r.Header.Get(editionTierHeader) == "priority" {

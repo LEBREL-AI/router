@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -42,14 +43,17 @@ const (
 	// documentMaxPages and documentMaxBytes bound what is read of one document.
 	documentMaxPages = 1000
 	documentMaxBytes = 4 << 20
-	// mediaMaxFetches is how many files one request may name by address, and mediaResolveTimeout the time that
-	// fetching and reading all the files of one request may take.
-	mediaMaxFetches     = 32
+	// mediaResolveTimeout is the time that fetching and reading all the files of one request may take.
 	mediaResolveTimeout = 60 * time.Second
 	// documentsMax and documentsMaxBytes bound the documents of one request, and their text together (a model's
-	// whole context is about half of that).
-	documentsMax      = 32
+	// whole context is about half of that). Images are bounded by the route (max_images).
+	documentsMax      = 100
 	documentsMaxBytes = 8 << 20
+	// An account's files by address: fetchWindowFiles of them and fetchWindowBytes in all in any fetchWindow.
+	// Fetching is work done before a request is held for anything, so it has an allowance of its own.
+	fetchWindow      = 10 * time.Minute
+	fetchWindowFiles = 128
+	fetchWindowBytes = 512 << 20
 	// documentPartType marks a document part between the translation of a request and the reading of its text.
 	documentPartType = "_lebrel_document"
 	// mediaUserAgent names the fetcher to the sites it fetches from.
@@ -387,17 +391,24 @@ func (s *Server) resolveMedia(ctx context.Context, chat map[string]any, route *R
 	ctx, stop := context.WithTimeout(ctx, mediaResolveTimeout)
 	defer stop()
 	messages, _ := chat["messages"].([]map[string]any)
-	images, fetches, documents, text := 0, 0, 0, 0
+	images, documents, text := 0, 0, 0
 	fetched := int64(0)
 	budget := s.settings.MaxRequestBytes
-	byAddress := func(size int) error {
-		fetches++
-		fetched += int64(size)
-		if fetches > mediaMaxFetches {
-			return formatErrorf("a request may name at most %d files by address", mediaMaxFetches)
+	account, _ := ctx.Value(mediaAccountKey{}).(string)
+	// named is asked before a file is fetched, took after: the request's own ceiling and the account's allowance
+	named := func() error {
+		if !s.fetchAllowance.take(account, 1, 0, time.Now()) {
+			return formatErrorf("this account has had too many files fetched by address in the last minutes: send them inline, or wait a few minutes")
 		}
+		return nil
+	}
+	took := func(size int) error {
+		fetched += int64(size)
 		if budget > 0 && fetched > budget {
 			return formatErrorf("the files a request names by address may be at most %d MB together", budget>>20)
+		}
+		if !s.fetchAllowance.take(account, 0, int64(size), time.Now()) {
+			return formatErrorf("this account has had too many files fetched by address in the last minutes: send them inline, or wait a few minutes")
 		}
 		return nil
 	}
@@ -421,17 +432,16 @@ func (s *Server) resolveMedia(ctx context.Context, chat map[string]any, route *R
 				inner, _ := object["image_url"].(map[string]any)
 				address, _ := inner["url"].(string)
 				if !strings.HasPrefix(address, "data:") {
-					if err := byAddress(0); err != nil {
+					if err := named(); err != nil {
 						return err
 					}
 					data, _, err := s.fetchMedia(ctx, address)
 					if err != nil {
 						return err
 					}
-					if err := byAddress(len(data)); err != nil {
+					if err := took(len(data)); err != nil {
 						return err
 					}
-					fetches--
 					inline, err := imageDataURL(data)
 					if err != nil {
 						return err
@@ -444,8 +454,8 @@ func (s *Server) resolveMedia(ctx context.Context, chat map[string]any, route *R
 				if documents > documentsMax {
 					return formatErrorf("a request may carry at most %d documents", documentsMax)
 				}
-				if _, named := object["url"].(string); named {
-					if err := byAddress(0); err != nil {
+				if _, byAddress := object["url"].(string); byAddress {
+					if err := named(); err != nil {
 						return err
 					}
 				}
@@ -486,6 +496,10 @@ func (s *Server) documentPartText(ctx context.Context, part map[string]any) (str
 	if err != nil {
 		return "", err
 	}
+	account, _ := ctx.Value(mediaAccountKey{}).(string)
+	if !s.fetchAllowance.take(account, 0, int64(len(data)), time.Now()) {
+		return "", formatErrorf("this account has had too many files fetched by address in the last minutes: send them inline, or wait a few minutes")
+	}
 	if mediaType == "" {
 		mediaType = served
 	}
@@ -504,4 +518,46 @@ func joinedIfText(parts []any) any {
 		texts = append(texts, text)
 	}
 	return strings.Join(texts, "\n")
+}
+
+// mediaAccountKey carries the account a request's files are fetched and read for.
+type mediaAccountKey struct{}
+
+// fetchAllowance is what each account has had fetched by address lately. With no account (a test) nothing is counted.
+type fetchAllowance struct {
+	mu      sync.Mutex
+	windows map[string]*fetchUse
+}
+
+type fetchUse struct {
+	since time.Time
+	files int
+	bytes int64
+}
+
+// take counts files and bytes for an account and says whether it is still within its allowance.
+func (a *fetchAllowance) take(account string, files int, bytes int64, now time.Time) bool {
+	if account == "" {
+		return true
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.windows == nil {
+		a.windows = make(map[string]*fetchUse)
+	}
+	if len(a.windows) > 10_000 {
+		for name, use := range a.windows {
+			if now.Sub(use.since) > fetchWindow {
+				delete(a.windows, name)
+			}
+		}
+	}
+	use := a.windows[account]
+	if use == nil || now.Sub(use.since) > fetchWindow {
+		use = &fetchUse{since: now}
+		a.windows[account] = use
+	}
+	use.files += files
+	use.bytes += bytes
+	return use.files <= fetchWindowFiles && use.bytes <= fetchWindowBytes
 }

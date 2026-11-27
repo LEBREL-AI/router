@@ -18,6 +18,9 @@ type RequestInfo struct {
 	Stream                bool
 	EstimatedPromptTokens int64
 	MaxOutputTokens       int64
+	// TextBytes is the request's text in bytes, what the estimate is a quarter of. No host counts more tokens
+	// than bytes, so it is also the most the prompt can be counted at.
+	TextBytes int64
 	// Images is how many image_url parts the request's messages carry; the estimate leaves a picture's data
 	// out (its base64 is no text) and nothing else, and the caller adds what one image costs its model.
 	Images int64
@@ -150,6 +153,7 @@ func Inspect(completionPath string, body []byte, defaultMaxOutput, maxOutputToke
 		Stream:                stream,
 		EstimatedPromptTokens: estimate,
 		MaxOutputTokens:       maxOutput,
+		TextBytes:             text,
 		Images:                images,
 	}, nil
 }

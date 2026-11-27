@@ -188,6 +188,10 @@ type Server struct {
 	peerKeys map[string]*peerKeyRead
 	// leftOut counts the request fields that were not forwarded (fields.go).
 	leftOut leftOutFields
+	// heldWhole are the accounts whose prompts are held at a token a byte (handleCompletion).
+	heldWhole heldWhole
+	// fetchAllowance is what each account has had fetched by address lately (media.go).
+	fetchAllowance fetchAllowance
 	// pauses holds what each upstream of each route said about its limit (patience.go); the map is
 	// built once and only read afterwards
 	pauses map[string]*pause
@@ -1014,7 +1018,15 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 	}
 	defer s.boundWritesOnCut(w, grace)()
 	promptEstimate := info.EstimatedPromptTokens
-	info.EstimatedPromptTokens = generousEstimate(info.EstimatedPromptTokens)
+	if s.heldWhole.is(principal.AccountID, s.settings.Now()) {
+		// An account whose prompt a host counted beyond its hold is held, for a day, for the most a prompt can be
+		// counted at: a token a byte, and every image. Text can be written to count four times what the same bytes
+		// of prose do; once is told to the operator and is Lebrel's, and it is not sold short a second time.
+		// (with room for what the router itself writes into the request on its way out)
+		info.EstimatedPromptTokens = info.TextBytes + info.TextBytes/16 + 512 + info.Images*route.ImageTokens
+	} else {
+		info.EstimatedPromptTokens = generousEstimate(info.EstimatedPromptTokens)
+	}
 	if info.EstimatedTotalTokens() > route.MaxContextTokens {
 		info.EstimatedPromptTokens = route.MaxContextTokens - info.MaxOutputTokens
 	}
@@ -1143,9 +1155,9 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, scoped
 	started := s.settings.Now()
 	var cut bool
 	if info.Stream {
-		cut = s.finishStream(w, response, upstream, route, pricing, queue, info, percent, promptEstimate, receipt, settle, requestID, started)
+		cut = s.finishStream(w, response, upstream, route, pricing, queue, info, percent, promptEstimate, receipt, settle, requestID, started, principal.AccountID)
 	} else {
-		cut = s.finishBuffered(w, response, upstream, route, pricing, queue, info, percent, receipt, settle, requestID, started)
+		cut = s.finishBuffered(w, response, upstream, route, pricing, queue, info, percent, receipt, settle, requestID, started, principal.AccountID)
 	}
 	if cut {
 		s.noteCut(reservation.ID)
@@ -1681,7 +1693,10 @@ func (s *Server) noteFallback(route *Route, upstream *Upstream, skipped []string
 // the cap it was given, or more prompt than the estimate with its margin. The customer is charged the reserved
 // maximum and the rest is Lebrel's, so each one is worth the operator's look: a host that stopped honouring the
 // cap, a kind of text the estimate reads short, or somebody trying. Counts only, never content.
-func (s *Server) noteBeyondHold(route *Route, upstream *Upstream, info meter.RequestInfo, usage model.Usage, requestID string) {
+func (s *Server) noteBeyondHold(route *Route, upstream *Upstream, info meter.RequestInfo, usage model.Usage, requestID, account string) {
+	if usage.PromptTokens > info.EstimatedPromptTokens {
+		s.heldWhole.set(account, s.settings.Now().Add(heldWholeFor))
+	}
 	s.settings.Logger.Printf("request=%s model=%s upstream=%s counted beyond the hold: prompt=%d of %d held, completion=%d of %d held", requestID, route.ModelID, upstream.Name,
 		usage.PromptTokens, info.EstimatedPromptTokens, usage.CompletionTokens, info.MaxOutputTokens)
 	s.alertThrottled("beyond-hold:"+route.ModelID, func(count int) string {
@@ -1906,7 +1921,7 @@ func extractAssistant(body []byte) assistantContent {
 
 // finishBuffered relays a whole answer at once; true when a shutdown cut it before it was read.
 func (s *Server) finishBuffered(w http.ResponseWriter, response *http.Response, upstream *Upstream, route *Route, pricing meter.Pricing,
-	queue model.QueueClass, info meter.RequestInfo, percent int64, receipt ReceiptInput, settle func(int64, model.Usage, model.SettlementOutcome), requestID string, started time.Time) bool {
+	queue model.QueueClass, info meter.RequestInfo, percent int64, receipt ReceiptInput, settle func(int64, model.Usage, model.SettlementOutcome), requestID string, started time.Time, account string) bool {
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxUpstreamBodyBytes))
 	if err != nil {
 		if s.cutCtx.Err() != nil {
@@ -1924,7 +1939,7 @@ func (s *Server) finishBuffered(w http.ResponseWriter, response *http.Response, 
 	usage, exact := ParseUsage(upstream.UsageFormat, body)
 	actual, billed, outcome := s.charge(pricing, queue, info, percent, usage, exact)
 	if exact && outcome != model.SettlementSucceeded {
-		s.noteBeyondHold(route, upstream, info, usage, requestID)
+		s.noteBeyondHold(route, upstream, info, usage, requestID, account)
 	}
 	exact = outcome == model.SettlementSucceeded
 	settle(actual, billed, outcome)
@@ -1970,7 +1985,7 @@ func (s *Server) charge(pricing meter.Pricing, queue model.QueueClass, info mete
 // finishStream relays an answer event by event; true when a shutdown cut it before its end.
 func (s *Server) finishStream(w http.ResponseWriter, response *http.Response, upstream *Upstream, route *Route, pricing meter.Pricing,
 	queue model.QueueClass, info meter.RequestInfo, percent int64, promptEstimate int64, receipt ReceiptInput, settle func(int64, model.Usage, model.SettlementOutcome),
-	requestID string, started time.Time) bool {
+	requestID string, started time.Time, account string) bool {
 	flusher, _ := w.(http.Flusher)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -2017,6 +2032,12 @@ func (s *Server) finishStream(w http.ResponseWriter, response *http.Response, up
 								Content          string          `json:"content"`
 								ReasoningContent json.RawMessage `json:"reasoning_content"`
 								Reasoning        json.RawMessage `json:"reasoning"`
+								ToolCalls        []struct {
+									Function struct {
+										Name      string `json:"name"`
+										Arguments string `json:"arguments"`
+									} `json:"function"`
+								} `json:"tool_calls"`
 							} `json:"delta"`
 						} `json:"choices"`
 					}
@@ -2040,10 +2061,15 @@ func (s *Server) finishStream(w http.ResponseWriter, response *http.Response, up
 							if reasoning == "" {
 								reasoning = textOf(delta.Reasoning)
 							}
+							// a tool call is output the host wrote and bills, as its text and its reasoning are
+							called := 0
+							for _, call := range delta.ToolCalls {
+								called += utf8.RuneCountInString(call.Function.Name) + utf8.RuneCountInString(call.Function.Arguments)
+							}
 							text.WriteString(delta.Content)
-							if delta.Content != "" || reasoning != "" {
+							if delta.Content != "" || reasoning != "" || called > 0 {
 								events++
-								reasoningRunes += utf8.RuneCountInString(reasoning)
+								reasoningRunes += utf8.RuneCountInString(reasoning) + called
 							}
 						}
 					}
@@ -2081,7 +2107,7 @@ func (s *Server) finishStream(w http.ResponseWriter, response *http.Response, up
 		exact = sawUsage && sawDone && !clientGone
 		actual, billed, outcome = s.charge(pricing, queue, info, percent, usage, exact)
 		if exact && outcome != model.SettlementSucceeded {
-			s.noteBeyondHold(route, upstream, info, usage, requestID)
+			s.noteBeyondHold(route, upstream, info, usage, requestID, account)
 		}
 		exact = outcome == model.SettlementSucceeded
 		settle(actual, billed, outcome)
@@ -2124,4 +2150,37 @@ func boundedID(value string) string {
 		}
 	}
 	return value
+}
+
+// heldWholeFor is how long an account is held at a token a byte after a host counted its prompt beyond the hold.
+const heldWholeFor = 24 * time.Hour
+
+// heldWhole remembers, per account, until when its prompts are held at the most they can be counted at. It lives
+// in this instance's memory: the other instance learns it at its own first such answer.
+type heldWhole struct {
+	mu    sync.Mutex
+	until map[string]time.Time
+}
+
+func (h *heldWhole) set(account string, until time.Time) {
+	if account == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.until == nil {
+		h.until = make(map[string]time.Time)
+	}
+	h.until[account] = until
+}
+
+func (h *heldWhole) is(account string, now time.Time) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	until, held := h.until[account]
+	if held && !now.Before(until) {
+		delete(h.until, account)
+		return false
+	}
+	return held
 }

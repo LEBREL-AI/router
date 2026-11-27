@@ -6,6 +6,9 @@ import (
 	"lebrel-router/internal/model"
 )
 
+// maxCountedTokens is more than any request can be.
+const maxCountedTokens = 1 << 40
+
 // ParseUsage reads a provider's usage block. Providers disagree on where cached
 // tokens live: OpenAI-style APIs use prompt_tokens_details.cached_tokens, DeepSeek
 // adds prompt_cache_hit_tokens. A host that counts what it wrote beyond completion_tokens
@@ -28,7 +31,9 @@ func ParseUsage(format string, data []byte) (model.Usage, bool) {
 		return model.Usage{}, false
 	}
 	usage := model.Usage{PromptTokens: *envelope.Usage.PromptTokens, CompletionTokens: *envelope.Usage.CompletionTokens}
-	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 {
+	// A count that cannot be one is no count: every request has a prompt, so a prompt of zero tokens says the host
+	// counted nothing, and no request is a trillion tokens. Such an answer settles as one whose usage is missing.
+	if usage.PromptTokens <= 0 || usage.CompletionTokens < 0 || usage.PromptTokens > maxCountedTokens || usage.CompletionTokens > maxCountedTokens {
 		return model.Usage{}, false
 	}
 	if total := envelope.Usage.TotalTokens; total != nil && *total > usage.PromptTokens && *total-usage.PromptTokens > usage.CompletionTokens {

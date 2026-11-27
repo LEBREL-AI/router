@@ -241,16 +241,19 @@ A chat completion goes to its host as the route allows, not as it came (release 
   (`enable_search`, `web_search_options`, `plugins`), a code interpreter, audio, predicted outputs, tools that are
   not functions. **Any other field is left out**, and the answer says which in `X-Lebrel-Ignored-Fields`.
 - **A message's content is text and images.** A part of another type (video, audio, a file) is refused: no route
-  has a price for it. An image part goes on as its address or its inline data and nothing else; options that
-  change what a picture costs stay behind.
+  has a price for it. An image part goes on as its http(s) address or its inline data and nothing else, a text
+  part as its text, a tool as its function, and a message with the fields a chat completion gives it.
 - **A PDF is read in a process of its own**, with a ceiling on its memory, its stack and its processor time and a
   deadline. A file written to hurt its reader ends that process, and the request is told the PDF could not be read.
 - **A key's turns are taken before a request is read**, in the Messages and Responses formats too, and the files
-  one request names are bounded: 32 by address, 32 documents, 8 MB of document text, 60 seconds for all of them.
-  Files are fetched from public addresses, on the ports the web is served from.
+  one request names are bounded: 100 documents, 8 MB of document text, 60 seconds for all of them, and as many
+  images as the route reads. Files are fetched from public addresses, on the ports the web is served from, within
+  an allowance per account, and one PDF is read at a time for an account.
 - **A host's count is read in full.** What it reports past the prompt beyond `completion_tokens` is billed as
   output, and of several usage blocks in one stream the larger counts stand. An answer whose host counted more
-  than the request was held for is charged the reserved maximum, and the operator is told.
+  than the request was held for is charged the reserved maximum, and the operator is told. A count that cannot
+  be one (no prompt tokens, a trillion of them) is no count. An account whose prompt a host counted beyond its hold
+  is held for a day at the most a prompt can be counted at, a token a byte.
 
 ## Settlement is owed, never waited for
 

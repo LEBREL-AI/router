@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -375,10 +376,9 @@ func TestARequestsFilesAreBounded(t *testing.T) {
 		budget int64
 		want   string
 	}{
-		"more files by address than a request may name": {chat: message(repeat(mediaMaxFetches+1, func(int) any { return imagePart("https://example.com/a.png") })...), want: "at most 32 files by address"},
-		"more fetched than a request may carry":         {chat: message(repeat(4, func(int) any { return imagePart("https://example.com/a.png") })...), budget: 2 << 20, want: "at most 2 MB together"},
-		"more documents than a request may carry":       {chat: message(repeat(documentsMax+1, func(int) any { return documentPart("", "text/plain", "", "hello", "") })...), want: "at most 32 documents"},
-		"more document text than a request may carry":   {chat: message(repeat(9, func(int) any { return documentPart("", "text/plain", "", "", "https://example.com/a.txt") })...), want: "at most 8 MB of text together"},
+		"more fetched than a request may carry":       {chat: message(repeat(4, func(int) any { return imagePart("https://example.com/a.png") })...), budget: 2 << 20, want: "at most 2 MB together"},
+		"more documents than a request may carry":     {chat: message(repeat(documentsMax+1, func(int) any { return documentPart("", "text/plain", "", "hello", "") })...), want: "at most 100 documents"},
+		"more document text than a request may carry": {chat: message(repeat(9, func(int) any { return documentPart("", "text/plain", "", "", "https://example.com/a.txt") })...), want: "at most 8 MB of text together"},
 	} {
 		server := mediaServer(files)
 		server.settings.MaxRequestBytes = test.budget
@@ -388,8 +388,30 @@ func TestARequestsFilesAreBounded(t *testing.T) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
-	// what fits is read as before
+	// as many pictures by address as the route reads, the last one included
 	server := mediaServer(files)
+	server.settings.MaxRequestBytes = 64 << 20
+	if err := server.resolveMedia(context.Background(), message(repeat(route.MaxImages, func(int) any { return imagePart("https://example.com/a.png") })...), route); err != nil {
+		t.Fatalf("%d pictures by address on a route that reads %d: %v", route.MaxImages, route.MaxImages, err)
+	}
+	// an account's allowance of fetched files is its own: past it the account is told, and another account is served
+	server = mediaServer(files)
+	as := func(account string) context.Context {
+		return context.WithValue(context.Background(), mediaAccountKey{}, account)
+	}
+	var last error
+	for i := 0; i < fetchWindowFiles/route.MaxImages+1 && last == nil; i++ {
+		last = server.resolveMedia(as("acct_greedy"), message(repeat(route.MaxImages, func(int) any { return imagePart("https://example.com/a.png") })...), route)
+	}
+	var told *formatError
+	if !asFormatError(last, &told) || !strings.Contains(told.message, "too many files fetched") {
+		t.Fatalf("an account past its allowance: %v", last)
+	}
+	if err := server.resolveMedia(as("acct_other"), message(imagePart("https://example.com/a.png")), route); err != nil {
+		t.Fatalf("another account meanwhile: %v", err)
+	}
+	// what fits is read as before
+	server = mediaServer(files)
 	if err := server.resolveMedia(context.Background(), message(imagePart("https://example.com/a.png"), documentPart("notes", "text/plain", "", "", "https://example.com/a.txt")), route); err != nil {
 		t.Fatalf("an image and a document by address: %v", err)
 	}
@@ -405,6 +427,139 @@ func TestOnlyThePublicWebIsFetched(t *testing.T) {
 	} {
 		if err := publicOnly("tcp", address, nil); (err == nil) != public {
 			t.Errorf("%s: fetched %v, want %v", address, err == nil, public)
+		}
+	}
+}
+
+func TestTheListReachesInsideMessagesPartsAndTools(t *testing.T) {
+	up := newFakeUpstream(t, okJSON(`{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}`))
+	reads := upstream("deepseek/api", up.server.URL, 1)
+	reads.Images = true
+	route := routeFor(reads)
+	route.ImageTokens, route.MaxImages = 1_000, 4
+	h := newHarness(t, route, "")
+	response, raw := postJSON(t, h, chat(map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "name": "ana", "images": []any{"AAAA"}, "audio": map[string]any{"id": "x"}, "content": []any{
+				map[string]any{"type": "text", "text": "look", "cache_control": map[string]any{"type": "ephemeral"}, "video_url": map[string]any{"url": "https://example.com/a.mp4"}},
+			}},
+			map[string]any{"role": "assistant", "content": nil, "reasoning_content": "thinking", "tool_calls": []any{map[string]any{"id": "c1", "type": "function", "function": map[string]any{"name": "lookup", "arguments": "{}"}}}},
+			map[string]any{"role": "tool", "tool_call_id": "c1", "content": "ok"},
+		},
+		"tools": []any{map[string]any{"function": map[string]any{"name": "lookup", "parameters": map[string]any{"type": "object"}}, "cache_control": map[string]any{"type": "ephemeral"}}},
+	}))
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", response.StatusCode, raw)
+	}
+	seen := up.last(t).body
+	messages := seen["messages"].([]any)
+	first := messages[0].(map[string]any)
+	if len(first) != 3 || first["name"] != "ana" || first["images"] != nil || first["audio"] != nil {
+		t.Errorf("the first message reached the host as %v", first)
+	}
+	if part := first["content"].([]any)[0].(map[string]any); len(part) != 2 || part["text"] != "look" {
+		t.Errorf("a text part reached the host as %v", part)
+	}
+	if second := messages[1].(map[string]any); second["reasoning_content"] != "thinking" || second["tool_calls"] == nil {
+		t.Errorf("a model's own turn reached the host as %v", second)
+	}
+	if tool := seen["tools"].([]any)[0].(map[string]any); len(tool) != 2 || tool["type"] != "function" {
+		t.Errorf("a tool reached the host as %v", tool)
+	}
+	if header := response.Header.Get(ignoredFieldsHeader); header != "messages.audio, messages.images" {
+		t.Errorf("ignored fields header %q", header)
+	}
+	for name, payload := range map[string]map[string]any{
+		"an image by another scheme":   chat(map[string]any{"messages": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": "ftp://example.com/a.png"}}}}}}),
+		"an image that is a file":      chat(map[string]any{"messages": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": "file:///etc/passwd"}}}}}}),
+		"inline data that is no image": chat(map[string]any{"messages": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:text/plain;base64,AAAA"}}}}}}),
+		"content that is an object":    chat(map[string]any{"messages": []any{map[string]any{"role": "user", "content": map[string]any{"text": "hi"}}}}),
+		"a message that is no object":  chat(map[string]any{"messages": []any{"hi"}}),
+		"tools that are no list":       chat(map[string]any{"tools": map[string]any{"type": "function"}}),
+		"a tool with no function":      chat(map[string]any{"tools": []any{map[string]any{"name": "lookup"}}}),
+		"a text part with no text":     chat(map[string]any{"messages": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "image_url": map[string]any{"url": "https://example.com/a.png"}}}}}}),
+	} {
+		if response, raw := postJSON(t, h, payload); response.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s: status %d: %.160s", name, response.StatusCode, raw)
+		}
+	}
+}
+
+func TestACountThatCannotBeOneIsNoCount(t *testing.T) {
+	for name, usage := range map[string]string{
+		"zeros, with an answer":  `{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}`,
+		"no prompt, some output": `{"prompt_tokens":0,"completion_tokens":5,"total_tokens":5}`,
+		"a trillion tokens":      `{"prompt_tokens":2000000000000,"completion_tokens":5,"total_tokens":2000000000005}`,
+	} {
+		up := newFakeUpstream(t, okJSON(usage))
+		h := newHarness(t, routeFor(upstream("deepseek/api", up.server.URL, 1)), "")
+		before := h.balance(t)
+		response, raw := postJSON(t, h, chat(map[string]any{"max_tokens": 16}))
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("%s: status %d: %s", name, response.StatusCode, raw)
+		}
+		receipt, _ := h.receipts.Get(response.Header.Get("X-Request-ID"))
+		if charged := before - h.balance(t); charged <= 0 || receipt.Payload["usage_exact"] != false {
+			t.Errorf("%s: charged %d, receipt exact %v: an answer was given, and the reserved maximum is owed", name, charged, receipt.Payload["usage_exact"])
+		}
+	}
+}
+
+func TestAnAccountWhosePromptWasCountedBeyondItsHoldIsHeldWholeAfterwards(t *testing.T) {
+	// a host that counts a token a byte, as it may for text written that way
+	dense := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"id":"up","model":"deepseek-flash","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":%d,"completion_tokens":1,"total_tokens":%d}}`, len(raw), len(raw)+1)
+	}))
+	t.Cleanup(dense.Close)
+	var mu sync.Mutex
+	var alerts []string
+	h := newHarnessWith(t, routeFor(upstream("deepseek/api", dense.URL, 1)), "", func(s *Settings) {
+		s.Alert = func(text string) { mu.Lock(); alerts = append(alerts, text); mu.Unlock() }
+	})
+	text := strings.Repeat("?!", 30_000) // 60,000 bytes
+	ask := func() (int64, bool) {
+		before := h.balance(t)
+		response, raw := postJSON(t, h, chat(map[string]any{"max_tokens": 1, "messages": []any{map[string]any{"role": "user", "content": text}}}))
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("status %d: %.200s", response.StatusCode, raw)
+		}
+		receipt, _ := h.receipts.Get(response.Header.Get("X-Request-ID"))
+		return before - h.balance(t), receipt.Payload["usage_exact"] == true
+	}
+	first, exact := ask()
+	if exact {
+		t.Fatalf("the first dense prompt fitted its hold: charged %d", first)
+	}
+	second, exact := ask()
+	// 60,000-odd tokens at 0.1575 microUSD: about 9,470, where the first paid for 22,500 of them
+	if !exact || second < 9_400 || second <= first {
+		t.Fatalf("the second dense prompt: charged %d (the first %d), exact %v: it is held whole and pays what the host counted", second, first, exact)
+	}
+	mu.Lock()
+	told := len(alerts)
+	mu.Unlock()
+	if told != 1 {
+		t.Fatalf("the operator was told %d times, want once", told)
+	}
+}
+
+func TestTheEditionDoesNotReasonForAClientThatSaidNo(t *testing.T) {
+	for name, test := range map[string]struct {
+		format  formatKind
+		request map[string]any
+		off     bool
+	}{
+		"Messages, thinking disabled": {formatAnthropic, map[string]any{"thinking": map[string]any{"type": "disabled"}}, true},
+		"Messages, thinking enabled":  {formatAnthropic, map[string]any{"thinking": map[string]any{"type": "enabled", "budget_tokens": 1024}}, false},
+		"Messages, nothing said":      {formatAnthropic, map[string]any{}, false},
+		"Responses, effort none":      {formatResponses, map[string]any{"reasoning": map[string]any{"effort": "none"}}, true},
+		"Responses, effort low":       {formatResponses, map[string]any{"reasoning": map[string]any{"effort": "low"}}, false},
+		"Responses, nothing said":     {formatResponses, map[string]any{}, false},
+	} {
+		if got := clientTurnedThinkingOff(test.format, test.request); got != test.off {
+			t.Errorf("%s: thinking off %v, want %v", name, got, test.off)
 		}
 	}
 }

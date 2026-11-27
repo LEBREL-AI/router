@@ -31,7 +31,14 @@ var forwardedFields = map[string]bool{
 	// reasoning, as each lab switches it; the output cap bounds it whatever these say
 	"thinking": true, "enable_thinking": true, "thinking_budget": true, "preserve_thinking": true, "reasoning": true, "reasoning_effort": true, "include_reasoning": true,
 	// who asks, for a host's own abuse checks and its cache
-	"user": true, "user_id": true, "request_id": true, "prompt_cache_key": true,
+	"user": true, "user_id": true, "request_id": true,
+}
+
+// messageFields are what a message carries upstream: who speaks, what is said, and a model's own earlier turn
+// (its tool calls, its reasoning, a turn to be continued).
+var messageFields = map[string]bool{
+	"role": true, "content": true, "name": true, "tool_calls": true, "tool_call_id": true, "function_call": true,
+	"reasoning_content": true, "reasoning": true, "reasoning_details": true, "refusal": true, "prefix": true, "partial": true,
 }
 
 // notOfferedFields are features a host sells apart, or answers in another form: a request asking for one is refused.
@@ -95,25 +102,60 @@ func chatPolicy(payload map[string]any) ([]string, error) {
 		left = append(left, name)
 	}
 	sort.Strings(left)
-	if tools, ok := payload["tools"].([]any); ok {
-		for _, entry := range tools {
+	if tools, present := payload["tools"]; present && tools != nil {
+		list, ok := tools.([]any)
+		if !ok {
+			return nil, fmt.Errorf("tools is a list of functions")
+		}
+		for _, entry := range list {
 			tool, _ := entry.(map[string]any)
+			if _, described := tool["function"].(map[string]any); !described {
+				return nil, fmt.Errorf("tools are functions: a tool of another type is not taken")
+			}
 			if kind, named := tool["type"]; named && kind != "function" {
 				return nil, fmt.Errorf("tools are functions: a tool of another type is not taken")
 			}
+			// a function and nothing beside it
+			for key := range tool {
+				if key != "type" && key != "function" {
+					delete(tool, key)
+				}
+			}
+			tool["type"] = "function"
 		}
 	}
 	messages, _ := payload["messages"].([]any)
+	dropped := map[string]bool{}
 	for _, entry := range messages {
-		message, _ := entry.(map[string]any)
-		parts, ok := message["content"].([]any)
+		message, ok := entry.(map[string]any)
 		if !ok {
+			return nil, fmt.Errorf("a message is an object with a role and its content")
+		}
+		for key := range message {
+			if !messageFields[key] {
+				delete(message, key)
+				dropped["messages."+key] = true
+			}
+		}
+		var parts []any
+		switch content := message["content"].(type) {
+		case nil, string:
 			continue
+		case []any:
+			parts = content
+		default:
+			return nil, fmt.Errorf("a message's content is text, or a list of text and image parts")
 		}
 		for i, entry := range parts {
 			part, _ := entry.(map[string]any)
 			switch part["type"] {
 			case "text":
+				text, ok := part["text"].(string)
+				if !ok {
+					return nil, fmt.Errorf("a text part needs its text")
+				}
+				// the text and nothing beside it: a cache marker or another kind of content under a text part stays behind
+				parts[i] = map[string]any{"type": "text", "text": text}
 			case "image_url":
 				var address string
 				switch inner := part["image_url"].(type) {
@@ -122,8 +164,9 @@ func chatPolicy(payload map[string]any) ([]string, error) {
 				case string:
 					address = inner
 				}
-				if address == "" {
-					return nil, fmt.Errorf("an image_url part needs a url")
+				lower := strings.ToLower(address)
+				if !strings.HasPrefix(lower, "https://") && !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "data:image/") {
+					return nil, fmt.Errorf("an image is an http(s) address or inline data (data:image/...;base64,...)")
 				}
 				// the picture and nothing else: an option beside it could make it cost more than the route holds for one
 				parts[i] = map[string]any{"type": "image_url", "image_url": map[string]any{"url": address}}
@@ -132,6 +175,10 @@ func chatPolicy(payload map[string]any) ([]string, error) {
 			}
 		}
 	}
+	for name := range dropped {
+		left = append(left, name)
+	}
+	sort.Strings(left)
 	return left, nil
 }
 
